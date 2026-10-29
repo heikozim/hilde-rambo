@@ -1,0 +1,199 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+What every page of rambo needs from a request and gives to an answer: the
+address of the client, the language, the texts, the frame of a page, the
+answer with its headers, and the audit line.
+
+- An answer of a page carries the security headers of the earlier Go provider: a content
+  security policy that allows only this origin, no framing by others, no
+  sniffing, a referrer only to this origin, and no caching.
+- The client is REMOTE_ADDR as the web server sends it; no header of the
+  request is trusted for it.
+- An audit line names actor, action, target and result and the address,
+  never an e-mail address, a password, a code or a token.
+
+    let lang: Span[Nat8, Static] := langOf(request);
+    let title: String := say(lang, TitleLogin());
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer,
+    length as bufferLength
+);
+import Standard.FcgiServer (
+    Request
+);
+import Standard.Log (
+    Log
+);
+import Rambo.Messages (
+    Key
+);
+import Wolly.OpKey (
+    RingKey
+);
+import Wolly.OpBase (
+    OpSettings
+);
+import Rambo.Config (
+    Config
+);
+import Rambo.Context (
+    Secrets
+);
+import Rambo.Pages (
+    Frame
+);
+
+module Rambo.Web is
+    """
+    What the pages read of the context of a request: the configuration,
+    the settings of the provider, the signing keys and the secrets.  The
+    database and the log, which they write, are lent beside it.
+    """
+    record World: Linear is
+        config: Config;
+        settings: OpSettings;
+        ring: Buffer[RingKey];
+        secrets: Secrets;
+    end;
+
+    """
+    The issuer of world.
+    """
+    generic [W: Region]
+    function issuerOf(world: &[World, W]): Span[Nat8, W]
+        ensures spanLength(result) > 0;
+
+    """
+    The pepper of the passwords of world.
+    """
+    generic [W: Region]
+    function pepperOf(world: &[World, W]): Span[Nat8, W]
+        ensures spanLength(result) >= 32;
+
+    """
+    The key of the second factors of world.
+    """
+    generic [W: Region]
+    function totpKeyOf(world: &[World, W]): Span[Nat8, W]
+        ensures spanLength(result) > 0;
+
+    """
+    The key of the puzzles of world.
+    """
+    generic [W: Region]
+    function powKeyOf(world: &[World, W]): Span[Nat8, W]
+        ensures spanLength(result) >= 32;
+
+    """
+    The content security policy of the pages.
+    """
+    function pagePolicy(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The version the foot of a page shows.
+    """
+    function version(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The name of the cookie that keeps the language of the pages.
+    """
+    function langCookie(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The address of the client, REMOTE_ADDR, empty when there is none.
+    No contract: the address is what the web server gave, empty when none.
+    """
+    generic [Q: Region]
+    function remoteAddr(request: &[Request, Q]): String;
+
+    """
+    The language of the pages for request, from its cookie and its
+    Accept-Language header as Rambo.Pages.languageOf picks it.
+    """
+    generic [Q: Region]
+    function langOf(request: &[Request, Q]): Span[Nat8, Static]
+        ensures spanLength(result) = 2;
+
+    """
+    The text of key in lang.
+    No contract: a text of the message tables, chosen by key and lang.
+    """
+    generic [L: Region]
+    function say(lang: Span[Nat8, L], key: Key): String;
+
+    """
+    The text of key in lang with arg in the place of {arg}.
+    No contract: a text of the message tables with arg in it; its length follows arg.
+    """
+    generic [L: Region, A: Region]
+    function sayWith(lang: Span[Nat8, L], key: Key, arg: Span[Nat8, A]): String;
+
+    """
+    Where the language buttons of a page return: the address of a GET
+    itself; after a POST the account page for a path below /account, the
+    page with req for a path below /login when req is not empty, else the
+    portal.
+    """
+    generic [Q: Region, E: Region]
+    function backOf(request: &[Request, Q], req: Span[Nat8, E]): String
+        ensures length(&result) > 0;
+
+    """
+    The frame of a page for request in lang: title translated, error and
+    info as given, the open entry nav of the menu, the logout token, and
+    whether the content stands in a card.
+    No contract: the frame holds the texts as they are given; a condition would only repeat the arguments.
+    """
+    generic [Q: Region, L: Region, E: Region]
+    function frameOf(request: &[Request, Q], lang: Span[Nat8, L], title: Key, error: String, info: String,
+        nav: Span[Nat8, Static], csrfLogout: String, card: Bool, req: Span[Nat8, E]): Frame;
+
+    """
+    The CGI output of a page: status, the security headers, no caching, each
+    Set-Cookie value of cookies, the ban of Hiawatha for ban seconds when
+    ban is above 0, and html.
+    """
+    generic [H: Region, C: Region]
+    function pageAnswer(status: Nat16, html: Span[Nat8, H], cookies: &[Buffer[String], C], ban: Int64): String
+        requires (status >= 100) and (status <= 599)
+        ensures length(&result) > 0;
+
+    """
+    The CGI output of a redirect to location with status, the security
+    headers and each Set-Cookie value of cookies.
+    """
+    generic [L: Region, C: Region]
+    function redirectAnswer(status: Nat16, location: Span[Nat8, L], cookies: &[Buffer[String], C]): String
+        requires (status >= 300) and (status <= 399)
+        ensures length(&result) > 0;
+
+    """
+    No cookies, for an answer that sets none.
+    """
+    function noCookies(): Buffer[String]
+        ensures bufferLength(&result) = 0;
+
+    """
+    Writes an audit line to log: actor, action, target, result ok or failed,
+    the time, reason when it is not empty, the field extra with value when
+    extra is not empty, and addr.  Never a secret: the caller passes IDs.
+    """
+    generic [L: Region, A: Region, T: Region, R: Region, V: Region, D: Region]
+    function auditLine(log: &![Log, L], actor: Span[Nat8, A], action: Span[Nat8, Static], target: Span[Nat8, T],
+        failed: Bool, reason: Span[Nat8, R], extra: Span[Nat8, Static], value: Span[Nat8, V], addr: Span[Nat8, D],
+        now: Int64): Unit
+        requires now > 0;
+end module.

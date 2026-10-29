@@ -1,0 +1,139 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The configuration of rambo, read from rambo.conf and refused whole when any
+part of it is not understood: an unknown key, a relative path, a duration
+or a number that does not read, exactly one root account.
+
+The file holds lines of key = value.  A line that starts with # is a
+comment; a # after a value is part of the value.  A value that ends in a
+backslash goes on with the next line.  A line without = is passed over.
+When a key comes twice, the last value counts.  A key with an empty value
+takes its default.
+
+Durations are written as Go's time.ParseDuration reads them: a
+sequence of a number, with a fraction if wanted, and a unit of ns, us, ms,
+s, m or h, such as 2h, 15m or 1h30m.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+
+module Rambo.Config is
+    """
+    The configuration as it was read, every path absolute and clean, every
+    duration in whole seconds.  rootAccounts holds no ID or two at least.
+    tokenAlg is the algorithm a client that names none is signed with:
+    ML-DSA-44, or the composite ML-DSA-44-Ed25519.
+    """
+    record Config: Linear is
+        issuer: String;
+        listen: String;
+        httpAddr: String;
+        socketDir: String;
+        socketGroup: String;
+        etcDir: String;
+        varDir: String;
+        db: String;
+        vault: String;
+        pepper: String;
+        sessionIdle: Int64;
+        sessionMax: Int64;
+        banAfter: Int64;
+        banWindow: Int64;
+        banSeconds: Int64;
+        rootAccounts: Buffer[String];
+        tokenAlg: String;
+        path: String;
+    end;
+
+    """
+    Frees config.
+    No contract: it only frees.
+    """
+    function destroyConfig(config: Config): Unit;
+
+    """
+    The directories rambo uses on the system named system, as
+    Standard.Platform names it: etc, data and the socket directory, in this
+    order, joined by colons.  Linux and any other system get /etc/rambo,
+    /var/lib/rambo and /run/rambo.
+    """
+    generic [S: Region]
+    function systemDirectories(system: Span[Nat8, S]): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The configuration file: the value of RAMBO_CONFIG when it is set and not
+    empty, else rambo.conf in the etc directory of this system.
+    """
+    function defaultConfigPath(): String
+        ensures length(&result) > 0;
+
+    """
+    Reads and checks the file at path for the system named system.  Right
+    the configuration, Left the text that says what is wrong, beginning
+    with config and the path, or with configkit: open when the file cannot
+    be read.
+    No contract: a file is read.
+    """
+    generic [P: Region, S: Region]
+    function loadConfig(path: Span[Nat8, P], system: Span[Nat8, S]): Either[String, Config];
+
+    """
+    Checks text as the content of the file at path for the system named
+    system, as loadConfig does.
+    No contract: an Either read from text.
+    """
+    generic [T: Region, P: Region, S: Region]
+    function readConfig(text: Span[Nat8, T], path: Span[Nat8, P], system: Span[Nat8, S]): Either[String, Config];
+
+    """
+    The duration text stands for in nanoseconds, as Go's time.ParseDuration
+    reads it, a sign included.  None for text it does not read and for a
+    value beyond an Int64.
+    No contract: an Option read from text.
+    """
+    generic [T: Region]
+    function goDuration(text: Span[Nat8, T]): Option[Int64];
+
+    """
+    ns as Go's Duration.String writes it, such as 2h0m0s, 15m0s or 1.5s;
+    below a microsecond ns, below a millisecond the micro sign and s.
+    """
+    function goDurationText(ns: Int64): String
+        ensures length(&result) > 0;
+
+    """
+    The whole number text stands for, as Go's strconv.Atoi reads it: digits
+    with an optional sign in front, plus or minus.  None for anything else
+    and for a value beyond an Int64.
+    No contract: an Option read from text.
+    """
+    generic [T: Region]
+    function goInteger(text: Span[Nat8, T]): Option[Int64];
+
+    """
+    Whether text is an absolute path that Go's filepath.Clean leaves as it
+    is: it starts with a slash, holds no empty, dot or dot-dot part and does
+    not end in a slash, the root itself excepted.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [T: Region]
+    function isCleanAbsolute(text: Span[Nat8, T]): Bool;
+
+    """
+    Whether id is one of the root accounts of config.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [C: Region, I: Region]
+    function isRoot(config: &[Config, C], id: Span[Nat8, I]): Bool;
+end module.

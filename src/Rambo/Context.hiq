@@ -1,0 +1,612 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    nthRef,
+    removeLast,
+    destroyEmpty,
+    length as bufferLength
+);
+import Standard.Text (
+    equal,
+    startsWith,
+    substring
+);
+import Standard.Base64 (
+    decode
+);
+import Standard.Arguments (
+    processArguments,
+    destroyArguments
+);
+import Standard.Vault (
+    Vault,
+    VaultError,
+    openVault,
+    closeVault,
+    getSecret,
+    describeVaultError
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Transaction,
+    noValues,
+    withInt64,
+    withText,
+    begin,
+    commit,
+    rollback,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    finish,
+    closeDatabase,
+    describe
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Standard.Log (
+    Log,
+    Daemon,
+    Info,
+    logToSystem,
+    closeLog
+);
+import Wolly.OpKey (
+    RingKey,
+    KeyFamily,
+    MlDsa,
+    Composite,
+    familyOf,
+    loadRing,
+    saveRing,
+    destroyRing,
+    isDue,
+    rotate,
+    prune
+);
+import Wolly.OpBase (
+    OpSettings,
+    makeSettings,
+    withDefaultFamily,
+    destroySettings,
+    keyKeep
+);
+import Wolly.Account (
+    prepareAccounts
+);
+import Wolly.OpClient (
+    prepareClients
+);
+import Wolly.OpStore (
+    prepareStore,
+    cleanup
+);
+import Wolly.Pow (
+    preparePow,
+    prunePow
+);
+import Wolly.Backoff (
+    defaultRule,
+    prepareBackoff,
+    pruneBackoff
+);
+import Wolly.Strikes (
+    prepareStrikes,
+    pruneStrikes
+);
+import Rambo.Config (
+    Config,
+    destroyConfig,
+    loadConfig,
+    defaultConfigPath
+);
+import Standard.Platform (
+    systemName
+);
+import Rambo.Steps (
+    prepareSteps
+);
+import Rambo.Passkeys (
+    preparePasskeyTables
+);
+
+module body Rambo.Context is
+    constant makeMeta: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS rambo_meta (name TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT";
+    constant seedMeta: Span[Nat8, Static] := "INSERT INTO rambo_meta (name, value) VALUES ('maintained', 0) ON CONFLICT (name) DO NOTHING";
+    constant claimRound: Span[Nat8, Static] := "UPDATE rambo_meta SET value = ? WHERE name = 'maintained' AND value <= ?";
+
+    function destroySecrets(secrets: Secrets): Unit is
+        let { pepper: String, totpKey: String, powKey: String } := secrets;
+        destroyString(pepper);
+        destroyString(totpKey);
+        destroyString(powKey);
+        return nil;
+    end;
+
+    function closeContext(context: Context): Unit is
+        let { config: Config, db: Database[Writing], settings: OpSettings, ring: Buffer[RingKey], secrets: Secrets,
+            log: Log } := context;
+        destroyConfig(config);
+        closeDatabase(db);
+        destroySettings(settings);
+        destroyRing(ring);
+        destroySecrets(secrets);
+        let closed: Bool := closeLog(log);
+        return nil;
+    end;
+
+    function vaultKeyName(): Span[Nat8, Static] is
+        return "RAMBO_FERNET_KEY";
+    end;
+
+    function signingPrefix(): Span[Nat8, Static] is
+        return "RAMBO_SIGNING_KEY_";
+    end;
+
+    function maintainEvery(): Int64 is
+        return 3600;
+    end;
+
+    -- The value of --config or -c in arguments, empty when there is none.
+    generic [A: Region]
+    function configArgument(arguments: &[Buffer[String], A]): String is
+        var i: Index := 0;
+        while i < bufferLength(arguments) do
+            let word: Span[Nat8, A] := asSpan(nthRef(arguments, i));
+            if equal(word, "--") then
+                return fromSpan("");
+            end if;
+            if equal(word, "--config") or equal(word, "-c") then
+                if (i + 1) < bufferLength(arguments) then
+                    return fromSpan(asSpan(nthRef(arguments, i + 1)));
+                end if;
+                return fromSpan("");
+            end if;
+            if startsWith(word, "--config=") then
+                return fromSpan(substring(word, 9, spanLength(word)));
+            end if;
+            if startsWith(word, "-c") and (spanLength(word) > 2) then
+                return fromSpan(substring(word, 2, spanLength(word)));
+            end if;
+            i := i + 1;
+        end while;
+        return fromSpan("");
+    end;
+
+    function configPath(): String is
+        let arguments: Buffer[String] := processArguments();
+        let given: String := configArgument(&arguments);
+        destroyArguments(arguments);
+        if length(&given) > 0 then
+            return given;
+        end if;
+        destroyString(given);
+        return defaultConfigPath();
+    end;
+
+    -- first, then the text of second, which is used up.
+    function joined(first: Span[Nat8, Static], second: String): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, first);
+        writeString(&!b, asSpan(&second));
+        destroyString(second);
+        return finalize(b);
+    end;
+
+    -- The secret name of vault as bytes from standard Base64, at least
+    -- least of them and at most most.
+    generic [V: Region]
+    function secretBytes(vault: &[Vault, V], name: Span[Nat8, Static], least: Index, most: Index): Either[String, String] is
+        case getSecret(vault, name) of
+            when Left(left as error: VaultError) do
+                return Left(left => joined(name, joined(": ", describeVaultError(error))));
+            when Right(right as text: String) do
+                let bytes: Option[String] := decode(asSpan(&text));
+                destroyString(text);
+                case bytes of
+                    when Some(value as raw: String) do
+                        if (length(&raw) < least) or (length(&raw) > most) then
+                            destroyString(raw);
+                            return Left(left => joined(name, fromSpan(" is not 32 bytes of base64")));
+                        end if;
+                        return Right(right => raw);
+                    when None do
+                        return Left(left => joined(name, fromSpan(" is not 32 bytes of base64")));
+                end case;
+        end case;
+    end;
+
+    -- The three secrets of vault.
+    generic [V: Region]
+    function secretsOf(vault: &[Vault, V]): Either[String, Secrets] is
+        case secretBytes(vault, "RAMBO_PASSWORD_PEPPER", 32, 32) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as pepper: String) do
+                case getSecret(vault, "RAMBO_TOTP_KEY") of
+                    when Left(left as error: VaultError) do
+                        destroyString(pepper);
+                        return Left(left => joined("RAMBO_TOTP_KEY: ", describeVaultError(error)));
+                    when Right(right as totpKey: String) do
+                        case secretBytes(vault, "RAMBO_POW_KEY", 32, 4096) of
+                            when Left(left as message: String) do
+                                destroyString(pepper);
+                                destroyString(totpKey);
+                                return Left(left => message);
+                            when Right(right as powKey: String) do
+                                return Right(right => Secrets(pepper => pepper, totpKey => totpKey, powKey => powKey));
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- Makes every table of rambo that is not there yet.
+    generic [R: Region]
+    function prepared(db: &![Database[Writing], R]): Option[DbError] is
+        case prepareAccounts(&~db) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case prepareClients(&~db) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case prepareStore(&~db) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case preparePow(&~db) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case prepareBackoff(&~db) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case prepareStrikes(&~db) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case prepareSteps(&~db) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case preparePasskeyTables(&~db) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case execute(&~db, makeMeta, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as made: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, seedMeta, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as seeded: Nat64) do
+                return None();
+        end case;
+    end;
+
+    -- The database at the path of config, its tables made.
+    generic [C: Region]
+    function databaseOf(config: &[Config, C]): Either[String, Database[Writing]] is
+        case openSqlite(asSpan(&(config->db))) of
+            when Left(left as error: DbError) do
+                return Left(left => joined("database: ", fromSpan(describe(error))));
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                case prepared(&!db) of
+                    when Some(value as error: DbError) do
+                        closeDatabase(db);
+                        return Left(left => joined("database: ", fromSpan(describe(error))));
+                    when None do
+                        return Right(right => db);
+                end case;
+        end case;
+    end;
+
+    generic [C: Region]
+    function settingsOf(config: &[Config, C]): Option[OpSettings] is
+        case makeSettings(asSpan(&(config->issuer)), "RAMBO", "__Host-rambo", false, config->sessionIdle,
+            config->sessionMax) of
+            when Some(value as settings: OpSettings) do
+                case familyOf(asSpan(&(config->tokenAlg))) of
+                    when Some(value as family: KeyFamily) do
+                        return Some(value => withDefaultFamily(settings, family));
+                    when None do
+                        return Some(value => settings);
+                end case;
+            when None do
+                let none: Option[OpSettings] := None();
+                return none;
+        end case;
+    end;
+
+    generic [C: Region]
+    function vaultOf(config: &[Config, C]): Either[String, Vault] is
+        case openVault(asSpan(&(config->vault)), asSpan(&(config->pepper)), vaultKeyName()) of
+            when Left(left as error: VaultError) do
+                return Left(left => joined("vault: ", describeVaultError(error)));
+            when Right(right as vault: Vault) do
+                return Right(right => vault);
+        end case;
+    end;
+
+    -- The secrets and the ring of the vault of config.
+    record Kept: Linear is
+        secrets: Secrets;
+        ring: Buffer[RingKey];
+    end;
+
+    generic [C: Region]
+    function keptOf(config: &[Config, C]): Either[String, Kept] is
+        case vaultOf(config) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as vault: Vault) do
+                let secrets: Either[String, Secrets] := secretsOf(&vault);
+                let ring: Either[VaultError, Buffer[RingKey]] := loadRing(&vault, signingPrefix());
+                closeVault(vault);
+                case secrets of
+                    when Left(left as message: String) do
+                        case ring of
+                            when Right(right as keys: Buffer[RingKey]) do
+                                destroyRing(keys);
+                            when Left(left as error: VaultError) do
+                                skip;
+                        end case;
+                        return Left(left => message);
+                    when Right(right as found: Secrets) do
+                        case ring of
+                            when Left(left as error: VaultError) do
+                                destroySecrets(found);
+                                return Left(left => joined("signing keys: ", describeVaultError(error)));
+                            when Right(right as keys: Buffer[RingKey]) do
+                                return Right(right => Kept(secrets => found, ring => keys));
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [P: Region]
+    function openContext(path: Span[Nat8, P], now: Int64): Either[String, Context] is
+        case loadConfig(path, systemName()) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as config: Config) do
+                case settingsOf(&config) of
+                    when None do
+                        destroyConfig(config);
+                        return Left(left => fromSpan("config: the settings of the provider do not hold"));
+                    when Some(value as settings: OpSettings) do
+                        case keptOf(&config) of
+                            when Left(left as message: String) do
+                                destroySettings(settings);
+                                destroyConfig(config);
+                                return Left(left => message);
+                            when Right(right as kept: Kept) do
+                                case databaseOf(&config) of
+                                    when Left(left as message: String) do
+                                        let { secrets: Secrets, ring: Buffer[RingKey] } := kept;
+                                        destroySecrets(secrets);
+                                        destroyRing(ring);
+                                        destroySettings(settings);
+                                        destroyConfig(config);
+                                        return Left(left => message);
+                                    when Right(right as db: Database[Writing]) do
+                                        let { secrets: Secrets, ring: Buffer[RingKey] } := kept;
+                                        let log: Log := logToSystem("rambo", Daemon(), Info());
+                                        return Right(right => Context(config => config, db => db, settings => settings,
+                                            ring => ring, secrets => secrets, log => log));
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    --- Maintenance
+
+    -- Whether this request takes the round of maintenance at now.
+    generic [R: Region]
+    function claimed(db: &![Database[Writing], R], now: Int64): Either[DbError, Bool] is
+        case execute(&~db, claimRound, withInt64(withInt64(noValues(), now), now - maintainEvery())) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as changed: Nat64) do
+                return Right(right => changed > 0);
+        end case;
+    end;
+
+    -- Rotates family in ring when it is due; Right true when it did.
+    generic [R: Region]
+    function rotatedFamily(ring: &![Buffer[RingKey], R], family: KeyFamily, now: Int64, every: Int64): Either[String, Bool] is
+        if not isDue(&ring, family, now, every) then
+            return Right(right => false);
+        end if;
+        case rotate(&~ring, family, now) of
+            when Some(value as kid: String) do
+                destroyString(kid);
+                return Right(right => true);
+            when None do
+                return Left(left => fromSpan("signing keys: no new key could be made"));
+        end case;
+    end;
+
+    -- Saves ring in the vault of config.
+    generic [C: Region, R: Region]
+    function saved(config: &[Config, C], ring: &[Buffer[RingKey], R]): Either[String, Bool] is
+        case vaultOf(config) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as opened: Vault) do
+                var vault: Vault := opened;
+                let result: Either[VaultError, Unit] := saveRing(&!vault, signingPrefix(), ring);
+                closeVault(vault);
+                case result of
+                    when Left(left as error: VaultError) do
+                        return Left(left => joined("signing keys: ", describeVaultError(error)));
+                    when Right(right as done: Unit) do
+                        return Right(right => true);
+                end case;
+        end case;
+    end;
+
+    -- Rotates what is due and removes what is retired, then saves the ring
+    -- when anything changed.
+    generic [C: Region, D: Region, R: Region, S: Region]
+    function rotated(config: &[Config, C], db: &![Database[Writing], D], ring: &![Buffer[RingKey], R],
+        settings: &[OpSettings, S], now: Int64): Either[String, Bool] is
+        let every: Int64 := rotationOf(settings);
+        var changed: Bool := false;
+        case rotatedFamily(&~ring, MlDsa(), now, every) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as done: Bool) do
+                changed := done;
+        end case;
+        -- Each family has its own key and its own rotation; a family with
+        -- no key yet is due, so its first key is made here.
+        case rotatedFamily(&~ring, Composite(), now, every) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as done: Bool) do
+                changed := changed or done;
+        end case;
+        let gone: Buffer[String] := prune(&~ring, now, keyKeep(settings));
+        if bufferLength(&gone) > 0 then
+            changed := true;
+        end if;
+        dropAll(gone);
+        if not changed then
+            return Right(right => false);
+        end if;
+        return saved(config, &ring);
+    end;
+
+    generic [S: Region]
+    function rotationOf(settings: &[OpSettings, S]): Int64 is
+        return settings->keyRotation;
+    end;
+
+    function dropAll(strings: Buffer[String]): Unit is
+        var rest: Buffer[String] := strings;
+        while bufferLength(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    -- Removes what ran out in the tables.
+    generic [R: Region]
+    function swept(db: &![Database[Writing], R], sessionMax: Int64, banWindow: Int64, now: Int64): Option[DbError] is
+        case cleanup(&~db, now, sessionMax) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as n: Int64) do
+                skip;
+        end case;
+        case prunePow(&~db, now) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as n: Int64) do
+                skip;
+        end case;
+        case pruneBackoff(&~db, defaultRule(), now) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as n: Int64) do
+                skip;
+        end case;
+        case pruneStrikes(&~db, atLeastMinute(banWindow), now) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as n: Int64) do
+                return None();
+        end case;
+    end;
+
+    function atLeastMinute(window: Int64): Int64 is
+        if window < 60 then
+            return 60;
+        end if;
+        return window;
+    end;
+
+    -- The work of maintain on the parts of the context.
+    generic [C: Region, D: Region, R: Region, S: Region]
+    function maintained(config: &[Config, C], db: &![Database[Writing], D], ring: &![Buffer[RingKey], R],
+        settings: &[OpSettings, S], now: Int64): Either[String, Bool] is
+        case claimed(&~db, now) of
+            when Left(left as error: DbError) do
+                return Left(left => joined("database: ", fromSpan(describe(error))));
+            when Right(right as mine: Bool) do
+                if not mine then
+                    return Right(right => false);
+                end if;
+        end case;
+        case rotated(config, &~db, &~ring, settings, now) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as changed: Bool) do
+                skip;
+        end case;
+        case swept(&~db, config->sessionMax, config->banWindow, now) of
+            when Some(value as error: DbError) do
+                return Left(left => joined("database: ", fromSpan(describe(error))));
+            when None do
+                return Right(right => true);
+        end case;
+    end;
+
+    function maintain(context: Context, now: Int64): Maintained is
+        let { config: Config, db as opened: Database[Writing], settings: OpSettings, ring as keys: Buffer[RingKey],
+            secrets: Secrets, log: Log } := context;
+        var db: Database[Writing] := opened;
+        var ring: Buffer[RingKey] := keys;
+        let outcome: Either[String, Bool] := maintained(&config, &!db, &!ring, &settings, now);
+        return Maintained(context => Context(config => config, db => db, settings => settings, ring => ring,
+            secrets => secrets, log => log), outcome => outcome);
+    end;
+end module body.

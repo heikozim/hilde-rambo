@@ -1,0 +1,29 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The programme rambo: an OpenID provider for a fixed set of first-party
+tools, and the commands that manage it.
+
+    rambo serve
+    rambo account add alice@example.org --name Alice
+    rambo client add --id lucy --kind web --redirect https://lucy.example.org/cb
+    rambo keys rotate
+
+serve runs the provider, as FastCGI on a socket in socket_dir behind
+Hiawatha or as HTTP on a loopback address for development.  Every other
+command manages it from the shell and runs as the owner of its data, never
+as root; each change writes an audit line to the system log.  A refusal is
+printed after rambo and a colon on the standard error, and the programme
+exits with 1.
+"""
+module Rambo.Main is
+    """
+    The command of the arguments.
+    No contract: the outcome is the result of I/O.
+    """
+    function main(root: RootCapability): ExitCode;
+end module.

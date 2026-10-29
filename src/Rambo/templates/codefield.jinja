@@ -1,0 +1,10 @@
+{#
+Part of rambo.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The field for a code of the second factor.
+-#}
+<label>{{ _("TotpCode") }}
+<input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" maxlength="7" required autofocus></label>

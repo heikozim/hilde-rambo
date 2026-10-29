@@ -1,0 +1,339 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The configuration reader against what Go's standard library made of the
+-- same inputs (testdata/config/expected.txt, written by tools/goconfig),
+-- and against the error texts of the earlier Go provider.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    nthRef,
+    length as bufferLength
+);
+import Standard.Text (
+    equal,
+    substring,
+    indexOfByte,
+    formatInt
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readAll,
+    closeFile
+);
+import Rambo.Config (
+    Config,
+    destroyConfig,
+    systemDirectories,
+    readConfig,
+    goDuration,
+    goDurationText,
+    goInteger,
+    isCleanAbsolute,
+    isRoot
+);
+
+module body Rambo.Config.Test is
+    constant rootA: Span[Nat8, Static] := "abcdefghijklmnopqrstuvwxya";
+    constant rootB: Span[Nat8, Static] := "234567abcdefghijklmnopqrs4";
+
+    function fileText(path: Span[Nat8, Static]): String is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let read: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case read of
+                    when Some(value as text: String) do
+                        return text;
+                    when None do
+                        abort("the file does not read");
+                end case;
+            when None do
+                abort("the file does not open");
+        end case;
+    end;
+
+    -- The field nth of line, fields cut at tabs, counted from 0.
+    generic [L: Region]
+    function field(line: Span[Nat8, L], nth: Int64): Span[Nat8, L] is
+        var start: Index := 0;
+        var count: Int64 := 0;
+        var i: Index := 0;
+        while i <= spanLength(line) do
+            var cut: Bool := i = spanLength(line);
+            if not cut then
+                cut := line[i] = 9;
+            end if;
+            if cut then
+                if count = nth then
+                    return substring(line, start, i);
+                end if;
+                count := count + 1;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return substring(line, 0, 0);
+    end;
+
+    -- text with the micro sign written u, as tools/goconfig writes it.
+    generic [T: Region]
+    function asAscii(text: Span[Nat8, T]): String is
+        var b: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(text) do
+            var micro: Bool := false;
+            if (i + 1) < spanLength(text) then
+                micro := (text[i] = 194) and (text[i + 1] = 181);
+            end if;
+            if micro then
+                writeByte(&!b, 'u');
+                i := i + 2;
+            else
+                writeByte(&!b, text[i]);
+                i := i + 1;
+            end if;
+        end while;
+        return finalize(b);
+    end;
+
+    -- Whether rambo answers the line of goconfig as Go did.
+    generic [L: Region]
+    function agrees(line: Span[Nat8, L]): Bool is
+        let kind: Span[Nat8, L] := field(line, 0);
+        let input: Span[Nat8, L] := field(line, 1);
+        let answer: Span[Nat8, L] := field(line, 2);
+        if equal(kind, "d") then
+            case goDuration(input) of
+                when Some(value as ns: Int64) do
+                    let digits: String := formatInt(ns);
+                    let sameValue: Bool := equal(asSpan(&digits), answer);
+                    destroyString(digits);
+                    let text: String := goDurationText(ns);
+                    let ascii: String := asAscii(asSpan(&text));
+                    destroyString(text);
+                    let sameText: Bool := equal(asSpan(&ascii), field(line, 3));
+                    destroyString(ascii);
+                    return sameValue and sameText;
+                when None do
+                    return equal(answer, "none");
+            end case;
+        end if;
+        if equal(kind, "i") then
+            case goInteger(input) of
+                when Some(value as n: Int64) do
+                    let digits: String := formatInt(n);
+                    let same: Bool := equal(asSpan(&digits), answer);
+                    destroyString(digits);
+                    return same;
+                when None do
+                    return equal(answer, "none");
+            end case;
+        end if;
+        return false;
+    end;
+
+    function testAgainstGo(): Unit is
+        let text: String := fileText("testdata/config/expected.txt");
+        borrow t: &[String, T] := &text do
+            check(asSpan(t));
+        end borrow;
+        destroyString(text);
+        return nil;
+    end;
+
+    generic [T: Region]
+    function check(all: Span[Nat8, T]): Unit is
+        var lines: Int64 := 0;
+        var good: Int64 := 0;
+        var start: Index := 0;
+        var i: Index := 0;
+        let n: Index := spanLength(all);
+        while i < n do
+            if all[i] = 10 then
+                lines := lines + 1;
+                if agrees(substring(all, start, i)) then
+                    good := good + 1;
+                else
+                    print("DISAGREES ");
+                    printLn(substring(all, start, i));
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        assertTrue(lines = 47, "47 lines of goconfig");
+        assertTrue(good = 47, "all 47 agree");
+        return nil;
+    end;
+
+    -- The error text of readConfig over text, or empty when it is read.
+    function errorOf(text: Span[Nat8, Static]): String is
+        case readConfig(text, "/etc/rambo/rambo.conf", "openbsd") of
+            when Left(left as message: String) do
+                return message;
+            when Right(right as config: Config) do
+                destroyConfig(config);
+                return fromSpan("");
+        end case;
+    end;
+
+    function refuses(text: Span[Nat8, Static], want: Span[Nat8, Static]): Bool is
+        let found: String := errorOf(text);
+        let same: Bool := equal(asSpan(&found), want);
+        destroyString(found);
+        return same;
+    end;
+
+    function testRefusals(): Unit is
+        assertTrue(refuses("issuer = https://a.example\nissuers = x\n",
+            "config /etc/rambo/rambo.conf: unknown key \"issuers\""), "an unknown key");
+        assertTrue(refuses("issuer = https://a.example/\n",
+            "config /etc/rambo/rambo.conf: issuer \"https://a.example/\" must be https://host without path"), "a path");
+        assertTrue(refuses("issuer = http://a.example\n",
+            "config /etc/rambo/rambo.conf: issuer \"http://a.example\" must be https://host without path"), "http");
+        assertTrue(refuses("", "config /etc/rambo/rambo.conf: issuer \"\" must be https://host without path"), "no issuer");
+        assertTrue(refuses("issuer = https://a.example\nlisten = tcp\n",
+            "config /etc/rambo/rambo.conf: listen \"tcp\": fcgi or http"), "a listen mode");
+        assertTrue(refuses("issuer = https://a.example\nlisten = http\nhttp_addr = 0.0.0.0:8480\n",
+            "config /etc/rambo/rambo.conf: http_addr \"0.0.0.0:8480\": http mode listens on loopback only"), "not loopback");
+        assertTrue(refuses("issuer = https://a.example\nlisten = http\nhttp_addr = [::1]:8480\n", ""), "IPv6 loopback");
+        assertTrue(refuses("issuer = https://a.example\ndb = /var/rambo/../rambo.db\n",
+            "config /etc/rambo/rambo.conf: db \"/var/rambo/../rambo.db\" must be an absolute, clean path"), "an unclean path");
+        assertTrue(refuses("issuer = https://a.example\nvault = etc/.rambo.env\n",
+            "config /etc/rambo/rambo.conf: vault \"etc/.rambo.env\" must be an absolute, clean path"), "a relative path");
+        assertTrue(refuses("issuer = https://a.example\nsession_idle = 13h\n",
+            "config /etc/rambo/rambo.conf: session_idle 13h0m0s / session_max 12h0m0s: both positive, idle <= max <= 168h"),
+            "idle above max");
+        assertTrue(refuses("issuer = https://a.example\nsession_idle = 2x\n",
+            "config /etc/rambo/rambo.conf: session_idle: time: invalid duration \"2x\""), "a duration");
+        assertTrue(refuses("issuer = https://a.example\nlogin.ban_after = 2\n",
+            "config /etc/rambo/rambo.conf: login.ban_after 2: 0 (off) or 3 to 100"), "ban after 2");
+        assertTrue(refuses("issuer = https://a.example\nlogin.ban_after = many\n",
+            "config /etc/rambo/rambo.conf: login.ban_after: \"many\" is not a whole number"), "not a number");
+        assertTrue(refuses("issuer = https://a.example\nlogin.ban_window = 30s\n",
+            "config /etc/rambo/rambo.conf: login.ban_window 30s: 1m to 24h"), "a short window");
+        assertTrue(refuses("issuer = https://a.example\nlogin.ban_seconds = 7200\n",
+            "config /etc/rambo/rambo.conf: login.ban_seconds 7200: 60 to 3600 (the cap BanByCGI sets)"), "a long ban");
+        assertTrue(refuses("issuer = https://a.example\nlogin.ban_after = 0\nlogin.ban_seconds = 7200\n", ""),
+            "no ban, no check of its length");
+        assertTrue(refuses("issuer = https://a.example\ntoken_alg = ML-DSA-44\n", ""), "token_alg of the Go provider's file");
+        assertTrue(refuses("issuer = https://a.example\ntoken_alg = ML-DSA-44-Ed25519\n", ""), "the composite as token_alg");
+        assertTrue(refuses("issuer = https://a.example\ntoken_alg = RS256\n",
+            "config /etc/rambo/rambo.conf: token_alg \"RS256\": one of ML-DSA-44, ML-DSA-44-Ed25519"), "another algorithm");
+        assertTrue(refuses("issuer = https://a.example\nroot_accounts = abcdefghijklmnopqrstuvwxya\n",
+            "config /etc/rambo/rambo.conf: root_accounts needs at least two account IDs (or none while setting up)"),
+            "one root");
+        assertTrue(refuses("issuer = https://a.example\nroot_accounts = abcdefghijklmnopqrstuvwxya, x\n",
+            "config /etc/rambo/rambo.conf: root_accounts: \"x\" is not an account ID (see `rambo account list`)"),
+            "no ID");
+        assertTrue(refuses("issuer = https://a.example\nroot_accounts = abcdefghijklmnopqrstuvwxya abcdefghijklmnopqrstuvwxya\n",
+            "config /etc/rambo/rambo.conf: root_accounts: \"abcdefghijklmnopqrstuvwxya\" named twice"), "twice");
+        return nil;
+    end;
+
+    generic [C: Region]
+    function issuerOf(config: &[Config, C]): Span[Nat8, C] is
+        return asSpan(&(config->issuer));
+    end;
+
+    generic [C: Region]
+    function dbOf(config: &[Config, C]): Span[Nat8, C] is
+        return asSpan(&(config->db));
+    end;
+
+    generic [C: Region]
+    function vaultOf(config: &[Config, C]): Span[Nat8, C] is
+        return asSpan(&(config->vault));
+    end;
+
+    generic [C: Region]
+    function socketOf(config: &[Config, C]): Span[Nat8, C] is
+        return asSpan(&(config->socketDir));
+    end;
+
+    generic [C: Region]
+    function groupOf(config: &[Config, C]): Span[Nat8, C] is
+        return asSpan(&(config->socketGroup));
+    end;
+
+    generic [C: Region]
+    function numbersHold(config: &[Config, C], idle: Int64, max: Int64, after: Int64, window: Int64, ban: Int64): Bool is
+        return (config->sessionIdle = idle) and (config->sessionMax = max) and (config->banAfter = after)
+            and (config->banWindow = window) and (config->banSeconds = ban);
+    end;
+
+    generic [C: Region]
+    function rootCount(config: &[Config, C]): Index is
+        return bufferLength(&(config->rootAccounts));
+    end;
+
+    constant typical: Span[Nat8, Static] := "# rambo\r\n\r\nissuer = https://auth.example.org\r\n   # an indented comment\nsocket_group = _hiawatha # not a comment\nsession_idle = 1h30m\nsession_max = \\\n  12h\nlogin.ban_window=1h\nroot_accounts = abcdefghijklmnopqrstuvwxya,\\\n 234567abcdefghijklmnopqrs4\nno equals sign here\ndb =\nlogin.ban_after = 5\nlogin.ban_after = +4\n";
+
+    function testTypicalFile(): Unit is
+        case readConfig(typical, "/etc/rambo/rambo.conf", "openbsd") of
+            when Right(right as config: Config) do
+                assertTrue(equal(issuerOf(&config), "https://auth.example.org"), "the issuer, CR left off");
+                assertTrue(equal(groupOf(&config), "_hiawatha # not a comment"), "a # after a value is the value");
+                assertTrue(equal(dbOf(&config), "/var/rambo/rambo.db"), "an empty value takes the default");
+                assertTrue(equal(vaultOf(&config), "/etc/rambo/.rambo.env"), "the vault of OpenBSD");
+                assertTrue(equal(socketOf(&config), "/var/run/rambo"), "the socket directory of OpenBSD");
+                assertTrue(numbersHold(&config, 5400, 43200, 4, 3600, 900), "durations in seconds, the last value");
+                assertTrue(rootCount(&config) = 2, "two roots over two lines");
+                assertTrue(isRoot(&config, rootA), "the first root");
+                assertTrue(isRoot(&config, rootB), "the second root");
+                assertFalse(isRoot(&config, "abcdefghijklmnopqrstuvwxye"), "no root");
+                destroyConfig(config);
+            when Left(left as message: String) do
+                assertTrue(false, "the typical file is read");
+                destroyString(message);
+        end case;
+        case readConfig("issuer = https://auth.example.org\n", "/x.conf", "linux") of
+            when Right(right as config: Config) do
+                assertTrue(equal(dbOf(&config), "/var/lib/rambo/rambo.db"), "the database of Linux");
+                assertTrue(equal(socketOf(&config), "/run/rambo"), "the socket directory of Linux");
+                assertTrue(numbersHold(&config, 7200, 43200, 3, 900, 900), "the defaults");
+                destroyConfig(config);
+            when Left(left as message: String) do
+                assertTrue(false, "a file with only the issuer is read");
+                destroyString(message);
+        end case;
+        assertTrue(equal(systemDirectories("darwin"), "/usr/local/etc/rambo:/usr/local/var/rambo:/usr/local/var/run/rambo"),
+            "the directories of macOS");
+        return nil;
+    end;
+
+    function testPaths(): Unit is
+        assertTrue(isCleanAbsolute("/"), "the root");
+        assertTrue(isCleanAbsolute("/var/rambo/rambo.db"), "a plain path");
+        assertTrue(isCleanAbsolute("/var/.rambo_pepper"), "a dot file");
+        assertFalse(isCleanAbsolute("/var/rambo/"), "a trailing slash");
+        assertFalse(isCleanAbsolute("/var//rambo"), "two slashes");
+        assertFalse(isCleanAbsolute("/var/./rambo"), "a dot part");
+        assertFalse(isCleanAbsolute("/var/rambo/.."), "a dot-dot part");
+        assertFalse(isCleanAbsolute("var/rambo"), "relative");
+        assertFalse(isCleanAbsolute(""), "empty");
+        return nil;
+    end;
+end module body.

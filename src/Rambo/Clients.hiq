@@ -1,0 +1,580 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    destroyEmpty,
+    nthRef,
+    length as bufferLength
+);
+import Standard.Text (
+    equal,
+    startsWith,
+    trim,
+    formatInt
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    noValues,
+    withInt64,
+    withText,
+    execute,
+    describe
+);
+import Standard.Log (
+    Log
+);
+import Standard.Vault (
+    Vault,
+    VaultError,
+    openVault,
+    closeVault,
+    describeVaultError
+);
+import Wolly.OpKey (
+    RingKey,
+    KeyFamily,
+    MlDsa,
+    Composite,
+    algorithmOf,
+    rotate,
+    saveRing
+);
+import Wolly.OpBase (
+    OpSettings
+);
+import Wolly.OpClient (
+    OpClient,
+    ClientKind,
+    WebClient,
+    Limits,
+    ClientProblem,
+    destroyClient,
+    destroyClients,
+    destroyProblem,
+    describeProblem,
+    kindName,
+    kindOf,
+    listClients,
+    getClient,
+    addClient,
+    rotateSecret,
+    setLimits,
+    setStartUrl,
+    setLogo,
+    setIdTokenAlg,
+    setSignAlg,
+    setLaxAuth,
+    setDisabled,
+    logoDataUri
+);
+import Rambo.Config (
+    Config,
+    goDurationText
+);
+import Rambo.Context (
+    vaultKeyName,
+    signingPrefix
+);
+import Rambo.Table (
+    addRow,
+    tableText,
+    destroyTable
+);
+import Rambo.Admin (
+    auditCommand
+);
+
+module body Rambo.Clients is
+    constant renameClient: Span[Nat8, Static] := "UPDATE op_clients SET name = ?, updated_at = ? WHERE id = ?";
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var rest: Buffer[String] := strings;
+        while bufferLength(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyDefinition(definition: Definition): Unit is
+        let { id: String, name: String, kind: String, redirects: Buffer[String], logouts: Buffer[String],
+            audience: Buffer[String], signAlg: String, laxAuth: Bool, startUrl: String } := definition;
+        destroyString(id);
+        destroyString(name);
+        destroyString(kind);
+        destroyStrings(redirects);
+        destroyStrings(logouts);
+        destroyStrings(audience);
+        destroyString(signAlg);
+        destroyString(startUrl);
+        return nil;
+    end;
+
+    generic [B: Region]
+    function copied(strings: &[Buffer[String], B]): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(strings) do
+            insertBack(&!out, fromSpan(asSpan(nthRef(strings, i))));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    function dbText(error: DbError): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "database: ");
+        writeString(&!b, describe(error));
+        return finalize(b);
+    end;
+
+    -- The text of problem as the Go library oidcop words it.
+    function problemText(problem: ClientProblem): String is
+        let text: String := describeProblem(&problem);
+        destroyProblem(problem);
+        if startsWith(asSpan(&text), "oidcop: ") then
+            return text;
+        end if;
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "oidcop: ");
+        writeString(&!b, asSpan(&text));
+        destroyString(text);
+        return finalize(b);
+    end;
+
+    generic [S: Region]
+    function sessionOf(settings: &[OpSettings, S]): Limits is
+        return settings->session;
+    end;
+
+    generic [S: Region]
+    function httpOf(settings: &[OpSettings, S]): Bool is
+        return settings->allowHttp;
+    end;
+
+    -- The answer of a change: None when it held; the audit line either way.
+    generic [L: Region, A: Region, I: Region]
+    function settled(log: &![Log, L], actor: Span[Nat8, A], action: Span[Nat8, Static], id: Span[Nat8, I],
+        result: Either[DbError, Option[ClientProblem]], extra: Span[Nat8, Static], value: Span[Nat8, Static],
+        now: Int64): Option[String] is
+        case result of
+            when Left(left as error: DbError) do
+                auditCommand(&~log, actor, action, id, "failed", extra, value, now);
+                return Some(value => dbText(error));
+            when Right(right as problem: Option[ClientProblem]) do
+                case problem of
+                    when Some(value as p: ClientProblem) do
+                        auditCommand(&~log, actor, action, id, "failed", extra, value, now);
+                        return Some(value => problemText(p));
+                    when None do
+                        auditCommand(&~log, actor, action, id, "ok", extra, value, now);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+        end case;
+    end;
+
+    generic [F: Region]
+    function clientOf(definition: &[Definition, F], kind: ClientKind): OpClient is
+        return OpClient(id => fromSpan(asSpan(&(definition->id))), name => fromSpan(asSpan(&(definition->name))), kind => kind,
+            secretHash => fromSpan(""), redirectUris => copied(&(definition->redirects)),
+            logoutUris => copied(&(definition->logouts)), audience => copied(&(definition->audience)),
+            limits => Limits(idle => 0, max => 0, refresh => 0), disabled => false,
+            initiateLoginUri => fromSpan(asSpan(&(definition->startUrl))), logo => fromSpan(""),
+            idTokenAlg => fromSpan(""), signAlg => fromSpan(asSpan(&(definition->signAlg))), laxAuth => definition->laxAuth,
+            created => 0, updated => 0);
+    end;
+
+    -- The algorithms a client may name; empty follows token_alg.
+    generic [G: Region]
+    function signsWith(alg: Span[Nat8, G]): Bool is
+        return equal(alg, "ML-DSA-44") or equal(alg, "ML-DSA-44-Ed25519");
+    end;
+
+    -- The text of a refused algorithm, closed by what may stand there.
+    generic [G: Region]
+    function refusedAlg(alg: Span[Nat8, G], allowed: Span[Nat8, Static]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "algorithm \"");
+        writeString(&!b, alg);
+        writeString(&!b, "\": ");
+        writeString(&!b, allowed);
+        return finalize(b);
+    end;
+
+    generic [D: Region, L: Region, S: Region, A: Region, F: Region]
+    function addNewClient(db: &![Database[Writing], D], log: &![Log, L], settings: &[OpSettings, S], actor: Span[Nat8, A],
+        definition: &[Definition, F], now: Int64): Either[String, String] is
+        let id: Span[Nat8, F] := asSpan(&(definition->id));
+        let alg: Span[Nat8, F] := asSpan(&(definition->signAlg));
+        if (spanLength(alg) > 0) and (not signsWith(alg)) then
+            auditCommand(&~log, actor, "client.add", id, "failed", "alg", alg, now);
+            return Left(left => refusedAlg(alg, "one of ML-DSA-44, ML-DSA-44-Ed25519"));
+        end if;
+        case kindOf(asSpan(&(definition->kind))) of
+            when None do
+                auditCommand(&~log, actor, "client.add", id, "failed", "kind", asSpan(&(definition->kind)), now);
+                return Left(left => fromSpan("oidcop: invalid client definition: kind must be web, native or service"));
+            when Some(value as kind: ClientKind) do
+                let client: OpClient := clientOf(definition, kind);
+                let result: Either[DbError, Either[ClientProblem, String]] := addClient(&~db, &client, sessionOf(settings),
+                    httpOf(settings), now);
+                destroyClient(client);
+                case result of
+                    when Left(left as error: DbError) do
+                        auditCommand(&~log, actor, "client.add", id, "failed", "kind", kindName(kind), now);
+                        return Left(left => dbText(error));
+                    when Right(right as outcome: Either[ClientProblem, String]) do
+                        case outcome of
+                            when Left(left as problem: ClientProblem) do
+                                auditCommand(&~log, actor, "client.add", id, "failed", "kind", kindName(kind), now);
+                                return Left(left => problemText(problem));
+                            when Right(right as secret: String) do
+                                auditCommand(&~log, actor, "client.add", id, "ok", "kind", kindName(kind), now);
+                                return Right(right => secret);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- The third column is the algorithm of the client's tokens and stays
+    -- there, for the scripts that read it; the fourth says whether the
+    -- client names it or follows token_alg.
+    generic [C: Region]
+    function clientLine(client: &[OpClient, C], fallback: Span[Nat8, Static]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, asSpan(&(client->id)));
+        writeByte(&!b, 9);
+        writeString(&!b, kindName(client->kind));
+        writeByte(&!b, 9);
+        if length(&(client->signAlg)) > 0 then
+            writeString(&!b, asSpan(&(client->signAlg)));
+            writeString(&!b, "\tclient");
+        else
+            writeString(&!b, fallback);
+            writeString(&!b, "\tdefault");
+        end if;
+        writeByte(&!b, 9);
+        writeString(&!b, asSpan(&(client->name)));
+        writeByte(&!b, 9);
+        if client->disabled then
+            writeString(&!b, "disabled");
+        else
+            writeString(&!b, "enabled");
+        end if;
+        writeByte(&!b, 9);
+        if length(&(client->initiateLoginUri)) > 0 then
+            writeString(&!b, asSpan(&(client->initiateLoginUri)));
+        else
+            writeByte(&!b, '-');
+        end if;
+        writeByte(&!b, 9);
+        var i: Index := 0;
+        while i < bufferLength(&(client->redirectUris)) do
+            if i > 0 then
+                writeByte(&!b, ' ');
+            end if;
+            writeString(&!b, asSpan(nthRef(&(client->redirectUris), i)));
+            i := i + 1;
+        end while;
+        return finalize(b);
+    end;
+
+    generic [D: Region, S: Region]
+    function clientTable(db: &![Database[Writing], D], settings: &[OpSettings, S]): Either[String, String] is
+        let fallback: Span[Nat8, Static] := algorithmOf(settings->defaultFamily);
+        case listClients(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => dbText(error));
+            when Right(right as clients: Buffer[OpClient]) do
+                var table: Buffer[Buffer[String]] := allocateEmpty();
+                addRow(&!table, "ID\tKIND\tALG\tFROM\tNAME\tSTATE\tSTART\tREDIRECT");
+                var i: Index := 0;
+                while i < bufferLength(&clients) do
+                    let line: String := clientLine(nthRef(&clients, i), fallback);
+                    addRow(&!table, asSpan(&line));
+                    destroyString(line);
+                    i := i + 1;
+                end while;
+                destroyClients(clients);
+                let text: String := tableText(&table);
+                destroyTable(table);
+                return Right(right => text);
+        end case;
+    end;
+
+    generic [D: Region, L: Region, S: Region, A: Region, I: Region]
+    function setClientLimits(db: &![Database[Writing], D], log: &![Log, L], settings: &[OpSettings, S], actor: Span[Nat8, A],
+        id: Span[Nat8, I], limits: Limits, now: Int64): Option[String] is
+        let result: Either[DbError, Option[ClientProblem]] := setLimits(&~db, id, limits, sessionOf(settings), now);
+        let idle: String := goDurationText(limits.idle * 1000000000);
+        let out: Option[String] := settledWith(&~log, actor, "client.limits", id, result, "idle", asSpan(&idle), now);
+        destroyString(idle);
+        return out;
+    end;
+
+    -- settled with a value that is not static.
+    generic [L: Region, A: Region, I: Region, V: Region]
+    function settledWith(log: &![Log, L], actor: Span[Nat8, A], action: Span[Nat8, Static], id: Span[Nat8, I],
+        result: Either[DbError, Option[ClientProblem]], extra: Span[Nat8, Static], value: Span[Nat8, V],
+        now: Int64): Option[String] is
+        case result of
+            when Left(left as error: DbError) do
+                auditCommand(&~log, actor, action, id, "failed", extra, value, now);
+                return Some(value => dbText(error));
+            when Right(right as problem: Option[ClientProblem]) do
+                case problem of
+                    when Some(value as p: ClientProblem) do
+                        auditCommand(&~log, actor, action, id, "failed", extra, value, now);
+                        return Some(value => problemText(p));
+                    when None do
+                        auditCommand(&~log, actor, action, id, "ok", extra, value, now);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+        end case;
+    end;
+
+    generic [D: Region, L: Region, S: Region, A: Region, I: Region, G: Region]
+    function setClientAlg(db: &![Database[Writing], D], log: &![Log, L], settings: &[OpSettings, S], actor: Span[Nat8, A],
+        id: Span[Nat8, I], alg: Span[Nat8, G], now: Int64): Option[String] is
+        let none: Span[Nat8, Static] := "";
+        let named: Bool := not equal(alg, "default");
+        if named and (not signsWith(alg)) then
+            return Some(value => refusedAlg(alg, "ML-DSA-44, ML-DSA-44-Ed25519 or default"));
+        end if;
+        let cleared: Either[DbError, Option[ClientProblem]] := setIdTokenAlg(&~db, id, none, sessionOf(settings),
+            httpOf(settings), now);
+        case cleared of
+            when Left(left as error: DbError) do
+                auditCommand(&~log, actor, "client.alg", id, "failed", "alg", alg, now);
+                return Some(value => dbText(error));
+            when Right(right as problem: Option[ClientProblem]) do
+                case problem of
+                    when Some(value as p: ClientProblem) do
+                        auditCommand(&~log, actor, "client.alg", id, "failed", "alg", alg, now);
+                        return Some(value => problemText(p));
+                    when None do
+                        skip;
+                end case;
+        end case;
+        if named then
+            let set: Either[DbError, Option[ClientProblem]] := setSignAlg(&~db, id, alg, sessionOf(settings),
+                httpOf(settings), now);
+            return settledWith(&~log, actor, "client.alg", id, set, "alg", alg, now);
+        end if;
+        let reset: Either[DbError, Option[ClientProblem]] := setSignAlg(&~db, id, none, sessionOf(settings),
+            httpOf(settings), now);
+        return settled(&~log, actor, "client.alg", id, reset, "alg", "default", now);
+    end;
+
+    generic [D: Region, L: Region, S: Region, A: Region, I: Region]
+    function setClientLax(db: &![Database[Writing], D], log: &![Log, L], settings: &[OpSettings, S], actor: Span[Nat8, A],
+        id: Span[Nat8, I], lax: Bool, now: Int64): Option[String] is
+        let result: Either[DbError, Option[ClientProblem]] := setLaxAuth(&~db, id, lax, sessionOf(settings), httpOf(settings),
+            now);
+        var shown: Span[Nat8, Static] := "false";
+        if lax then
+            shown := "true";
+        end if;
+        return settled(&~log, actor, "client.lax", id, result, "lax", shown, now);
+    end;
+
+    generic [D: Region, L: Region, A: Region, I: Region]
+    function setClientDisabled(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], id: Span[Nat8, I],
+        disabled: Bool, now: Int64): Option[String] is
+        let result: Either[DbError, Option[ClientProblem]] := setDisabled(&~db, id, disabled, now);
+        var action: Span[Nat8, Static] := "client.enable";
+        if disabled then
+            action := "client.disable";
+        end if;
+        return settled(&~log, actor, action, id, result, "", "", now);
+    end;
+
+    generic [D: Region, L: Region, A: Region, I: Region]
+    function rotateClientSecret(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], id: Span[Nat8, I],
+        now: Int64): Either[String, String] is
+        case rotateSecret(&~db, id, now) of
+            when Left(left as error: DbError) do
+                auditCommand(&~log, actor, "client.rotate-secret", id, "failed", "", "", now);
+                return Left(left => dbText(error));
+            when Right(right as outcome: Either[ClientProblem, String]) do
+                case outcome of
+                    when Left(left as problem: ClientProblem) do
+                        auditCommand(&~log, actor, "client.rotate-secret", id, "failed", "", "", now);
+                        return Left(left => problemText(problem));
+                    when Right(right as secret: String) do
+                        auditCommand(&~log, actor, "client.rotate-secret", id, "ok", "", "", now);
+                        return Right(right => secret);
+                end case;
+        end case;
+    end;
+
+    generic [D: Region, L: Region, S: Region, A: Region, I: Region, U: Region]
+    function setClientStart(db: &![Database[Writing], D], log: &![Log, L], settings: &[OpSettings, S], actor: Span[Nat8, A],
+        id: Span[Nat8, I], uri: Span[Nat8, U], now: Int64): Option[String] is
+        let result: Either[DbError, Option[ClientProblem]] := setStartUrl(&~db, id, uri, sessionOf(settings),
+            httpOf(settings), now);
+        var shown: Span[Nat8, Static] := "false";
+        if spanLength(uri) > 0 then
+            shown := "true";
+        end if;
+        return settled(&~log, actor, "client.start-url", id, result, "set", shown, now);
+    end;
+
+    generic [D: Region, L: Region, S: Region, A: Region, I: Region, B: Region]
+    function setClientLogo(db: &![Database[Writing], D], log: &![Log, L], settings: &[OpSettings, S], actor: Span[Nat8, A],
+        id: Span[Nat8, I], bytes: Span[Nat8, B], clear: Bool, now: Int64): Option[String] is
+        var shown: Span[Nat8, Static] := "true";
+        if clear then
+            shown := "false";
+            let result: Either[DbError, Option[ClientProblem]] := setLogo(&~db, id, "", sessionOf(settings), httpOf(settings),
+                now);
+            return settled(&~log, actor, "client.logo", id, result, "set", shown, now);
+        end if;
+        case logoDataUri(bytes) of
+            when Left(left as problem: ClientProblem) do
+                auditCommand(&~log, actor, "client.logo", id, "failed", "set", shown, now);
+                return Some(value => problemText(problem));
+            when Right(right as uri: String) do
+                let result: Either[DbError, Option[ClientProblem]] := setLogo(&~db, id, asSpan(&uri), sessionOf(settings),
+                    httpOf(settings), now);
+                destroyString(uri);
+                return settled(&~log, actor, "client.logo", id, result, "set", shown, now);
+        end case;
+    end;
+
+    -- Whether name holds a byte below a blank or the delete.
+    generic [N: Region]
+    function hasControl(name: Span[Nat8, N]): Bool is
+        var i: Index := 0;
+        while i < spanLength(name) do
+            if (name[i] < 32) or (name[i] = 127) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [D: Region, L: Region, A: Region, I: Region, N: Region]
+    function setClientName(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], id: Span[Nat8, I],
+        name: Span[Nat8, N], now: Int64): Option[String] is
+        let t: Span[Nat8, N] := trim(name);
+        if (spanLength(t) = 0) or (spanLength(t) > 100) then
+            auditCommand(&~log, actor, "client.set-name", id, "failed", "", "", now);
+            return Some(value => fromSpan("oidcop: invalid client definition: name must be 1-100 bytes"));
+        end if;
+        if hasControl(t) then
+            auditCommand(&~log, actor, "client.set-name", id, "failed", "", "", now);
+            return Some(value => fromSpan("oidcop: invalid client definition: name holds a control character"));
+        end if;
+        case getClient(&~db, id) of
+            when Left(left as error: DbError) do
+                auditCommand(&~log, actor, "client.set-name", id, "failed", "", "", now);
+                return Some(value => dbText(error));
+            when Right(right as found: Option[OpClient]) do
+                case found of
+                    when None do
+                        auditCommand(&~log, actor, "client.set-name", id, "failed", "", "", now);
+                        return Some(value => fromSpan("oidcop: no such client"));
+                    when Some(value as client: OpClient) do
+                        destroyClient(client);
+                end case;
+        end case;
+        case execute(&~db, renameClient, withText(withInt64(withText(noValues(), t), now), id)) of
+            when Left(left as error: DbError) do
+                auditCommand(&~log, actor, "client.set-name", id, "failed", "", "", now);
+                var b: StringBuilder := makeStringBuilder();
+                writeString(&!b, "admin: set client name\n");
+                let text: String := dbText(error);
+                writeString(&!b, asSpan(&text));
+                destroyString(text);
+                return Some(value => finalize(b));
+            when Right(right as changed: Nat64) do
+                auditCommand(&~log, actor, "client.set-name", id, "ok", "", "", now);
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    --- Signing keys
+
+    generic [L: Region, C: Region, R: Region, A: Region]
+    function rotateKeysNow(log: &![Log, L], config: &[Config, C], ring: &![Buffer[RingKey], R], actor: Span[Nat8, A],
+        now: Int64): Either[String, String] is
+        var pure: String := fromSpan("");
+        case rotate(&~ring, MlDsa(), now) of
+            when None do
+                auditCommand(&~log, actor, "keys.rotate", "-", "failed", "", "", now);
+                destroyString(pure);
+                return Left(left => fromSpan("oidcop: no new signing key could be made"));
+            when Some(value as kid: String) do
+                destroyString(pure);
+                pure := kid;
+        end case;
+        var hybrid: String := fromSpan("");
+        case rotate(&~ring, Composite(), now) of
+            when None do
+                auditCommand(&~log, actor, "keys.rotate", "-", "failed", "", "", now);
+                destroyString(pure);
+                destroyString(hybrid);
+                return Left(left => fromSpan("oidcop: no new signing key could be made"));
+            when Some(value as kid: String) do
+                destroyString(hybrid);
+                hybrid := kid;
+        end case;
+        case openVault(asSpan(&(config->vault)), asSpan(&(config->pepper)), vaultKeyName()) of
+            when Left(left as error: VaultError) do
+                auditCommand(&~log, actor, "keys.rotate", "-", "failed", "", "", now);
+                destroyString(pure);
+                destroyString(hybrid);
+                return Left(left => describeVaultError(error));
+            when Right(right as opened: Vault) do
+                var vault: Vault := opened;
+                let saved: Either[VaultError, Unit] := saveRing(&!vault, signingPrefix(), &ring);
+                closeVault(vault);
+                case saved of
+                    when Left(left as error: VaultError) do
+                        auditCommand(&~log, actor, "keys.rotate", "-", "failed", "", "", now);
+                        destroyString(pure);
+                        destroyString(hybrid);
+                        return Left(left => describeVaultError(error));
+                    when Right(right as done: Unit) do
+                        auditCommand(&~log, actor, "keys.rotate", asSpan(&pure), "ok", "alg", "ML-DSA-44", now);
+                        auditCommand(&~log, actor, "keys.rotate", asSpan(&hybrid), "ok", "alg", "ML-DSA-44-Ed25519", now);
+                        var b: StringBuilder := makeStringBuilder();
+                        writeString(&!b, "ML-DSA-44 ");
+                        writeString(&!b, asSpan(&pure));
+                        writeString(&!b, "\nML-DSA-44-Ed25519 ");
+                        writeString(&!b, asSpan(&hybrid));
+                        destroyString(pure);
+                        destroyString(hybrid);
+                        return Right(right => finalize(b));
+                end case;
+        end case;
+    end;
+end module body.

@@ -1,0 +1,174 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+What the command line does to clients and to the signing keys, each step
+with its audit line.
+
+- A client is checked before it is stored: its ID, kind, URIs, limits and
+  algorithm; a web or service client gets a secret shown once.
+- A logo is a picture of png, jpeg, gif or webp of at most 48 KiB, kept as
+  a data URI.
+- Every refusal is a Left with the text the command line prints after
+  rambo and a colon.
+
+    case addNewClient(&!db, &!log, &settings, actor, &definition, now) of
+        when Right(right as secret: String) do
+            ...
+"""
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing
+);
+import Standard.Log (
+    Log
+);
+import Wolly.OpKey (
+    RingKey
+);
+import Wolly.OpBase (
+    OpSettings
+);
+import Wolly.OpClient (
+    Limits
+);
+import Rambo.Config (
+    Config
+);
+
+module Rambo.Clients is
+    """
+    What client add was given.
+    """
+    record Definition: Linear is
+        id: String;
+        name: String;
+        kind: String;
+        redirects: Buffer[String];
+        logouts: Buffer[String];
+        audience: Buffer[String];
+        signAlg: String;
+        laxAuth: Bool;
+        startUrl: String;
+    end;
+
+    """
+    Frees definition.
+    No contract: it only frees.
+    """
+    function destroyDefinition(definition: Definition): Unit;
+
+    """
+    Registers the client of definition.  Right its secret, empty for a
+    native client.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, S: Region, A: Region, F: Region]
+    function addNewClient(db: &![Database[Writing], D], log: &![Log, L], settings: &[OpSettings, S], actor: Span[Nat8, A],
+        definition: &[Definition, F], now: Int64): Either[String, String]
+        requires now > 0;
+
+    """
+    The table of the clients as client list prints it.
+    No contract: the answer is the work of the database.
+    """
+    generic [D: Region, S: Region]
+    function clientTable(db: &![Database[Writing], D], settings: &[OpSettings, S]): Either[String, String];
+
+    """
+    Sets the limits of the client id, in seconds, 0 for the provider's.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, S: Region, A: Region, I: Region]
+    function setClientLimits(db: &![Database[Writing], D], log: &![Log, L], settings: &[OpSettings, S], actor: Span[Nat8, A],
+        id: Span[Nat8, I], limits: Limits, now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    Sets the algorithm of the tokens of the client id: ML-DSA-44,
+    ML-DSA-44-Ed25519, or default for token_alg of the configuration.  It
+    clears the mark RS256 an older provider left.  Anything else is refused.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, S: Region, A: Region, I: Region, G: Region]
+    function setClientAlg(db: &![Database[Writing], D], log: &![Log, L], settings: &[OpSettings, S], actor: Span[Nat8, A],
+        id: Span[Nat8, I], alg: Span[Nat8, G], now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    Lets the web client id leave the code challenge and the nonce out, or
+    takes it back.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, S: Region, A: Region, I: Region]
+    function setClientLax(db: &![Database[Writing], D], log: &![Log, L], settings: &[OpSettings, S], actor: Span[Nat8, A],
+        id: Span[Nat8, I], lax: Bool, now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    Blocks the client id, or unblocks it.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, A: Region, I: Region]
+    function setClientDisabled(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], id: Span[Nat8, I],
+        disabled: Bool, now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    Gives the web or service client id a new secret.  Right the secret.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, A: Region, I: Region]
+    function rotateClientSecret(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], id: Span[Nat8, I],
+        now: Int64): Either[String, String]
+        requires now > 0;
+
+    """
+    Sets the start page of the client id, empty to remove its tile.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, S: Region, A: Region, I: Region, U: Region]
+    function setClientStart(db: &![Database[Writing], D], log: &![Log, L], settings: &[OpSettings, S], actor: Span[Nat8, A],
+        id: Span[Nat8, I], uri: Span[Nat8, U], now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    Sets the logo of the client id from the bytes of a picture, or removes
+    it when clear is true.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, S: Region, A: Region, I: Region, B: Region]
+    function setClientLogo(db: &![Database[Writing], D], log: &![Log, L], settings: &[OpSettings, S], actor: Span[Nat8, A],
+        id: Span[Nat8, I], bytes: Span[Nat8, B], clear: Bool, now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    Gives the client id the name name: 1 to 100 bytes after trimming, no
+    control byte.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, A: Region, I: Region, N: Region]
+    function setClientName(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], id: Span[Nat8, I],
+        name: Span[Nat8, N], now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    Makes a new signing key of ML-DSA-44 and one of ML-DSA-44-Ed25519 now,
+    keeps the ring in the vault of config, and gives one line for each new
+    key: its algorithm, a blank and its kid.
+    No ensures: the vault is written.
+    """
+    generic [L: Region, C: Region, R: Region, A: Region]
+    function rotateKeysNow(log: &![Log, L], config: &[Config, C], ring: &![Buffer[RingKey], R], actor: Span[Nat8, A],
+        now: Int64): Either[String, String]
+        requires now > 0;
+end module.

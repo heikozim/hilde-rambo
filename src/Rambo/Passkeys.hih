@@ -1,0 +1,156 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The passkeys of the accounts as rambo shows them: the name a person gives each one and when it was last used, beside the key Wolly.Passkey keeps.
+
+- A passkey belongs to one account; the name of Wolly.Passkey is the account ID.
+- A name is at most 64 bytes, without a control character.
+- The relying party and the origin are those of the issuer.
+
+    let views: Either[DbError, Buffer[PasskeyView]] := passkeysOf(&!db, "a2f0c9e4-1b7d-4c3e-9a51-7d2b8e6f4a10");
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Wolly.Passkey (
+    Refusal
+);
+
+module Rambo.Passkeys is
+    """
+    A passkey of an account: its credential ID in base64url, its name, when
+    it was added and when last used, 0 for never.
+    """
+    record PasskeyView: Linear is
+        credential: String;
+        label: String;
+        createdAt: Int64;
+        lastUsed: Int64;
+    end;
+
+    """
+    Frees a list of passkeysOf.
+    No contract: it only frees.
+    """
+    function destroyPasskeyViews(views: Buffer[PasskeyView]): Unit;
+
+    """
+    The most bytes of a name: 64.
+    """
+    function mostLabel(): Index
+        ensures result = 64;
+
+    """
+    Makes the tables of Wolly.Passkey and of the names, if they are not
+    there.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function preparePasskeyTables(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    The relying party of issuer: its host without the port.
+    No contract: the length depends on where the host ends.
+    """
+    generic [I: Region]
+    function partyOf(issuer: Span[Nat8, I]): String;
+
+    """
+    The origin of issuer: the scheme, the host and the port, without a path.
+    """
+    generic [I: Region]
+    function originOf(issuer: Span[Nat8, I]): String
+        ensures length(&result) <= spanLength(issuer);
+
+    """
+    The name a challenge for a passkey login of the request req is bound
+    to: the SHA-256 of req in lower-case hexadecimal, empty when the hash
+    fails.
+    """
+    generic [Q: Region]
+    function loginBound(req: Span[Nat8, Q]): String
+        ensures (length(&result) = 64) or (length(&result) = 0);
+
+    """
+    The name typed for a passkey, trimmed; Passkey for nothing, None for
+    one over mostLabel bytes or with a control character.
+    No contract: an Option read from text.
+    """
+    generic [L: Region]
+    function cleanLabel(typed: Span[Nat8, L]): Option[String];
+
+    """
+    Keeps the name of a passkey credential just registered for account.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, C: Region, A: Region, L: Region]
+    function keepLabel(db: &![Database[Writing], R], credential: Span[Nat8, C], account: Span[Nat8, A],
+        label: Span[Nat8, L]): Option[DbError];
+
+    """
+    Notes that credential was used at now.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, C: Region]
+    function touchPasskey(db: &![Database[Writing], R], credential: Span[Nat8, C], now: Int64): Option[DbError]
+        requires now > 0;
+
+    """
+    Gives the passkey credential of account the name label; Right false
+    when account has no such passkey.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, A: Region, C: Region, L: Region]
+    function renamePasskey(db: &![Database[Writing], R], account: Span[Nat8, A], credential: Span[Nat8, C],
+        label: Span[Nat8, L]): Either[DbError, Bool];
+
+    """
+    Removes the passkey credential of account, key and name; Right false
+    when account has no such passkey.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, A: Region, C: Region]
+    function forgetPasskey(db: &![Database[Writing], R], account: Span[Nat8, A],
+        credential: Span[Nat8, C]): Either[DbError, Bool];
+
+    """
+    Removes every passkey of account; Right with how many it had.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, A: Region]
+    function forgetPasskeys(db: &![Database[Writing], R], account: Span[Nat8, A]): Either[DbError, Int64];
+
+    """
+    The passkeys of account, the oldest first, a name of Passkey for one
+    without a row of its own.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, A: Region]
+    function passkeysOf(db: &![Database[Writing], R], account: Span[Nat8, A]): Either[DbError, Buffer[PasskeyView]];
+
+    """
+    The account whose passkey credential is, None for an unknown one.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, C: Region]
+    function ownerOf(db: &![Database[Writing], R], credential: Span[Nat8, C]): Either[DbError, Option[String]];
+
+    """
+    The word of the audit log for refusal, such as signature or replayed.
+    """
+    function refusalWord(refusal: Refusal): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+end module.

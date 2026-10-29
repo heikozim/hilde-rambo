@@ -1,0 +1,1178 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    nthRef,
+    length as bufferLength
+);
+import Standard.Text (
+    equal,
+    formatInt
+);
+import Standard.Calendar (
+    Instant,
+    Civil,
+    Zone,
+    ZoneFailure,
+    civilAt,
+    localZone,
+    localAt,
+    utcZone,
+    destroyZone
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    describe
+);
+import Standard.Log (
+    Log,
+    Entry,
+    Info,
+    makeEntry,
+    addText,
+    writeEntry
+);
+import Standard.File (
+    environmentValue
+);
+import Standard.Account (
+    runningUser
+);
+import Wolly.Account (
+    Account,
+    AccountProblem,
+    BadEmail,
+    EmailTaken,
+    BadName,
+    destroyAccount,
+    destroyAccounts,
+    isAccountId,
+    accountById,
+    accountByEmail,
+    createAccount,
+    listAccounts,
+    setLocked,
+    setEmail,
+    setName,
+    deleteAccountRow,
+    oneTimePassword,
+    hashPassword,
+    storePassword,
+    resetTotp
+);
+import Wolly.OpStore (
+    OpSession,
+    RoleGrant,
+    Granted,
+    RoleAdded,
+    RoleHeldAlready,
+    TooManyRoles,
+    destroySession,
+    destroySessions,
+    destroyGrants,
+    isRole,
+    sessionById,
+    endSession,
+    revokeSubject,
+    liveSessions,
+    grantRole,
+    revokeRole,
+    listRoles,
+    forgetSubject
+);
+import Wolly.OpClient (
+    OpClient,
+    destroyClient,
+    getClient
+);
+import Rambo.Config (
+    Config,
+    isRoot
+);
+import Rambo.Passkeys (
+    PasskeyView,
+    destroyPasskeyViews,
+    passkeysOf,
+    ownerOf,
+    forgetPasskey,
+    forgetPasskeys
+);
+import Rambo.Table (
+    addRow,
+    tableText,
+    destroyTable
+);
+
+module body Rambo.Admin is
+    function orEmpty(found: Option[String]): String is
+        case found of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    function digits(n: Int64): String is
+        return formatInt(n);
+    end;
+
+    function actorName(): String is
+        var name: String := orEmpty(environmentValue("LOGNAME"));
+        if length(&name) = 0 then
+            destroyString(name);
+            name := orEmpty(environmentValue("USER"));
+        end if;
+        var uid: Int64 := 0;
+        case toInt64(runningUser()) of
+            when Some(value as n: Int64) do
+                uid := n;
+            when None do
+                skip;
+        end case;
+        let number: String := digits(uid);
+        var b: StringBuilder := makeStringBuilder();
+        if length(&name) > 0 then
+            writeString(&!b, asSpan(&name));
+        else
+            writeString(&!b, asSpan(&number));
+        end if;
+        destroyString(name);
+        writeString(&!b, "(uid ");
+        writeString(&!b, asSpan(&number));
+        writeByte(&!b, ')');
+        destroyString(number);
+        var by: String := orEmpty(environmentValue("DOAS_USER"));
+        if length(&by) = 0 then
+            destroyString(by);
+            by := orEmpty(environmentValue("SUDO_USER"));
+        end if;
+        if length(&by) > 0 then
+            writeString(&!b, " via ");
+            writeString(&!b, asSpan(&by));
+        end if;
+        destroyString(by);
+        return finalize(b);
+    end;
+
+    -- n in two digits.
+    generic [R: Region]
+    function writeTwo(b: &![StringBuilder, R], n: Nat8): Unit is
+        writeByte(&~b, '0' + (n / 10));
+        writeByte(&~b, '0' + rem(n, 10));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function writeYear(b: &![StringBuilder, R], year: Int32): Unit is
+        case toInt64(year) of
+            when Some(value as y: Int64) do
+                let text: String := digits(y);
+                writeString(&~b, asSpan(&text));
+                destroyString(text);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- civil as Go's time.DateTime, or its date alone.
+    function civilText(civil: Civil, withTime: Bool): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeYear(&!b, civil.year);
+        writeByte(&!b, '-');
+        writeTwo(&!b, civil.month);
+        writeByte(&!b, '-');
+        writeTwo(&!b, civil.day);
+        if withTime then
+            writeByte(&!b, ' ');
+            writeTwo(&!b, civil.hour);
+            writeByte(&!b, ':');
+            writeTwo(&!b, civil.minute);
+            writeByte(&!b, ':');
+            writeTwo(&!b, civil.second);
+        end if;
+        return finalize(b);
+    end;
+
+    -- seconds in the time zone of the system, as Go's time.Time.Format
+    -- prints them, UTC when the zone cannot be read.
+    function localText(seconds: Int64, withTime: Bool): String is
+        let instant: Instant := Instant(seconds => seconds, nanos => 0);
+        var zone: Zone := utcZone();
+        case localZone() of
+            when Right(right as found: Zone) do
+                destroyZone(zone);
+                zone := found;
+            when Left(left as failure: ZoneFailure) do
+                skip;
+        end case;
+        let shown: Option[Civil] := localAt(&zone, instant);
+        destroyZone(zone);
+        case shown of
+            when Some(value as civil: Civil) do
+                return civilText(civil, withTime);
+            when None do
+                return fromSpan("-");
+        end case;
+    end;
+
+    generic [L: Region, A: Region, T: Region, V: Region]
+    function auditCommand(log: &![Log, L], actor: Span[Nat8, A], action: Span[Nat8, Static], target: Span[Nat8, T],
+        result: Span[Nat8, Static], extra: Span[Nat8, Static], value: Span[Nat8, V], now: Int64): Unit is
+        let at: String := utcText(now);
+        var entry: Entry := addText(addText(addText(addText(addText(makeEntry(Info(), "audit"), "actor", actor), "action",
+            action), "target", target), "result", result), "at", asSpan(&at));
+        destroyString(at);
+        if spanLength(extra) > 0 then
+            entry := addText(entry, extra, value);
+        end if;
+        let written: Bool := writeEntry(&~log, entry);
+        return nil;
+    end;
+
+    -- seconds as RFC 3339 in UTC.
+    function utcText(seconds: Int64): String is
+        case civilAt(Instant(seconds => seconds, nanos => 0), 0) of
+            when Some(value as civil: Civil) do
+                var b: StringBuilder := makeStringBuilder();
+                writeYear(&!b, civil.year);
+                writeByte(&!b, '-');
+                writeTwo(&!b, civil.month);
+                writeByte(&!b, '-');
+                writeTwo(&!b, civil.day);
+                writeByte(&!b, 'T');
+                writeTwo(&!b, civil.hour);
+                writeByte(&!b, ':');
+                writeTwo(&!b, civil.minute);
+                writeByte(&!b, ':');
+                writeTwo(&!b, civil.second);
+                writeByte(&!b, 'Z');
+                return finalize(b);
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- The text of a database error.
+    function dbText(error: DbError): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "database: ");
+        writeString(&!b, describe(error));
+        return finalize(b);
+    end;
+
+    function problemText(problem: AccountProblem): String is
+        case problem of
+            when BadEmail do
+                return fromSpan("accountkit: not a plain e-mail address");
+            when EmailTaken do
+                return fromSpan("accountkit: e-mail address already in use");
+            when BadName do
+                return fromSpan("accountkit: name longer than 200 bytes or with control characters");
+        end case;
+    end;
+
+    generic [A: Region]
+    function idOf(account: &[Account, A]): Span[Nat8, A] is
+        return asSpan(&(account->id));
+    end;
+
+    generic [D: Region, R: Region]
+    function resolve(db: &![Database[Writing], D], ref: Span[Nat8, R]): Either[String, Account] is
+        if isAccountId(ref) then
+            case accountById(&~db, ref) of
+                when Right(right as maybe: Option[Account]) do
+                    return someAccount(maybe);
+                when Left(left as error: DbError) do
+                    return Left(left => dbText(error));
+            end case;
+        end if;
+        case accountByEmail(&~db, ref) of
+            when Right(right as maybe: Option[Account]) do
+                return someAccount(maybe);
+            when Left(left as error: DbError) do
+                return Left(left => dbText(error));
+        end case;
+    end;
+
+    function someAccount(maybe: Option[Account]): Either[String, Account] is
+        case maybe of
+            when Some(value as account: Account) do
+                return Right(right => account);
+            when None do
+                return Left(left => fromSpan("accountkit: no such account"));
+        end case;
+    end;
+
+    function destroyAdded(added: Added): Unit is
+        let { id: String, password: String } := added;
+        destroyString(id);
+        destroyString(password);
+        return nil;
+    end;
+
+    -- A new one-time password for the account id, stored with must change
+    -- set.  Right the password.
+    generic [D: Region, I: Region, P: Region]
+    function freshPassword(db: &![Database[Writing], D], id: Span[Nat8, I], pepper: Span[Nat8, P],
+        now: Int64): Either[String, String] is
+        case oneTimePassword() of
+            when None do
+                return Left(left => fromSpan("accountkit: no random password"));
+            when Some(value as password: String) do
+                case hashPassword(asSpan(&password), pepper) of
+                    when None do
+                        destroyString(password);
+                        return Left(left => fromSpan("accountkit: the password is not hashed"));
+                    when Some(value as encoded: String) do
+                        let stored: Either[DbError, Bool] := storePassword(&~db, id, asSpan(&encoded), true, now);
+                        destroyString(encoded);
+                        case stored of
+                            when Left(left as error: DbError) do
+                                destroyString(password);
+                                return Left(left => dbText(error));
+                            when Right(right as done: Bool) do
+                                if not done then
+                                    destroyString(password);
+                                    return Left(left => fromSpan("accountkit: no such account"));
+                                end if;
+                                return Right(right => password);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [D: Region, L: Region, A: Region, E: Region, N: Region, P: Region]
+    function addAccount(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], email: Span[Nat8, E],
+        name: Span[Nat8, N], pepper: Span[Nat8, P], now: Int64): Either[String, Added] is
+        case createAccount(&~db, email, name, now) of
+            when Left(left as error: DbError) do
+                auditCommand(&~log, actor, "account.add", "-", "failed", "", "", now);
+                return Left(left => dbText(error));
+            when Right(right as made: Either[AccountProblem, Account]) do
+                case made of
+                    when Left(left as problem: AccountProblem) do
+                        auditCommand(&~log, actor, "account.add", "-", "failed", "", "", now);
+                        return Left(left => problemText(problem));
+                    when Right(right as account: Account) do
+                        let id: String := fromSpan(idOf(&account));
+                        destroyAccount(account);
+                        case freshPassword(&~db, asSpan(&id), pepper, now) of
+                            when Left(left as message: String) do
+                                auditCommand(&~log, actor, "account.add", asSpan(&id), "failed", "", "", now);
+                                destroyString(id);
+                                return Left(left => message);
+                            when Right(right as password: String) do
+                                auditCommand(&~log, actor, "account.add", asSpan(&id), "ok", "", "", now);
+                                return Right(right => Added(id => id, password => password));
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [A: Region, C: Region]
+    function stateOf(account: &[Account, A], config: &[Config, C]): String is
+        var b: StringBuilder := makeStringBuilder();
+        var first: Bool := true;
+        if isRoot(config, asSpan(&(account->id))) then
+            writeString(&!b, "root");
+            first := false;
+        end if;
+        if account->locked then
+            if not first then
+                writeByte(&!b, ',');
+            end if;
+            writeString(&!b, "locked");
+            first := false;
+        end if;
+        if account->mustChangePassword then
+            if not first then
+                writeByte(&!b, ',');
+            end if;
+            writeString(&!b, "one-time-password");
+            first := false;
+        end if;
+        if not account->hasTotp then
+            if not first then
+                writeByte(&!b, ',');
+            end if;
+            writeString(&!b, "no-totp");
+        end if;
+        return finalize(b);
+    end;
+
+    generic [A: Region, C: Region]
+    function accountLine(account: &[Account, A], config: &[Config, C]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, asSpan(&(account->id)));
+        writeByte(&!b, 9);
+        writeString(&!b, asSpan(&(account->email)));
+        writeByte(&!b, 9);
+        writeString(&!b, asSpan(&(account->name)));
+        writeByte(&!b, 9);
+        let state: String := stateOf(account, config);
+        writeString(&!b, asSpan(&state));
+        destroyString(state);
+        return finalize(b);
+    end;
+
+    generic [D: Region, C: Region]
+    function accountTable(db: &![Database[Writing], D], config: &[Config, C]): Either[String, String] is
+        case listAccounts(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => dbText(error));
+            when Right(right as accounts: Buffer[Account]) do
+                var table: Buffer[Buffer[String]] := allocateEmpty();
+                addRow(&!table, "ID\tE-MAIL\tNAME\tSTATE");
+                var i: Index := 0;
+                while i < bufferLength(&accounts) do
+                    let line: String := accountLine(nthRef(&accounts, i), config);
+                    addRow(&!table, asSpan(&line));
+                    destroyString(line);
+                    i := i + 1;
+                end while;
+                destroyAccounts(accounts);
+                let text: String := tableText(&table);
+                destroyTable(table);
+                return Right(right => text);
+        end case;
+    end;
+
+    -- Whether a root account of config other than id is there and not
+    -- locked.
+    generic [D: Region, C: Region, I: Region]
+    function otherRootUnlocked(db: &![Database[Writing], D], config: &[Config, C], id: Span[Nat8, I]): Bool is
+        var i: Index := 0;
+        while i < bufferLength(&(config->rootAccounts)) do
+            let root: Span[Nat8, C] := asSpan(nthRef(&(config->rootAccounts), i));
+            if not equal(root, id) then
+                case accountById(&~db, root) of
+                    when Right(right as maybe: Option[Account]) do
+                        case maybe of
+                            when Some(value as other: Account) do
+                                let unlocked: Bool := not lockedOf(&other);
+                                destroyAccount(other);
+                                if unlocked then
+                                    return true;
+                                end if;
+                            when None do
+                                skip;
+                        end case;
+                    when Left(left as error: DbError) do
+                        skip;
+                end case;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [A: Region]
+    function lockedOf(account: &[Account, A]): Bool is
+        return account->locked;
+    end;
+
+    -- Ends the sessions and the app sign-ins of id; the rows ended.
+    generic [D: Region, I: Region]
+    function signedOut(db: &![Database[Writing], D], id: Span[Nat8, I], reason: Span[Nat8, Static],
+        now: Int64): Either[String, Int64] is
+        case revokeSubject(&~db, id, reason, now) of
+            when Left(left as error: DbError) do
+                return Left(left => dbText(error));
+            when Right(right as n: Int64) do
+                return Right(right => n);
+        end case;
+    end;
+
+    generic [D: Region, L: Region, C: Region, A: Region, R: Region]
+    function lockAccount(db: &![Database[Writing], D], log: &![Log, L], config: &[Config, C], actor: Span[Nat8, A],
+        ref: Span[Nat8, R], root: Bool, now: Int64): Option[String] is
+        case resolve(&~db, ref) of
+            when Left(left as message: String) do
+                return Some(value => message);
+            when Right(right as account: Account) do
+                let id: String := fromSpan(idOf(&account));
+                destroyAccount(account);
+                if isRoot(config, asSpan(&id)) then
+                    if not root then
+                        auditCommand(&~log, actor, "account.lock", asSpan(&id), "refused", "", "", now);
+                        destroyString(id);
+                        return Some(value => fromSpan("admin: this is a root account; repeat with --root to lock it"));
+                    end if;
+                    if not otherRootUnlocked(&~db, config, asSpan(&id)) then
+                        auditCommand(&~log, actor, "account.lock", asSpan(&id), "refused", "", "", now);
+                        destroyString(id);
+                        return Some(value => fromSpan("admin: refusing to lock the last unlocked root account"));
+                    end if;
+                end if;
+                case setLocked(&~db, asSpan(&id), true, now) of
+                    when Left(left as error: DbError) do
+                        auditCommand(&~log, actor, "account.lock", asSpan(&id), "failed", "", "", now);
+                        destroyString(id);
+                        return Some(value => dbText(error));
+                    when Right(right as done: Bool) do
+                        skip;
+                end case;
+                case signedOut(&~db, asSpan(&id), "account locked", now) of
+                    when Left(left as message: String) do
+                        auditCommand(&~log, actor, "account.lock", asSpan(&id), "failed", "", "", now);
+                        destroyString(id);
+                        return Some(value => message);
+                    when Right(right as n: Int64) do
+                        let ended: String := digits(n);
+                        auditCommand(&~log, actor, "account.lock", asSpan(&id), "ok", "ended", asSpan(&ended), now);
+                        destroyString(ended);
+                        destroyString(id);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+        end case;
+    end;
+
+    -- The answer of a change of the account ref: None when it held, the
+    -- audit line written either way.
+    generic [L: Region, A: Region, I: Region]
+    function changed(log: &![Log, L], actor: Span[Nat8, A], action: Span[Nat8, Static], id: Span[Nat8, I],
+        result: Either[DbError, Bool], now: Int64): Option[String] is
+        case result of
+            when Left(left as error: DbError) do
+                auditCommand(&~log, actor, action, id, "failed", "", "", now);
+                return Some(value => dbText(error));
+            when Right(right as done: Bool) do
+                if not done then
+                    auditCommand(&~log, actor, action, id, "failed", "", "", now);
+                    return Some(value => fromSpan("accountkit: no such account"));
+                end if;
+                auditCommand(&~log, actor, action, id, "ok", "", "", now);
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [D: Region, L: Region, A: Region, R: Region]
+    function unlockAccount(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        now: Int64): Option[String] is
+        case resolve(&~db, ref) of
+            when Left(left as message: String) do
+                return Some(value => message);
+            when Right(right as account: Account) do
+                let id: String := fromSpan(idOf(&account));
+                destroyAccount(account);
+                let result: Either[DbError, Bool] := setLocked(&~db, asSpan(&id), false, now);
+                let out: Option[String] := changed(&~log, actor, "account.unlock", asSpan(&id), result, now);
+                destroyString(id);
+                return out;
+        end case;
+    end;
+
+    generic [D: Region, L: Region, A: Region, R: Region, P: Region]
+    function resetPassword(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        pepper: Span[Nat8, P], now: Int64): Either[String, String] is
+        case resolve(&~db, ref) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as account: Account) do
+                let id: String := fromSpan(idOf(&account));
+                destroyAccount(account);
+                case freshPassword(&~db, asSpan(&id), pepper, now) of
+                    when Left(left as message: String) do
+                        auditCommand(&~log, actor, "account.reset-password", asSpan(&id), "failed", "", "", now);
+                        destroyString(id);
+                        return Left(left => message);
+                    when Right(right as password: String) do
+                        case signedOut(&~db, asSpan(&id), "password reset", now) of
+                            when Left(left as message: String) do
+                                auditCommand(&~log, actor, "account.reset-password", asSpan(&id), "failed", "", "", now);
+                                destroyString(id);
+                                destroyString(password);
+                                return Left(left => message);
+                            when Right(right as n: Int64) do
+                                auditCommand(&~log, actor, "account.reset-password", asSpan(&id), "ok", "", "", now);
+                                destroyString(id);
+                                return Right(right => password);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [D: Region, L: Region, A: Region, R: Region]
+    function resetSecondFactor(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        now: Int64): Option[String] is
+        case resolve(&~db, ref) of
+            when Left(left as message: String) do
+                return Some(value => message);
+            when Right(right as account: Account) do
+                let id: String := fromSpan(idOf(&account));
+                destroyAccount(account);
+                case resetTotp(&~db, asSpan(&id), now) of
+                    when Left(left as error: DbError) do
+                        auditCommand(&~log, actor, "account.reset-totp", asSpan(&id), "failed", "", "", now);
+                        destroyString(id);
+                        return Some(value => dbText(error));
+                    when Right(right as done: Bool) do
+                        skip;
+                end case;
+                case signedOut(&~db, asSpan(&id), "totp reset", now) of
+                    when Left(left as message: String) do
+                        auditCommand(&~log, actor, "account.reset-totp", asSpan(&id), "failed", "", "", now);
+                        destroyString(id);
+                        return Some(value => message);
+                    when Right(right as n: Int64) do
+                        auditCommand(&~log, actor, "account.reset-totp", asSpan(&id), "ok", "", "", now);
+                        destroyString(id);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+        end case;
+    end;
+
+    generic [D: Region, L: Region, A: Region, R: Region, E: Region]
+    function setAccountEmail(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        email: Span[Nat8, E], now: Int64): Option[String] is
+        case resolve(&~db, ref) of
+            when Left(left as message: String) do
+                return Some(value => message);
+            when Right(right as account: Account) do
+                let id: String := fromSpan(idOf(&account));
+                destroyAccount(account);
+                case setEmail(&~db, asSpan(&id), email, now) of
+                    when Left(left as error: DbError) do
+                        auditCommand(&~log, actor, "account.set-email", asSpan(&id), "failed", "", "", now);
+                        destroyString(id);
+                        return Some(value => dbText(error));
+                    when Right(right as outcome: Either[AccountProblem, Bool]) do
+                        case outcome of
+                            when Left(left as problem: AccountProblem) do
+                                auditCommand(&~log, actor, "account.set-email", asSpan(&id), "failed", "", "", now);
+                                destroyString(id);
+                                return Some(value => problemText(problem));
+                            when Right(right as done: Bool) do
+                                let result: Either[DbError, Bool] := Right(right => done);
+                                let out: Option[String] := changed(&~log, actor, "account.set-email", asSpan(&id), result, now);
+                                destroyString(id);
+                                return out;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [D: Region, L: Region, A: Region, R: Region, N: Region]
+    function setAccountName(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        name: Span[Nat8, N], now: Int64): Option[String] is
+        case resolve(&~db, ref) of
+            when Left(left as message: String) do
+                return Some(value => message);
+            when Right(right as account: Account) do
+                let id: String := fromSpan(idOf(&account));
+                destroyAccount(account);
+                case setName(&~db, asSpan(&id), name, now) of
+                    when Left(left as error: DbError) do
+                        auditCommand(&~log, actor, "account.set-name", asSpan(&id), "failed", "", "", now);
+                        destroyString(id);
+                        return Some(value => dbText(error));
+                    when Right(right as outcome: Either[AccountProblem, Bool]) do
+                        case outcome of
+                            when Left(left as problem: AccountProblem) do
+                                auditCommand(&~log, actor, "account.set-name", asSpan(&id), "failed", "", "", now);
+                                destroyString(id);
+                                return Some(value => problemText(problem));
+                            when Right(right as done: Bool) do
+                                let result: Either[DbError, Bool] := Right(right => done);
+                                let out: Option[String] := changed(&~log, actor, "account.set-name", asSpan(&id), result, now);
+                                destroyString(id);
+                                return out;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- The rows of id removed: what hangs off it in one transaction, then
+    -- the account.  Right the rows that hung off it.
+    generic [D: Region, I: Region]
+    function removed(db: &![Database[Writing], D], id: Span[Nat8, I]): Either[String, Int64] is
+        case forgetPasskeys(&~db, id) of
+            when Left(left as error: DbError) do
+                return Left(left => dbText(error));
+            when Right(right as keys: Int64) do
+                skip;
+        end case;
+        case forgetSubject(&~db, id) of
+            when Left(left as error: DbError) do
+                return Left(left => dbText(error));
+            when Right(right as n: Int64) do
+                case deleteAccountRow(&~db, id) of
+                    when Left(left as error: DbError) do
+                        return Left(left => dbText(error));
+                    when Right(right as done: Bool) do
+                        return Right(right => n);
+                end case;
+        end case;
+    end;
+
+    generic [D: Region, L: Region, C: Region, A: Region, R: Region]
+    function deleteAccount(db: &![Database[Writing], D], log: &![Log, L], config: &[Config, C], actor: Span[Nat8, A],
+        ref: Span[Nat8, R], now: Int64): Either[String, String] is
+        case resolve(&~db, ref) of
+            when Left(left as message: String) do
+                auditCommand(&~log, actor, "account.delete", "-", "failed", "", "", now);
+                return Left(left => message);
+            when Right(right as account: Account) do
+                let id: String := fromSpan(idOf(&account));
+                destroyAccount(account);
+                if isRoot(config, asSpan(&id)) then
+                    auditCommand(&~log, actor, "account.delete", asSpan(&id), "refused", "", "", now);
+                    destroyString(id);
+                    return Left(left => fromSpan("admin: this is a root account; root accounts are never deleted"));
+                end if;
+                case removed(&~db, asSpan(&id)) of
+                    when Left(left as message: String) do
+                        auditCommand(&~log, actor, "account.delete", asSpan(&id), "failed", "", "", now);
+                        destroyString(id);
+                        var b: StringBuilder := makeStringBuilder();
+                        writeString(&!b, "admin: delete account: ");
+                        writeString(&!b, asSpan(&message));
+                        destroyString(message);
+                        return Left(left => finalize(b));
+                    when Right(right as n: Int64) do
+                        let rows: String := digits(n);
+                        auditCommand(&~log, actor, "account.delete", asSpan(&id), "ok", "rows", asSpan(&rows), now);
+                        destroyString(rows);
+                        return Right(right => id);
+                end case;
+        end case;
+    end;
+
+    --- Passkeys
+
+    generic [B: Region, I: Region, V: Region]
+    function addPasskeyRows(table: &![Buffer[Buffer[String]], B], id: Span[Nat8, I],
+        views: &[Buffer[PasskeyView], V]): Unit is
+        var i: Index := 0;
+        while i < bufferLength(views) do
+            let view: &[PasskeyView, V] := nthRef(views, i);
+            var b: StringBuilder := makeStringBuilder();
+            writeString(&!b, asSpan(&(view->credential)));
+            writeByte(&!b, 9);
+            writeString(&!b, id);
+            writeByte(&!b, 9);
+            writeString(&!b, asSpan(&(view->label)));
+            writeByte(&!b, 9);
+            let added: String := localText(view->createdAt, true);
+            writeString(&!b, asSpan(&added));
+            destroyString(added);
+            writeByte(&!b, 9);
+            if view->lastUsed > 0 then
+                let used: String := localText(view->lastUsed, true);
+                writeString(&!b, asSpan(&used));
+                destroyString(used);
+            else
+                writeString(&!b, "never");
+            end if;
+            let line: String := finalize(b);
+            addRow(&~table, asSpan(&line));
+            destroyString(line);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The rows of the passkeys of id; Some with the text of the database
+    -- when they cannot be read.
+    generic [D: Region, B: Region, I: Region]
+    function passkeyRowsOf(db: &![Database[Writing], D], table: &![Buffer[Buffer[String]], B],
+        id: Span[Nat8, I]): Option[String] is
+        case passkeysOf(&~db, id) of
+            when Left(left as error: DbError) do
+                return Some(value => dbText(error));
+            when Right(right as views: Buffer[PasskeyView]) do
+                addPasskeyRows(&~table, id, &views);
+                destroyPasskeyViews(views);
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [D: Region, B: Region, A: Region]
+    function everyPasskey(db: &![Database[Writing], D], table: &![Buffer[Buffer[String]], B],
+        accounts: &[Buffer[Account], A]): Option[String] is
+        var i: Index := 0;
+        while i < bufferLength(accounts) do
+            case passkeyRowsOf(&~db, &~table, idOf(nthRef(accounts, i))) of
+                when Some(value as message: String) do
+                    return Some(value => message);
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    function dropProblem(problem: Option[String]): Unit is
+        case problem of
+            when Some(value as message: String) do
+                destroyString(message);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [D: Region, R: Region]
+    function passkeyTable(db: &![Database[Writing], D], ref: Span[Nat8, R]): Either[String, String] is
+        var table: Buffer[Buffer[String]] := allocateEmpty();
+        addRow(&!table, "CREDENTIAL\tACCOUNT\tNAME\tADDED\tLAST USED");
+        var problem: Option[String] := None();
+        if spanLength(ref) > 0 then
+            case resolve(&~db, ref) of
+                when Left(left as message: String) do
+                    dropProblem(problem);
+                    destroyTable(table);
+                    return Left(left => message);
+                when Right(right as account: Account) do
+                    let id: String := fromSpan(idOf(&account));
+                    destroyAccount(account);
+                    dropProblem(problem);
+                    problem := passkeyRowsOf(&~db, &!table, asSpan(&id));
+                    destroyString(id);
+            end case;
+        else
+            case listAccounts(&~db) of
+                when Left(left as error: DbError) do
+                    dropProblem(problem);
+                    destroyTable(table);
+                    return Left(left => dbText(error));
+                when Right(right as accounts: Buffer[Account]) do
+                    dropProblem(problem);
+                    problem := everyPasskey(&~db, &!table, &accounts);
+                    destroyAccounts(accounts);
+            end case;
+        end if;
+        case problem of
+            when Some(value as message: String) do
+                destroyTable(table);
+                return Left(left => message);
+            when None do
+                let text: String := tableText(&table);
+                destroyTable(table);
+                return Right(right => text);
+        end case;
+    end;
+
+    generic [D: Region, L: Region, A: Region, C: Region]
+    function revokePasskey(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], credential: Span[Nat8, C],
+        now: Int64): Option[String] is
+        case ownerOf(&~db, credential) of
+            when Left(left as error: DbError) do
+                return Some(value => dbText(error));
+            when Right(right as found: Option[String]) do
+                case found of
+                    when None do
+                        auditCommand(&~log, actor, "passkey.revoke", "-", "failed", "credential", credential, now);
+                        var b: StringBuilder := makeStringBuilder();
+                        writeString(&!b, "passkey ");
+                        writeString(&!b, credential);
+                        writeString(&!b, ": no such passkey");
+                        return Some(value => finalize(b));
+                    when Some(value as owner: String) do
+                        let gone: Either[DbError, Bool] := forgetPasskey(&~db, asSpan(&owner), credential);
+                        case gone of
+                            when Left(left as error: DbError) do
+                                auditCommand(&~log, actor, "passkey.revoke", asSpan(&owner), "failed", "credential",
+                                    credential, now);
+                                destroyString(owner);
+                                return Some(value => dbText(error));
+                            when Right(right as done: Bool) do
+                                auditCommand(&~log, actor, "passkey.revoke", asSpan(&owner), "ok", "credential",
+                                    credential, now);
+                                destroyString(owner);
+                                let none: Option[String] := None();
+                                return none;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [D: Region, L: Region, A: Region, R: Region]
+    function resetPasskeys(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        now: Int64): Either[String, Int64] is
+        case resolve(&~db, ref) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as account: Account) do
+                let id: String := fromSpan(idOf(&account));
+                destroyAccount(account);
+                case forgetPasskeys(&~db, asSpan(&id)) of
+                    when Left(left as error: DbError) do
+                        auditCommand(&~log, actor, "account.reset-passkeys", asSpan(&id), "failed", "", "", now);
+                        destroyString(id);
+                        return Left(left => dbText(error));
+                    when Right(right as n: Int64) do
+                        let count: String := digits(n);
+                        auditCommand(&~log, actor, "account.reset-passkeys", asSpan(&id), "ok", "passkeys",
+                            asSpan(&count), now);
+                        destroyString(count);
+                        destroyString(id);
+                        return Right(right => n);
+                end case;
+        end case;
+    end;
+
+    --- Sessions
+
+    generic [S: Region]
+    function sessionLine(session: &[OpSession, S]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, asSpan(&(session->id)));
+        writeByte(&!b, 9);
+        writeString(&!b, asSpan(&(session->subject)));
+        writeByte(&!b, 9);
+        let signedIn: String := localText(session->authTime, true);
+        writeString(&!b, asSpan(&signedIn));
+        destroyString(signedIn);
+        writeByte(&!b, 9);
+        let seen: String := localText(session->lastSeen, true);
+        writeString(&!b, asSpan(&seen));
+        destroyString(seen);
+        writeByte(&!b, 9);
+        writeByte(&!b, '[');
+        writeString(&!b, asSpan(&(session->amr)));
+        writeByte(&!b, ']');
+        writeByte(&!b, 9);
+        writeString(&!b, asSpan(&(session->userAgent)));
+        return finalize(b);
+    end;
+
+    generic [D: Region, C: Region, R: Region]
+    function sessionTable(db: &![Database[Writing], D], config: &[Config, C], ref: Span[Nat8, R],
+        now: Int64): Either[String, String] is
+        var subject: String := fromSpan("");
+        if spanLength(ref) > 0 then
+            case resolve(&~db, ref) of
+                when Left(left as message: String) do
+                    destroyString(subject);
+                    return Left(left => message);
+                when Right(right as account: Account) do
+                    destroyString(subject);
+                    subject := fromSpan(idOf(&account));
+                    destroyAccount(account);
+            end case;
+        end if;
+        let found: Either[DbError, Buffer[OpSession]] := liveSessions(&~db, asSpan(&subject), now, config->sessionIdle,
+            config->sessionMax);
+        destroyString(subject);
+        case found of
+            when Left(left as error: DbError) do
+                return Left(left => dbText(error));
+            when Right(right as sessions: Buffer[OpSession]) do
+                var table: Buffer[Buffer[String]] := allocateEmpty();
+                addRow(&!table, "SESSION\tACCOUNT\tSIGNED IN\tLAST SEEN\tMETHODS\tBROWSER");
+                var i: Index := 0;
+                while i < bufferLength(&sessions) do
+                    let line: String := sessionLine(nthRef(&sessions, i));
+                    addRow(&!table, asSpan(&line));
+                    destroyString(line);
+                    i := i + 1;
+                end while;
+                destroySessions(sessions);
+                let text: String := tableText(&table);
+                destroyTable(table);
+                return Right(right => text);
+        end case;
+    end;
+
+    generic [D: Region, L: Region, A: Region, S: Region]
+    function endSessionNamed(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], sid: Span[Nat8, S],
+        now: Int64): Option[String] is
+        case sessionById(&~db, sid) of
+            when Left(left as error: DbError) do
+                return Some(value => dbText(error));
+            when Right(right as found: Option[OpSession]) do
+                case found of
+                    when None do
+                        var b: StringBuilder := makeStringBuilder();
+                        writeString(&!b, "session ");
+                        writeString(&!b, sid);
+                        writeString(&!b, ": oidcop: no such session");
+                        return Some(value => finalize(b));
+                    when Some(value as session: OpSession) do
+                        destroySession(session);
+                end case;
+        end case;
+        case endSession(&~db, sid, "ended by operator", now) of
+            when Some(value as error: DbError) do
+                auditCommand(&~log, actor, "session.end", sid, "failed", "", "", now);
+                return Some(value => dbText(error));
+            when None do
+                auditCommand(&~log, actor, "session.end", sid, "ok", "", "", now);
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    --- Roles
+
+    -- None when the client id is there, else the text of oidcop.
+    generic [D: Region, C: Region]
+    function clientThere(db: &![Database[Writing], D], client: Span[Nat8, C]): Option[String] is
+        case getClient(&~db, client) of
+            when Left(left as error: DbError) do
+                return Some(value => dbText(error));
+            when Right(right as found: Option[OpClient]) do
+                case found of
+                    when Some(value as c: OpClient) do
+                        destroyClient(c);
+                        let none: Option[String] := None();
+                        return none;
+                    when None do
+                        return Some(value => fromSpan("oidcop: no such client"));
+                end case;
+        end case;
+    end;
+
+    generic [D: Region, L: Region, A: Region, R: Region, C: Region, O: Region]
+    function grantRoleTo(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        client: Span[Nat8, C], role: Span[Nat8, O], now: Int64): Either[String, RoleGiven] is
+        case resolve(&~db, ref) of
+            when Left(left as message: String) do
+                auditCommand(&~log, actor, "role.grant", "-", "failed", "client", client, now);
+                return Left(left => message);
+            when Right(right as account: Account) do
+                let id: String := fromSpan(idOf(&account));
+                destroyAccount(account);
+                if not isRole(role) then
+                    auditCommand(&~log, actor, "role.grant", asSpan(&id), "failed", "client", client, now);
+                    destroyString(id);
+                    return Left(left => fromSpan("oidcop: invalid role (lowercase letters, digits, - and _, starting with a letter, at most 32)"));
+                end if;
+                case clientThere(&~db, client) of
+                    when Some(value as message: String) do
+                        auditCommand(&~log, actor, "role.grant", asSpan(&id), "failed", "client", client, now);
+                        destroyString(id);
+                        return Left(left => message);
+                    when None do
+                        skip;
+                end case;
+                case grantRole(&~db, client, asSpan(&id), role, now) of
+                    when Left(left as error: DbError) do
+                        auditCommand(&~log, actor, "role.grant", asSpan(&id), "failed", "client", client, now);
+                        destroyString(id);
+                        return Left(left => dbText(error));
+                    when Right(right as granted: Granted) do
+                        case granted of
+                            when RoleAdded do
+                                auditCommand(&~log, actor, "role.grant", asSpan(&id), "ok", "role", role, now);
+                                return Right(right => RoleGiven(account => id, added => true));
+                            when RoleHeldAlready do
+                                auditCommand(&~log, actor, "role.grant", asSpan(&id), "ok", "role", role, now);
+                                return Right(right => RoleGiven(account => id, added => false));
+                            when TooManyRoles do
+                                auditCommand(&~log, actor, "role.grant", asSpan(&id), "failed", "role", role, now);
+                                destroyString(id);
+                                return Left(left => fromSpan("oidcop: too many roles for one account in one client"));
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [D: Region, L: Region, A: Region, R: Region, C: Region, O: Region]
+    function revokeRoleFrom(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        client: Span[Nat8, C], role: Span[Nat8, O], now: Int64): Either[String, String] is
+        case resolve(&~db, ref) of
+            when Left(left as message: String) do
+                auditCommand(&~log, actor, "role.revoke", "-", "failed", "client", client, now);
+                return Left(left => message);
+            when Right(right as account: Account) do
+                let id: String := fromSpan(idOf(&account));
+                destroyAccount(account);
+                case revokeRole(&~db, client, asSpan(&id), role) of
+                    when Left(left as error: DbError) do
+                        auditCommand(&~log, actor, "role.revoke", asSpan(&id), "failed", "client", client, now);
+                        destroyString(id);
+                        return Left(left => dbText(error));
+                    when Right(right as done: Bool) do
+                        if not done then
+                            auditCommand(&~log, actor, "role.revoke", asSpan(&id), "failed", "client", client, now);
+                            destroyString(id);
+                            return Left(left => fromSpan("oidcop: the account does not hold this role in this client"));
+                        end if;
+                        auditCommand(&~log, actor, "role.revoke", asSpan(&id), "ok", "role", role, now);
+                        return Right(right => id);
+                end case;
+        end case;
+    end;
+
+    generic [G: Region]
+    function grantLine(grant: &[RoleGrant, G]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, asSpan(&(grant->clientId)));
+        writeByte(&!b, 9);
+        writeString(&!b, asSpan(&(grant->subject)));
+        writeByte(&!b, 9);
+        writeString(&!b, asSpan(&(grant->role)));
+        writeByte(&!b, 9);
+        let since: String := localText(grant->created, false);
+        writeString(&!b, asSpan(&since));
+        destroyString(since);
+        return finalize(b);
+    end;
+
+    generic [D: Region, C: Region, R: Region]
+    function roleTable(db: &![Database[Writing], D], client: Span[Nat8, C], ref: Span[Nat8, R]): Either[String, String] is
+        var subject: String := fromSpan("");
+        if spanLength(ref) > 0 then
+            case resolve(&~db, ref) of
+                when Left(left as message: String) do
+                    destroyString(subject);
+                    return Left(left => message);
+                when Right(right as account: Account) do
+                    destroyString(subject);
+                    subject := fromSpan(idOf(&account));
+                    destroyAccount(account);
+            end case;
+        end if;
+        let found: Either[DbError, Buffer[RoleGrant]] := listRoles(&~db, client, asSpan(&subject));
+        destroyString(subject);
+        case found of
+            when Left(left as error: DbError) do
+                return Left(left => dbText(error));
+            when Right(right as grants: Buffer[RoleGrant]) do
+                var table: Buffer[Buffer[String]] := allocateEmpty();
+                addRow(&!table, "CLIENT\tACCOUNT\tROLE\tSINCE");
+                var i: Index := 0;
+                while i < bufferLength(&grants) do
+                    let line: String := grantLine(nthRef(&grants, i));
+                    addRow(&!table, asSpan(&line));
+                    destroyString(line);
+                    i := i + 1;
+                end while;
+                destroyGrants(grants);
+                let text: String := tableText(&table);
+                destroyTable(table);
+                return Right(right => text);
+        end case;
+    end;
+end module body.

@@ -1,0 +1,795 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- rambo end to end over a copy of a data set of the earlier Go provider: the requests a
+-- browser sends are made as FastCGI requests, the answers are read as a
+-- browser reads them, cookies included.  alice signs in with password and
+-- code and out again, bob turns his one-time password into a password of
+-- his own and sets up a second factor, carol is locked, three wrong
+-- passwords earn a ban, and the router answers as Go's does.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    startsWith,
+    contains,
+    indexOf,
+    indexOfByte,
+    substring,
+    parseNat,
+    formatInt
+);
+import Standard.Base32 (
+    decodeBase32
+);
+import Standard.Otp (
+    OtpSha1,
+    totp
+);
+import Standard.Http (
+    headerCount,
+    nthHeaderName,
+    nthHeaderValue
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    Turn,
+    Served,
+    makeRequest,
+    destroyRequest
+);
+import Wolly.OpUrl (
+    queryEscape
+);
+import Wolly.Pow (
+    solves
+);
+import Rambo.Fixture (
+    expected,
+    fixtureCopy
+);
+import Rambo.Migrate (
+    migrate
+);
+import Rambo.Site (
+    Worker,
+    nowSeconds,
+    respond,
+    makeWorker,
+    closeWorker,
+    handleWith
+);
+
+module body Rambo.Site.Test is
+    constant ip: Span[Nat8, Static] := "192.0.2.7";
+
+    --- Requests
+
+    generic [B: Region, V: Region]
+    function pair(block: &![StringBuilder, B], name: Span[Nat8, Static], value: Span[Nat8, V]): Unit is
+        if spanLength(value) = 0 then
+            return nil;
+        end if;
+        case makePair(name, value) of
+            when Some(value as encoded: String) do
+                writeString(&~block, asSpan(&encoded));
+                destroyString(encoded);
+            when None do
+                abort("a pair is not encoded");
+        end case;
+        return nil;
+    end;
+
+    -- The path of uri, without its query.
+    generic [U: Region]
+    function pathOf(uri: Span[Nat8, U]): Span[Nat8, U] is
+        case indexOfByte(uri, '?') of
+            when Some(value as at: Index) do
+                return substring(uri, 0, at);
+            when None do
+                return uri;
+        end case;
+    end;
+
+    -- The query of uri, empty when it has none.
+    generic [U: Region]
+    function queryOf(uri: Span[Nat8, U]): Span[Nat8, U] is
+        case indexOfByte(uri, '?') of
+            when Some(value as at: Index) do
+                return substring(uri, at + 1, spanLength(uri));
+            when None do
+                return substring(uri, 0, 0);
+        end case;
+    end;
+
+    generic [U: Region, C: Region, B: Region]
+    function requestOf(verb: Span[Nat8, Static], uri: Span[Nat8, U], cookie: Span[Nat8, C], content: Span[Nat8, B]): Request is
+        var block: StringBuilder := makeStringBuilder();
+        pair(&!block, "REQUEST_METHOD", verb);
+        pair(&!block, "REQUEST_URI", uri);
+        pair(&!block, "QUERY_STRING", queryOf(uri));
+        pair(&!block, "HTTP_COOKIE", cookie);
+        pair(&!block, "HTTP_USER_AGENT", "test browser");
+        pair(&!block, "HTTP_ACCEPT_LANGUAGE", "en");
+        pair(&!block, "REMOTE_ADDR", ip);
+        if spanLength(content) > 0 then
+            pair(&!block, "CONTENT_TYPE", "application/x-www-form-urlencoded");
+        end if;
+        return makeRequest(finalize(block), fromSpan(content));
+    end;
+
+    --- Answers
+
+    generic [O: Region]
+    function statusOf(output: Span[Nat8, O]): Int64 is
+        if not startsWith(output, "Status: ") then
+            return 0;
+        end if;
+        case parseNat(substring(output, 8, 11)) of
+            when Some(value as n: Nat64) do
+                case toInt64(n) of
+                    when Some(value as status: Int64) do
+                        return status;
+                    when None do
+                        return 0;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [O: Region]
+    function headOf(output: Span[Nat8, O]): Span[Nat8, O] is
+        case indexOf(output, "\r\n\r\n") of
+            when Some(value as stop: Index) do
+                return substring(output, 0, stop + 2);
+            when None do
+                return output;
+        end case;
+    end;
+
+    -- The value of the nth header called name of output, empty when there
+    -- is none.
+    generic [O: Region]
+    function header(output: Span[Nat8, O], name: Span[Nat8, Static], nth: Index): String is
+        let head: Span[Nat8, O] := headOf(output);
+        var seen: Index := 0;
+        var i: Index := 0;
+        while i < headerCount(head) do
+            case nthHeaderName(head, i) of
+                when Some(value as found: String) do
+                    let fits: Bool := equal(asSpan(&found), name);
+                    destroyString(found);
+                    if fits then
+                        if seen = nth then
+                            case nthHeaderValue(head, i) of
+                                when Some(value as v: String) do
+                                    return v;
+                                when None do
+                                    return fromSpan("");
+                            end case;
+                        end if;
+                        seen := seen + 1;
+                    end if;
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return fromSpan("");
+    end;
+
+    -- The text between the first before in text and the next quote.
+    generic [T: Region]
+    function after(text: Span[Nat8, T], before: Span[Nat8, Static]): String is
+        case indexOf(text, before) of
+            when Some(value as at: Index) do
+                let rest: Span[Nat8, T] := substring(text, at + spanLength(before), spanLength(text));
+                case indexOfByte(rest, '"') of
+                    when Some(value as stop: Index) do
+                        return fromSpan(substring(rest, 0, stop));
+                    when None do
+                        return fromSpan("");
+                end case;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    --- The cookies of the browser
+
+    record Jar: Linear is
+        flow: String;
+        session: String;
+        step: String;
+    end;
+
+    function emptyJar(): Jar is
+        return Jar(flow => fromSpan(""), session => fromSpan(""), step => fromSpan(""));
+    end;
+
+    function destroyJar(jar: Jar): Unit is
+        let { flow: String, session: String, step: String } := jar;
+        destroyString(flow);
+        destroyString(session);
+        destroyString(step);
+        return nil;
+    end;
+
+    generic [J: Region]
+    function hasFlow(jar: &[Jar, J]): Bool is
+        return length(&(jar->flow)) > 0;
+    end;
+
+    generic [J: Region]
+    function hasSession(jar: &[Jar, J]): Bool is
+        return length(&(jar->session)) > 0;
+    end;
+
+    generic [J: Region]
+    function hasStep(jar: &[Jar, J]): Bool is
+        return length(&(jar->step)) > 0;
+    end;
+
+    -- The Cookie header of jar.
+    generic [J: Region]
+    function cookieOf(jar: &[Jar, J]): String is
+        var b: StringBuilder := makeStringBuilder();
+        var first: Bool := true;
+        if length(&(jar->flow)) > 0 then
+            writeString(&!b, "__Host-rambo-flow=");
+            writeString(&!b, asSpan(&(jar->flow)));
+            first := false;
+        end if;
+        if length(&(jar->session)) > 0 then
+            if not first then
+                writeString(&!b, "; ");
+            end if;
+            writeString(&!b, "__Host-rambo=");
+            writeString(&!b, asSpan(&(jar->session)));
+            first := false;
+        end if;
+        if length(&(jar->step)) > 0 then
+            if not first then
+                writeString(&!b, "; ");
+            end if;
+            writeString(&!b, "__Host-rambo-step=");
+            writeString(&!b, asSpan(&(jar->step)));
+        end if;
+        return finalize(b);
+    end;
+
+    -- The value of a Set-Cookie header, empty for one that removes it.
+    generic [S: Region]
+    function valueOfCookie(setCookie: Span[Nat8, S]): String is
+        if contains(setCookie, "Max-Age=-") or contains(setCookie, "Max-Age=0") then
+            return fromSpan("");
+        end if;
+        case indexOfByte(setCookie, '=') of
+            when Some(value as eq: Index) do
+                let rest: Span[Nat8, S] := substring(setCookie, eq + 1, spanLength(setCookie));
+                case indexOfByte(rest, ';') of
+                    when Some(value as semicolon: Index) do
+                        return fromSpan(substring(rest, 0, semicolon));
+                    when None do
+                        return fromSpan(rest);
+                end case;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- jar after the Set-Cookie headers of output.
+    generic [O: Region]
+    function taken(jar: Jar, output: Span[Nat8, O]): Jar is
+        let { flow: String, session: String, step: String } := jar;
+        var f: String := flow;
+        var s: String := session;
+        var t: String := step;
+        var i: Index := 0;
+        var going: Bool := true;
+        while going do
+            let set: String := header(output, "Set-Cookie", i);
+            if length(&set) = 0 then
+                going := false;
+            else if startsWith(asSpan(&set), "__Host-rambo-flow=") then
+                destroyString(f);
+                f := valueOfCookie(asSpan(&set));
+            else if startsWith(asSpan(&set), "__Host-rambo-step=") then
+                destroyString(t);
+                t := valueOfCookie(asSpan(&set));
+            else if startsWith(asSpan(&set), "__Host-rambo=") then
+                destroyString(s);
+                s := valueOfCookie(asSpan(&set));
+            end if;
+            destroyString(set);
+            i := i + 1;
+        end while;
+        return Jar(flow => f, session => s, step => t);
+    end;
+
+    --- A browser
+
+    -- What a request came to: its output and the jar after it.
+    record Visit: Linear is
+        output: String;
+        jar: Jar;
+    end;
+
+    generic [U: Region, B: Region, P: Region]
+    function visit(jar: Jar, verb: Span[Nat8, Static], uri: Span[Nat8, U], content: Span[Nat8, B], conf: Span[Nat8, P]): Visit is
+        let cookie: String := cookieOf(&jar);
+        let request: Request := requestOf(verb, uri, asSpan(&cookie), content);
+        destroyString(cookie);
+        let output: String := respond(&request, conf, nowSeconds());
+        destroyRequest(request);
+        let next: Jar := taken(jar, asSpan(&output));
+        return Visit(output => output, jar => next);
+    end;
+
+    -- A copy of a data set of the earlier Go provider, taken over by migrate as before the
+    -- first serve.
+    function confWith(extra: Span[Nat8, Static]): String is
+        case fixtureCopy("site", extra) of
+            when Some(value as path: String) do
+                case migrate(asSpan(&path), nowSeconds()) of
+                    when Left(left as message: String) do
+                        destroyString(message);
+                        abort("migrate refused the data set");
+                    when Right(right as report: String) do
+                        destroyString(report);
+                end case;
+                return path;
+            when None do
+                abort("the data set is not copied");
+        end case;
+    end;
+
+    function want(name: Span[Nat8, Static]): String is
+        case expected(name) of
+            when Some(value as found: String) do
+                return found;
+            when None do
+                abort("expected.json lacks a value");
+        end case;
+    end;
+
+    -- The first number that solves token for bits.
+    generic [T: Region]
+    function answer(token: Span[Nat8, T], bits: Int64): String is
+        var n: Int64 := 0;
+        while n < 100000000 do
+            let text: String := formatInt(n);
+            if solves(token, asSpan(&text), bits) then
+                return text;
+            end if;
+            destroyString(text);
+            n := n + 1;
+        end while;
+        abort("no answer");
+    end;
+
+    generic [T: Region]
+    function numberIn(text: Span[Nat8, T]): Int64 is
+        case parseNat(text) of
+            when Some(value as n: Nat64) do
+                case toInt64(n) of
+                    when Some(value as i: Int64) do
+                        return i;
+                    when None do
+                        return 0;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The code of the base32 secret now.
+    generic [S: Region]
+    function codeNow(secret: Span[Nat8, S]): String is
+        case decodeBase32(secret) of
+            when Some(value as key: String) do
+                case totp(asSpan(&key), nowSeconds(), 30, 6, OtpSha1()) of
+                    when Some(value as code: String) do
+                        destroyString(key);
+                        return code;
+                    when None do
+                        destroyString(key);
+                        abort("no code");
+                end case;
+            when None do
+                abort("no base32 secret");
+        end case;
+    end;
+
+    -- name=value with value escaped, an ampersand in front unless first.
+    generic [B: Region, V: Region]
+    function field(b: &![StringBuilder, B], name: Span[Nat8, Static], value: Span[Nat8, V], first: Bool): Unit is
+        if not first then
+            writeByte(&~b, '&');
+        end if;
+        writeString(&~b, name);
+        writeByte(&~b, '=');
+        let escaped: String := queryEscape(value);
+        writeString(&~b, asSpan(&escaped));
+        destroyString(escaped);
+        return nil;
+    end;
+
+    -- The form of a login for req, with the puzzle of page solved.
+    generic [R: Region, H: Region, E: Region, P: Region, C: Region]
+    function loginBody(req: Span[Nat8, R], page: Span[Nat8, H], email: Span[Nat8, E], password: Span[Nat8, P],
+        code: Span[Nat8, C]): String is
+        let token: String := after(page, "data-pow-token=\"");
+        let bitsText: String := after(page, "data-pow-bits=\"");
+        let nonce: String := answer(asSpan(&token), numberIn(asSpan(&bitsText)));
+        destroyString(bitsText);
+        var b: StringBuilder := makeStringBuilder();
+        field(&!b, "req", req, true);
+        field(&!b, "pow", asSpan(&token), false);
+        field(&!b, "pow_nonce", asSpan(&nonce), false);
+        field(&!b, "email", email, false);
+        field(&!b, "password", password, false);
+        field(&!b, "code", code, false);
+        destroyString(token);
+        destroyString(nonce);
+        return finalize(b);
+    end;
+
+    -- A visit, its output checked against status and dropped.
+    generic [U: Region, B: Region, P: Region]
+    function expectStatus(jar: Jar, verb: Span[Nat8, Static], uri: Span[Nat8, U], content: Span[Nat8, B], conf: Span[Nat8, P],
+        status: Int64, what: Span[Nat8, Static]): Jar is
+        let made1: Visit := visit(jar, verb, uri, content, conf);
+        let { output: String, jar as next: Jar } := made1;
+        if statusOf(asSpan(&output)) /= status then
+            printLn(substring(asSpan(&output), 0, 400));
+        end if;
+        assertTrue(statusOf(asSpan(&output)) = status, what);
+        destroyString(output);
+        return next;
+    end;
+
+    -- The location a redirect leads to, and the jar after it.
+    record Moved: Linear is
+        location: String;
+        jar: Jar;
+    end;
+
+    generic [U: Region, B: Region, P: Region]
+    function moved(jar: Jar, verb: Span[Nat8, Static], uri: Span[Nat8, U], content: Span[Nat8, B], conf: Span[Nat8, P],
+        what: Span[Nat8, Static]): Moved is
+        let made2: Visit := visit(jar, verb, uri, content, conf);
+        let { output: String, jar as next: Jar } := made2;
+        let status: Int64 := statusOf(asSpan(&output));
+        if (status < 300) or (status > 399) then
+            printLn(substring(asSpan(&output), 0, 600));
+        end if;
+        assertTrue((status >= 300) and (status <= 399), what);
+        let location: String := header(asSpan(&output), "Location", 0);
+        destroyString(output);
+        return Moved(location => location, jar => next);
+    end;
+
+    -- The login page of a direct login: its URI and the jar with the flow.
+    generic [R: Region]
+    function directLogin(jar: Jar, conf: Span[Nat8, R]): Moved is
+        return moved(jar, "GET", "/login", "", conf, "a direct login begins");
+    end;
+
+    generic [R: Region]
+    function reqOf(location: Span[Nat8, R]): String is
+        case indexOf(location, "req=") of
+            when Some(value as at: Index) do
+                return fromSpan(substring(location, at + 4, spanLength(location)));
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    --- The tests
+
+    function testAliceSignsInAndOut(): Unit is
+        let path: String := confWith("");
+        let made3: Moved := directLogin(emptyJar(), asSpan(&path));
+        let { location as loginUri: String, jar as j1: Jar } := made3;
+        assertTrue(startsWith(asSpan(&loginUri), "/login?req="), "to the login page");
+        assertTrue(hasFlow(&j1), "the flow cookie is set");
+        let made4: Visit := visit(j1, "GET", asSpan(&loginUri), "", asSpan(&path));
+        let { output as page: String, jar as j2: Jar } := made4;
+        assertTrue(statusOf(asSpan(&page)) = 200, "the login page");
+        assertTrue(contains(asSpan(&page), "data-pow-bits=\"14\""), "a puzzle of 14 bits");
+        let email: String := want("alice_email");
+        let password: String := want("alice_password");
+        let secret: String := want("alice_totp_secret");
+        let code: String := codeNow(asSpan(&secret));
+        let req: String := reqOf(asSpan(&loginUri));
+        let posted: String := loginBody(asSpan(&req), asSpan(&page), asSpan(&email), asSpan(&password), asSpan(&code));
+        destroyString(page);
+        let made5: Moved := moved(j2, "POST", "/login", asSpan(&posted), asSpan(&path),
+            "password and code lead on");
+        let { location as homeUri: String, jar as j3: Jar } := made5;
+        assertTrue(equal(asSpan(&homeUri), "/"), "back to the portal");
+        assertTrue(hasSession(&j3), "a session");
+        let made6: Visit := visit(j3, "GET", "/", "", asSpan(&path));
+        let { output as portal: String, jar as j4: Jar } := made6;
+        assertTrue(statusOf(asSpan(&portal)) = 200, "the portal");
+        assertTrue(contains(asSpan(&portal), "<em>"), "this session is named");
+        assertTrue(contains(asSpan(&portal), "Content-Security-Policy: default-src 'none'"), "the policy of a page");
+        let logoutToken: String := after(asSpan(&portal), "action=\"/logout\"><input type=\"hidden\" name=\"csrf\" value=\"");
+        destroyString(portal);
+        let j5: Jar := expectStatus(j4, "GET", "/account", "", asSpan(&path), 200, "the account page");
+        var form: StringBuilder := makeStringBuilder();
+        field(&!form, "csrf", asSpan(&logoutToken), true);
+        let logoutBody: String := finalize(form);
+        let loggedOut: Moved := moved(j5, "POST", "/logout", asSpan(&logoutBody), asSpan(&path), "the logout");
+        let { location as out: String, jar as j6: Jar } := loggedOut;
+        assertTrue(not hasSession(&j6), "the session cookie is gone");
+        let made7: Moved := moved(j6, "GET", "/", "", asSpan(&path), "no session, a login");
+        let { location as again: String, jar as j7: Jar } := made7;
+        assertTrue(startsWith(asSpan(&again), "/login?req="), "a login again");
+        let restarted: Moved := moved(j7, "POST", "/login", asSpan(&posted), asSpan(&path), "a used request is restarted");
+        let { location as fresh: String, jar as j8: Jar } := restarted;
+        assertTrue(startsWith(asSpan(&fresh), "/login?req="), "a new login, not a second sign-in");
+        assertTrue(not hasSession(&j8), "no session from a used request");
+        destroyString(fresh);
+        destroyJar(j8);
+        destroyString(again);
+        destroyString(out);
+        destroyString(logoutBody);
+        destroyString(logoutToken);
+        destroyString(homeUri);
+        destroyString(posted);
+        destroyString(req);
+        destroyString(code);
+        destroyString(secret);
+        destroyString(password);
+        destroyString(email);
+        destroyString(loginUri);
+        destroyString(path);
+        return nil;
+    end;
+
+    function testBobSetsUpHisAccount(): Unit is
+        let path: String := confWith("");
+        let made8: Moved := directLogin(emptyJar(), asSpan(&path));
+        let { location as loginUri: String, jar as j1: Jar } := made8;
+        let made9: Visit := visit(j1, "GET", asSpan(&loginUri), "", asSpan(&path));
+        let { output as page: String, jar as j2: Jar } := made9;
+        let password: String := want("bob_password");
+        let req: String := reqOf(asSpan(&loginUri));
+        let posted: String := loginBody(asSpan(&req), asSpan(&page), "bob@example.com", asSpan(&password), "");
+        destroyString(page);
+        let made10: Moved := moved(j2, "POST", "/login", asSpan(&posted), asSpan(&path),
+            "the one-time password leads to a step");
+        let { location as stepUri: String, jar as j3: Jar } := made10;
+        assertTrue(startsWith(asSpan(&stepUri), "/login/password?req="), "a new password is owed");
+        assertTrue(hasStep(&j3), "the step cookie");
+        let made11: Visit := visit(j3, "GET", asSpan(&stepUri), "", asSpan(&path));
+        let { output as form: String, jar as j4: Jar } := made11;
+        assertTrue(statusOf(asSpan(&form)) = 200, "the password page");
+        let stepToken: String := after(asSpan(&form), "name=\"step\" value=\"");
+        destroyString(form);
+        var b: StringBuilder := makeStringBuilder();
+        field(&!b, "req", asSpan(&req), true);
+        field(&!b, "step", asSpan(&stepToken), false);
+        field(&!b, "password", "bob's own password, long", false);
+        field(&!b, "password2", "bob's own password, long", false);
+        let newBody: String := finalize(b);
+        let made12: Moved := moved(j4, "POST", "/login/password", asSpan(&newBody),
+            asSpan(&path), "the new password is taken");
+        let { location as totpUri: String, jar as j5: Jar } := made12;
+        assertTrue(startsWith(asSpan(&totpUri), "/login/totp?req="), "a second factor is owed");
+        let made13: Visit := visit(j5, "GET", asSpan(&totpUri), "", asSpan(&path));
+        let { output as enrol: String, jar as j6: Jar } := made13;
+        assertTrue(statusOf(asSpan(&enrol)) = 200, "the second factor page");
+        assertTrue(contains(asSpan(&enrol), "<img src=\"data:image/png;base64,"), "a QR code");
+        let grouped: String := afterTag(asSpan(&enrol), "<p class=\"secret\"><code>");
+        let secret: String := withoutBlanks(asSpan(&grouped));
+        destroyString(grouped);
+        destroyString(enrol);
+        let code: String := codeNow(asSpan(&secret));
+        var c: StringBuilder := makeStringBuilder();
+        field(&!c, "req", asSpan(&req), true);
+        field(&!c, "step", asSpan(&stepToken), false);
+        field(&!c, "code", asSpan(&code), false);
+        let codeBody: String := finalize(c);
+        let made14: Moved := moved(j6, "POST", "/login/totp", asSpan(&codeBody), asSpan(&path),
+            "the first code finishes the login");
+        let { location as homeUri: String, jar as j7: Jar } := made14;
+        assertTrue(equal(asSpan(&homeUri), "/"), "to the portal");
+        assertTrue(hasSession(&j7), "a session");
+        assertTrue(not hasStep(&j7), "the step cookie is gone");
+        let j8: Jar := expectStatus(j7, "GET", "/", "", asSpan(&path), 200, "the portal of bob");
+        destroyJar(j8);
+        destroyString(homeUri);
+        destroyString(codeBody);
+        destroyString(code);
+        destroyString(secret);
+        destroyString(totpUri);
+        destroyString(newBody);
+        destroyString(stepToken);
+        destroyString(stepUri);
+        destroyString(posted);
+        destroyString(req);
+        destroyString(password);
+        destroyString(loginUri);
+        destroyString(path);
+        return nil;
+    end;
+
+    -- The text after tag up to the next angle bracket.
+    generic [T: Region]
+    function afterTag(text: Span[Nat8, T], tag: Span[Nat8, Static]): String is
+        case indexOf(text, tag) of
+            when Some(value as at: Index) do
+                let rest: Span[Nat8, T] := substring(text, at + spanLength(tag), spanLength(text));
+                case indexOfByte(rest, '<') of
+                    when Some(value as stop: Index) do
+                        return fromSpan(substring(rest, 0, stop));
+                    when None do
+                        return fromSpan("");
+                end case;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [T: Region]
+    function withoutBlanks(text: Span[Nat8, T]): String is
+        var b: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if text[i] /= ' ' then
+                writeByte(&!b, text[i]);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(b);
+    end;
+
+    -- One login with password for email, from a fresh login page; its output.
+    generic [P: Region, E: Region, W: Region]
+    function attempt(conf: Span[Nat8, P], email: Span[Nat8, E], password: Span[Nat8, W]): String is
+        let made15: Moved := directLogin(emptyJar(), conf);
+        let { location as loginUri: String, jar as j1: Jar } := made15;
+        let made16: Visit := visit(j1, "GET", asSpan(&loginUri), "", conf);
+        let { output as page: String, jar as j2: Jar } := made16;
+        let req: String := reqOf(asSpan(&loginUri));
+        let posted: String := loginBody(asSpan(&req), asSpan(&page), email, password, "");
+        destroyString(page);
+        let made17: Visit := visit(j2, "POST", "/login", asSpan(&posted), conf);
+        let { output: String, jar as j3: Jar } := made17;
+        destroyJar(j3);
+        destroyString(posted);
+        destroyString(req);
+        destroyString(loginUri);
+        return output;
+    end;
+
+    function testCarolIsLocked(): Unit is
+        let path: String := confWith("");
+        let out: String := attempt(asSpan(&path), "carol@example.com", "carol has a long password");
+        assertTrue(statusOf(asSpan(&out)) = 403, "the right proof of a locked account");
+        assertTrue(contains(asSpan(&out), "This account is locked"), "it says so");
+        destroyString(out);
+        destroyString(path);
+        return nil;
+    end;
+
+    function testBanAfterThreeFailures(): Unit is
+        let path: String := confWith("login.ban_after = 3\n");
+        let first: String := attempt(asSpan(&path), "alice@example.com", "wrong password number one");
+        assertTrue(statusOf(asSpan(&first)) = 401, "the first failure");
+        let noBan: String := header(asSpan(&first), "X-Hiawatha-Ban", 0);
+        assertTrue(length(&noBan) = 0, "no ban yet");
+        destroyString(noBan);
+        destroyString(first);
+        let second: String := attempt(asSpan(&path), "alice@example.com", "wrong password number two");
+        assertTrue(statusOf(asSpan(&second)) = 401, "the second failure");
+        destroyString(second);
+        let third: String := attempt(asSpan(&path), "alice@example.com", "wrong password number three");
+        assertTrue(statusOf(asSpan(&third)) = 429, "the third earns the ban");
+        let ban: String := header(asSpan(&third), "X-Hiawatha-Ban", 0);
+        assertTrue(equal(asSpan(&ban), "900"), "a ban of 900 seconds is asked of Hiawatha");
+        destroyString(ban);
+        destroyString(third);
+        destroyString(path);
+        return nil;
+    end;
+
+    function testRouter(): Unit is
+        let path: String := confWith("");
+        let j1: Jar := expectStatus(emptyJar(), "GET", "/nowhere", "", asSpan(&path), 404, "an unknown path");
+        let j2: Jar := expectStatus(j1, "GET", "/token", "", asSpan(&path), 405, "GET of the token endpoint");
+        let made18: Visit := visit(j2, "DELETE", "/login", "", asSpan(&path));
+        let { output: String, jar as j3: Jar } := made18;
+        assertTrue(statusOf(asSpan(&output)) = 405, "DELETE of the login");
+        let allow: String := header(asSpan(&output), "Allow", 0);
+        assertTrue(equal(asSpan(&allow), "GET, HEAD, POST"), "the methods it allows");
+        destroyString(allow);
+        destroyString(output);
+        let j4: Jar := expectStatus(j3, "GET", "/.well-known/openid-configuration", "", asSpan(&path), 200, "discovery");
+        let j5: Jar := expectStatus(j4, "GET", "/jwks", "", asSpan(&path), 200, "the key set");
+        let j6: Jar := expectStatus(j5, "HEAD", "/jwks", "", asSpan(&path), 200, "HEAD as GET");
+        destroyJar(j6);
+        destroyString(path);
+        return nil;
+    end;
+
+    --- A worker of the server
+
+    -- The answer of worker to verb on uri, and the worker for the next
+    -- request.
+    generic [U: Region]
+    function served(worker: Worker, verb: Span[Nat8, Static], uri: Span[Nat8, U]): Served[Worker] is
+        return handleWith(Turn(state => worker, request => requestOf(verb, uri, "", "")));
+    end;
+
+    -- The answer of the handler that opens the world per request, to
+    -- compare with the worker's.
+    generic [U: Region, P: Region]
+    function freshAnswer(verb: Span[Nat8, Static], uri: Span[Nat8, U], conf: Span[Nat8, P]): String is
+        let request: Request := requestOf(verb, uri, "", "");
+        let output: String := respond(&request, conf, nowSeconds());
+        destroyRequest(request);
+        return output;
+    end;
+
+    -- Whether worker answers verb on uri as the handler without a world
+    -- does, and the worker for the next request.
+    generic [U: Region, P: Region]
+    function sameAsFresh(worker: Worker, verb: Span[Nat8, Static], uri: Span[Nat8, U], conf: Span[Nat8, P],
+        what: Span[Nat8, Static]): Worker is
+        let { state as next: Worker, answer as mine: String } := served(worker, verb, uri);
+        let other: String := freshAnswer(verb, uri, conf);
+        assertTrue(statusOf(asSpan(&mine)) > 0, what);
+        assertTrue(equal(asSpan(&mine), asSpan(&other)), what);
+        destroyString(mine);
+        destroyString(other);
+        return next;
+    end;
+
+    -- A worker keeps its world between requests and answers as the
+    -- handler that opens it per request: discovery and the key set, made
+    -- once, and the router, twice each, so the second answer comes from
+    -- the world the first one opened.
+    function testWorkerAnswersAsFresh(): Unit is
+        let path: String := confWith("");
+        var worker: Worker := makeWorker(asSpan(&path));
+        var round: Index := 0;
+        while round < 2 do
+            worker := sameAsFresh(worker, "GET", "/.well-known/openid-configuration", asSpan(&path), "discovery");
+            worker := sameAsFresh(worker, "GET", "/jwks", asSpan(&path), "the key set");
+            worker := sameAsFresh(worker, "HEAD", "/jwks", asSpan(&path), "HEAD as GET");
+            worker := sameAsFresh(worker, "GET", "/nowhere", asSpan(&path), "an unknown path");
+            worker := sameAsFresh(worker, "GET", "/token", asSpan(&path), "GET of the token endpoint");
+            round := round + 1;
+        end while;
+        closeWorker(worker);
+        destroyString(path);
+        return nil;
+    end;
+end module body.

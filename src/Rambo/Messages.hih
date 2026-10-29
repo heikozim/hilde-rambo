@@ -1,0 +1,163 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Written by tools/genmessages.pl from the page texts of the earlier Go provider and texts/;
+-- change the generator or the texts, not this file.
+"""
+The texts of the pages in English and German, as a catalog of
+Standard.I18n.  A text with {arg} has a word put in its place.
+"""
+import Standard.I18n (
+    Catalog
+);
+
+module Rambo.Messages is
+    """
+    The texts of the pages, one case each.
+    """
+    union Key: Free is
+        case AccountApp;
+        case AccountAppServer;
+        case AccountBrowser;
+        case AccountCode;
+        case AccountDeviceIpNote;
+        case AccountEmail;
+        case AccountEnd;
+        case AccountId;
+        case AccountLastSeen;
+        case AccountName;
+        case AccountOldPassword;
+        case AccountPasskeyAdd;
+        case AccountPasskeyAddHint;
+        case AccountPasskeyCreated;
+        case AccountPasskeyLabel;
+        case AccountPasskeyLabelHint;
+        case AccountPasskeyLastUsed;
+        case AccountPasskeyName;
+        case AccountPasskeyNever;
+        case AccountPasskeyNone;
+        case AccountPasskeyRemove;
+        case AccountPasskeyRename;
+        case AccountPasskeys;
+        case AccountPasskeysHint;
+        case AccountPassword;
+        case AccountPasswordHint;
+        case AccountPasswordSubmit;
+        case AccountReauthHint;
+        case AccountSessions;
+        case AccountSince;
+        case AccountThisSession;
+        case AccountTotp;
+        case AccountTotpHint;
+        case AccountTotpSubmit;
+        case BoundEnd;
+        case BoundSwitch;
+        case CommonCancel;
+        case ConfirmDevice;
+        case ConfirmEndSession;
+        case ConfirmRevokeDevice;
+        case ConfirmSession;
+        case ErrBanned;
+        case ErrBusy;
+        case ErrCode;
+        case ErrCsrf;
+        case ErrForm;
+        case ErrInvalid;
+        case ErrLocked;
+        case ErrMismatch;
+        case ErrNotFound;
+        case ErrPasskey;
+        case ErrPasskeyAdd;
+        case ErrPasskeyGone;
+        case ErrPasskeyKnown;
+        case ErrPasskeyLabel;
+        case ErrPasskeyMany;
+        case ErrPow;
+        case ErrPowHarder;
+        case ErrReauth;
+        case ErrRenewal;
+        case ErrRequest;
+        case ErrSession;
+        case ErrTemporary;
+        case ErrThrottled;
+        case ErrWeak;
+        case FooterAcronym;
+        case FooterAuthor;
+        case FooterCopyright;
+        case HomeBound;
+        case HomeBoundHint;
+        case HomeNoApps;
+        case HomeNoBound;
+        case InfoDoneDevice;
+        case InfoDonePassword;
+        case InfoDoneSession;
+        case InfoDoneTotp;
+        case InfoLoggedOut;
+        case InfoNotSignedIn;
+        case InfoPasskeyAdded;
+        case InfoPasskeyRemoved;
+        case InfoPasskeyRenamed;
+        case InfoRestarted;
+        case LangDe;
+        case LangDeShort;
+        case LangEn;
+        case LangEnShort;
+        case LangLabel;
+        case LoginCode;
+        case LoginCodeHint;
+        case LoginEmail;
+        case LoginFor;
+        case LoginPasskey;
+        case LoginPasskeyOr;
+        case LoginPassword;
+        case LoginReauth;
+        case LoginSubmit;
+        case LogoutLead;
+        case LogoutSubmit;
+        case MessageContinue;
+        case NavAccount;
+        case NavHome;
+        case NavLabel;
+        case PasskeyCancelled;
+        case PasskeyCreate;
+        case PasskeyCreateHint;
+        case PasskeyUnsupported;
+        case PasskeyWorking;
+        case PasswordAgain;
+        case PasswordLead;
+        case PasswordNew;
+        case PasswordRule;
+        case PasswordSubmit;
+        case PowDone;
+        case PowNoscript;
+        case PowTimeout;
+        case PowUnsupported;
+        case PowWorking;
+        case RenewLead;
+        case TitleAccount;
+        case TitleConfirm;
+        case TitleError;
+        case TitleHome;
+        case TitleLoggedOut;
+        case TitleLogin;
+        case TitleLogout;
+        case TitlePasskeyAdd;
+        case TitlePassword;
+        case TitleTotp;
+        case TitleTotpRenew;
+        case TotpCode;
+        case TotpLead;
+        case TotpManual;
+        case TotpQrAlt;
+        case TotpSubmit;
+    end;
+
+    """
+    The catalog: English first, then German.
+    No contract: a record of function pointers has no equality to state it with.
+    """
+    function messages(): Catalog[Key];
+end module.

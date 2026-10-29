@@ -1,0 +1,12 @@
+{#
+Part of rambo.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+A page that only says something: an error, a note, and the way back.
+-#}
+{% extends "templates/layout.jinja" %}
+{% block content %}
+<p><a href="/">{{ _("MessageContinue") }}</a></p>
+{% endblock %}

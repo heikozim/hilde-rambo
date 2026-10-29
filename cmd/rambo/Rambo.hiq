@@ -1,0 +1,1774 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length,
+    nthByte
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    destroyEmpty,
+    nthRef,
+    length as bufferLength
+);
+import Standard.Text (
+    equal,
+    formatInt
+);
+import Standard.IO (
+    TerminalCapability,
+    acquireTerminal,
+    releaseTerminal,
+    readByte
+);
+import Standard.IO.Terminal (
+    StandardError,
+    StandardInput,
+    StandardOutput,
+    acquireError,
+    acquireInput,
+    acquireOutput,
+    releaseError,
+    releaseInput,
+    releaseOutput,
+    writeErrorText,
+    readHiddenLine,
+    outputIsTerminal
+);
+import Standard.Arguments (
+    Command,
+    Spec,
+    FlagKey,
+    TextKey,
+    PathKey,
+    PositionalKey,
+    SubcommandKey,
+    ArgumentError,
+    Outcome,
+    Run,
+    Help,
+    Version,
+    Matches,
+    makeCommand,
+    destroyCommand,
+    setVersion,
+    setFullVersion,
+    addVerbose,
+    addConfig,
+    addSandbox,
+    option,
+    repeatable,
+    addFlag,
+    addText,
+    addPositional,
+    addSubcommand,
+    requireSubcommand,
+    processArguments,
+    destroyArguments,
+    parse,
+    destroyMatches,
+    describeError,
+    destroyError,
+    flagCount,
+    textOf,
+    pathOf,
+    positionalOf,
+    textCount,
+    textAt,
+    chosen,
+    helpText,
+    setInfo
+);
+import Standard.Account (
+    isSuperuser
+);
+import Standard.File (
+    environmentValue
+);
+import Standard.About (
+    fullVersionWith,
+    info
+);
+import Standard.Libcrypto (
+    libraryVersion as cryptoVersion
+);
+import Standard.SqlCipher (
+    libraryVersion as sqliteVersion
+);
+import Standard.Platform (
+    systemName
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.Log (
+    Log,
+    Daemon,
+    Info,
+    logToSystem,
+    closeLog
+);
+import Standard.FcgiServer (
+    Limits as ServerLimits,
+    defaultLimits
+);
+import Wolly.OpKey (
+    RingKey
+);
+import Wolly.Account (
+    Account,
+    destroyAccount,
+    accountById
+);
+import Wolly.DevServer (
+    serveHttp
+);
+import Wolly.OpBase (
+    OpSettings
+);
+import Wolly.OpClient (
+    Limits
+);
+import Wolly.Server (
+    Outcome as Served,
+    serveWith
+);
+import Rambo.Config (
+    Config,
+    destroyConfig,
+    loadConfig,
+    goDuration
+);
+import Rambo.Context (
+    Context,
+    Secrets,
+    closeContext,
+    configPath,
+    openContext
+);
+import Rambo.Site (
+    Worker,
+    nowSeconds,
+    handle,
+    makeWorker,
+    closeWorker,
+    handleWith
+);
+import Rambo.Admin (
+    Added,
+    auditCommand,
+    RoleGiven,
+    actorName,
+    addAccount,
+    accountTable,
+    lockAccount,
+    unlockAccount,
+    resetPassword,
+    resetSecondFactor,
+    setAccountEmail,
+    setAccountName,
+    deleteAccount,
+    sessionTable,
+    endSessionNamed,
+    passkeyTable,
+    revokePasskey,
+    resetPasskeys,
+    grantRoleTo,
+    revokeRoleFrom,
+    roleTable
+);
+import Rambo.Clients (
+    Definition,
+    destroyDefinition,
+    addNewClient,
+    clientTable,
+    setClientLimits,
+    setClientAlg,
+    setClientLax,
+    setClientDisabled,
+    rotateClientSecret,
+    setClientStart,
+    setClientLogo,
+    setClientName,
+    rotateKeysNow
+);
+import Rambo.Migrate (
+    migrate
+);
+import Rambo.Vaults (
+    initVault,
+    setVaultSecret,
+    getVaultSecret,
+    deleteVaultSecret,
+    listVaultSecrets,
+    rotateVaultKey,
+    rotateVaultPepper
+);
+import Rambo.Guard (
+    checkSocketDir,
+    applyServe,
+    applyAdmin,
+    applyInfo,
+    sandboxText,
+    infoProfile
+);
+
+module body Rambo.Main is
+    constant release: Span[Nat8, Static] := "0.2.0";
+
+    --- The command tree
+
+    -- The keys of every command, option and argument.
+    record Keys: Free is
+        verbose: FlagKey;
+        config: PathKey;
+        sandbox: FlagKey;
+        serve: SubcommandKey;
+        sandboxCommand: SubcommandKey;
+        setup: SubcommandKey;
+        setupInit: SubcommandKey;
+        setupSet: SubcommandKey;
+        setupSetName: PositionalKey;
+        setupGet: SubcommandKey;
+        setupGetName: PositionalKey;
+        setupDelete: SubcommandKey;
+        setupDeleteName: PositionalKey;
+        setupDeleteYes: FlagKey;
+        setupList: SubcommandKey;
+        setupRotateKey: SubcommandKey;
+        setupRotatePepper: SubcommandKey;
+        account: SubcommandKey;
+        accountAdd: SubcommandKey;
+        accountAddEmail: PositionalKey;
+        accountAddName: TextKey;
+        accountList: SubcommandKey;
+        accountSetEmail: SubcommandKey;
+        accountSetEmailRef: PositionalKey;
+        accountSetEmailEmail: PositionalKey;
+        accountSetName: SubcommandKey;
+        accountSetNameRef: PositionalKey;
+        accountSetNameName: PositionalKey;
+        accountLock: SubcommandKey;
+        accountLockRef: PositionalKey;
+        accountLockRoot: FlagKey;
+        accountLockYes: FlagKey;
+        accountUnlock: SubcommandKey;
+        accountUnlockRef: PositionalKey;
+        accountResetPassword: SubcommandKey;
+        accountResetPasswordRef: PositionalKey;
+        accountResetPasswordYes: FlagKey;
+        accountResetTotp: SubcommandKey;
+        accountResetTotpRef: PositionalKey;
+        accountResetTotpYes: FlagKey;
+        accountDelete: SubcommandKey;
+        accountDeleteRef: PositionalKey;
+        accountDeleteYes: FlagKey;
+        accountResetPasskeys: SubcommandKey;
+        accountResetPasskeysRef: PositionalKey;
+        accountResetPasskeysYes: FlagKey;
+        client: SubcommandKey;
+        clientAdd: SubcommandKey;
+        clientAddId: TextKey;
+        clientAddName: TextKey;
+        clientAddKind: TextKey;
+        clientAddRedirect: TextKey;
+        clientAddLogout: TextKey;
+        clientAddAudience: TextKey;
+        clientAddAlg: TextKey;
+        clientAddLax: FlagKey;
+        clientAddStart: TextKey;
+        clientList: SubcommandKey;
+        clientLimits: SubcommandKey;
+        clientLimitsId: PositionalKey;
+        clientLimitsIdle: TextKey;
+        clientLimitsMax: TextKey;
+        clientLimitsRefresh: TextKey;
+        clientAlg: SubcommandKey;
+        clientAlgId: PositionalKey;
+        clientAlgAlg: PositionalKey;
+        clientLax: SubcommandKey;
+        clientLaxId: PositionalKey;
+        clientLaxOn: PositionalKey;
+        clientDisable: SubcommandKey;
+        clientDisableId: PositionalKey;
+        clientDisableYes: FlagKey;
+        clientEnable: SubcommandKey;
+        clientEnableId: PositionalKey;
+        clientRotate: SubcommandKey;
+        clientRotateId: PositionalKey;
+        clientRotateYes: FlagKey;
+        clientStart: SubcommandKey;
+        clientStartId: PositionalKey;
+        clientStartUrl: PositionalKey;
+        clientStartClear: FlagKey;
+        clientLogo: SubcommandKey;
+        clientLogoId: PositionalKey;
+        clientLogoClear: FlagKey;
+        clientSetName: SubcommandKey;
+        clientSetNameId: PositionalKey;
+        clientSetNameName: PositionalKey;
+        role: SubcommandKey;
+        roleGrant: SubcommandKey;
+        roleGrantRef: PositionalKey;
+        roleGrantClient: PositionalKey;
+        roleGrantRole: PositionalKey;
+        roleRevoke: SubcommandKey;
+        roleRevokeRef: PositionalKey;
+        roleRevokeClient: PositionalKey;
+        roleRevokeRole: PositionalKey;
+        roleRevokeYes: FlagKey;
+        roleList: SubcommandKey;
+        roleListClient: TextKey;
+        roleListAccount: TextKey;
+        session: SubcommandKey;
+        sessionList: SubcommandKey;
+        sessionListRef: PositionalKey;
+        sessionEnd: SubcommandKey;
+        sessionEndId: PositionalKey;
+        sessionEndYes: FlagKey;
+        passkey: SubcommandKey;
+        passkeyList: SubcommandKey;
+        passkeyListRef: PositionalKey;
+        passkeyRevoke: SubcommandKey;
+        passkeyRevokeCredential: PositionalKey;
+        passkeyRevokeYes: FlagKey;
+        keys: SubcommandKey;
+        keysRotate: SubcommandKey;
+        migrate: SubcommandKey;
+    end;
+
+    generic [C: Region]
+    function yesOf(command: &![Command, C]): FlagKey is
+        return addFlag(command, option("yes", 0, "really do it (this cannot be undone from here)"));
+    end;
+
+    generic [C: Region]
+    function positional(command: &![Command, C], name: Span[Nat8, Static], help: Span[Nat8, Static]): PositionalKey is
+        return addPositional(command, name, help, true, false);
+    end;
+
+    -- The whole tree of rambo and its keys.
+    record Tree: Linear is
+        command: Command;
+        keys: Keys;
+    end;
+
+    constant art: Span[Nat8, Static] :=
+        " ____      _    __  __ ____   ___\n|  _ \\    / \\  |  \\/  | __ ) / _ \\\n| |_) |  / _ \\ | |\\/| |  _ \\| | | |\n|  _ <  / ___ \\| |  | | |_) | |_| |\n|_| \\_\\/_/   \\_\\_|  |_|____/ \\___/\n";
+
+    -- name, a blank and version, a line library of the full version.
+    function library(name: Span[Nat8, Static], version: Span[Nat8, Static]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, name);
+        writeByte(&!b, ' ');
+        writeString(&!b, version);
+        return finalize(b);
+    end;
+
+    -- The full version with the versions of the C libraries rambo runs with.
+    function fullVersion(): String is
+        var libraries: Buffer[String] := allocateEmpty();
+        insertBack(&!libraries, library("libcrypto", cryptoVersion()));
+        insertBack(&!libraries, library("sqlcipher", sqliteVersion()));
+        let text: String := fullVersionWith(release, "2026 Heiko Zimmermann", &libraries);
+        while bufferLength(&libraries) > 0 do
+            destroyString(removeLast(&!libraries));
+        end while;
+        destroyEmpty(libraries);
+        return text;
+    end;
+
+    function tree(): Tree is
+        var root: Command := makeCommand("rambo", "RAMBO - sign-in for a fixed set of first-party tools");
+        setVersion(&!root, "0.2.0, Copyright (C) 2026 Heiko Zimmermann");
+        setFullVersion(&!root, fullVersion());
+        let path: String := configPath();
+        setInfo(&!root, info(art, "Rights, Accounts, Multi-factor, Bearer tokens & OAuth", "rambo", release, asSpan(&path)));
+        destroyString(path);
+        let verbose: FlagKey := addVerbose(&!root, "Enable verbose output");
+        let config: PathKey := addConfig(&!root);
+        let sandbox: FlagKey := addSandbox(&!root);
+
+        var serving: Command := makeCommand("serve", "Run RAMBO (FastCGI behind Hiawatha, or http on loopback for development)");
+        let serveKey: SubcommandKey := addSubcommand(&!root, serving);
+        var sandboxing: Command := makeCommand("sandbox", "Print the sandbox: this process, and the serve and admin profiles");
+        let sandboxKey: SubcommandKey := addSubcommand(&!root, sandboxing);
+
+        var setup: Command := makeCommand("setup", "Manage the vault (Fernet-encrypted secrets)");
+        requireSubcommand(&!setup);
+        var setupInit: Command := makeCommand("init", "Create the vault, the pepper and every secret RAMBO needs (idempotent)");
+        let setupInitKey: SubcommandKey := addSubcommand(&!setup, setupInit);
+        var setupSet: Command := makeCommand("set", "Store a secret (asked for without echo, or one line from a pipe)");
+        let setupSetName: PositionalKey := positional(&!setupSet, "NAME", "the name of the secret");
+        let setupSetKey: SubcommandKey := addSubcommand(&!setup, setupSet);
+        var setupGet: Command := makeCommand("get", "Print a secret -- to a terminal only");
+        let setupGetName: PositionalKey := positional(&!setupGet, "NAME", "the name of the secret");
+        let setupGetKey: SubcommandKey := addSubcommand(&!setup, setupGet);
+        var setupDelete: Command := makeCommand("delete", "Remove a secret");
+        let setupDeleteName: PositionalKey := positional(&!setupDelete, "NAME", "the name of the secret");
+        let setupDeleteYes: FlagKey := yesOf(&!setupDelete);
+        let setupDeleteKey: SubcommandKey := addSubcommand(&!setup, setupDelete);
+        var setupList: Command := makeCommand("list", "List the names of the secrets");
+        let setupListKey: SubcommandKey := addSubcommand(&!setup, setupList);
+        var setupRotateKey: Command := makeCommand("rotate-key", "New Fernet key, every secret re-encrypted");
+        let setupRotateKeyKey: SubcommandKey := addSubcommand(&!setup, setupRotateKey);
+        var setupRotatePepper: Command := makeCommand("rotate-pepper",
+            "New pepper file, every secret re-encrypted (the password pepper is a secret of its own and stays)");
+        let setupRotatePepperKey: SubcommandKey := addSubcommand(&!setup, setupRotatePepper);
+        let setupKey: SubcommandKey := addSubcommand(&!root, setup);
+
+        var account: Command := makeCommand("account", "Manage accounts");
+        requireSubcommand(&!account);
+        var accountAdd: Command := makeCommand("add", "Create an account with a one-time password (shown once)");
+        let accountAddEmail: PositionalKey := positional(&!accountAdd, "EMAIL", "the address the account signs in with");
+        let accountAddName: TextKey := addText(&!accountAdd, option("name", 0, "display name"), "");
+        let accountAddKey: SubcommandKey := addSubcommand(&!account, accountAdd);
+        var accountList: Command := makeCommand("list", "List the accounts");
+        let accountListKey: SubcommandKey := addSubcommand(&!account, accountList);
+        var accountSetEmail: Command := makeCommand("set-email", "Change the login address (the ID stays)");
+        let accountSetEmailRef: PositionalKey := positional(&!accountSetEmail, "REF", "an account ID or e-mail address");
+        let accountSetEmailEmail: PositionalKey := positional(&!accountSetEmail, "EMAIL", "the new address");
+        let accountSetEmailKey: SubcommandKey := addSubcommand(&!account, accountSetEmail);
+        var accountSetName: Command := makeCommand("set-name", "Change the display name");
+        let accountSetNameRef: PositionalKey := positional(&!accountSetName, "REF", "an account ID or e-mail address");
+        let accountSetNameName: PositionalKey := positional(&!accountSetName, "NAME", "the new display name");
+        let accountSetNameKey: SubcommandKey := addSubcommand(&!account, accountSetName);
+        var accountLock: Command := makeCommand("lock", "Lock an account and end all its sessions and devices");
+        let accountLockRef: PositionalKey := positional(&!accountLock, "REF", "an account ID or e-mail address");
+        let accountLockRoot: FlagKey := addFlag(&!accountLock, option("root", 0,
+            "allow locking a root account (never the last unlocked one)"));
+        let accountLockYes: FlagKey := yesOf(&!accountLock);
+        let accountLockKey: SubcommandKey := addSubcommand(&!account, accountLock);
+        var accountUnlock: Command := makeCommand("unlock", "Lift a lock (ended sessions stay ended)");
+        let accountUnlockRef: PositionalKey := positional(&!accountUnlock, "REF", "an account ID or e-mail address");
+        let accountUnlockKey: SubcommandKey := addSubcommand(&!account, accountUnlock);
+        var accountResetPassword: Command := makeCommand("reset-password",
+            "Give a new one-time password (shown once) and end the sessions");
+        let accountResetPasswordRef: PositionalKey := positional(&!accountResetPassword, "REF",
+            "an account ID or e-mail address");
+        let accountResetPasswordYes: FlagKey := yesOf(&!accountResetPassword);
+        let accountResetPasswordKey: SubcommandKey := addSubcommand(&!account, accountResetPassword);
+        var accountResetTotp: Command := makeCommand("reset-totp",
+            "Remove the second factor (set up again at the next login) and end the sessions");
+        let accountResetTotpRef: PositionalKey := positional(&!accountResetTotp, "REF", "an account ID or e-mail address");
+        let accountResetTotpYes: FlagKey := yesOf(&!accountResetTotp);
+        let accountResetTotpKey: SubcommandKey := addSubcommand(&!account, accountResetTotp);
+        var accountDelete: Command := makeCommand("delete",
+            "Delete an account for good: password, second factor, sessions, tokens, roles");
+        let accountDeleteRef: PositionalKey := positional(&!accountDelete, "REF", "an account ID or e-mail address");
+        let accountDeleteYes: FlagKey := yesOf(&!accountDelete);
+        let accountDeleteKey: SubcommandKey := addSubcommand(&!account, accountDelete);
+        var accountResetPasskeys: Command := makeCommand("reset-passkeys",
+            "Remove every passkey of an account (password and code stay)");
+        let accountResetPasskeysRef: PositionalKey := positional(&!accountResetPasskeys, "REF", "an account ID or e-mail address");
+        let accountResetPasskeysYes: FlagKey := yesOf(&!accountResetPasskeys);
+        let accountResetPasskeysKey: SubcommandKey := addSubcommand(&!account, accountResetPasskeys);
+        let accountKey: SubcommandKey := addSubcommand(&!root, account);
+
+        var client: Command := makeCommand("client", "Manage the clients (tools) that may sign in with RAMBO");
+        requireSubcommand(&!client);
+        var clientAdd: Command := makeCommand("add", "Register a client; a web or service client's secret is shown once");
+        let clientAddId: TextKey := addText(&!clientAdd, option("id", 0, "client ID (lowercase letters, digits, dashes)"), "");
+        let clientAddName: TextKey := addText(&!clientAdd, option("name", 0, "name shown on the login page"), "");
+        let clientAddKind: TextKey := addText(&!clientAdd, option("kind", 0, "web, native or service"), "");
+        let clientAddRedirect: TextKey := addText(&!clientAdd, repeatable(option("redirect", 0,
+            "redirect URI (repeat for more)")), "");
+        let clientAddLogout: TextKey := addText(&!clientAdd, repeatable(option("logout", 0,
+            "post-logout redirect URI (repeat for more)")), "");
+        let clientAddAudience: TextKey := addText(&!clientAdd, repeatable(option("audience", 0,
+            "access token audience (repeat; default: the client ID)")), "");
+        let clientAddAlg: TextKey := addText(&!clientAdd, option("alg", 0,
+            "algorithm of the client's tokens: ML-DSA-44 or ML-DSA-44-Ed25519; empty: token_alg of rambo.conf"), "");
+        let clientAddLax: FlagKey := addFlag(&!clientAdd, option("lax-auth", 0,
+            "web client only: PKCE and nonce optional, for a tool that sends neither"));
+        let clientAddStart: TextKey := addText(&!clientAdd, option("start-url", 0,
+            "where the portal starts the client (OIDC initiate_login_uri); empty: no tile"), "");
+        let clientAddKey: SubcommandKey := addSubcommand(&!client, clientAdd);
+        var clientList: Command := makeCommand("list", "List the clients");
+        let clientListKey: SubcommandKey := addSubcommand(&!client, clientList);
+        var clientLimits: Command := makeCommand("limits", "Set a client's own limits (0 = RAMBO's; longer than RAMBO's is refused)");
+        let clientLimitsId: PositionalKey := positional(&!clientLimits, "ID", "the client ID");
+        let clientLimitsIdle: TextKey := addText(&!clientLimits, option("idle", 0, "idle limit, e.g. 30m (0: RAMBO's)"), "0s");
+        let clientLimitsMax: TextKey := addText(&!clientLimits, option("max", 0, "max limit, e.g. 30m (0: RAMBO's)"), "0s");
+        let clientLimitsRefresh: TextKey := addText(&!clientLimits, option("refresh", 0,
+            "refresh limit, e.g. 30m (0: RAMBO's)"), "0s");
+        let clientLimitsKey: SubcommandKey := addSubcommand(&!client, clientLimits);
+        var clientAlg: Command := makeCommand("alg",
+            "Set the algorithm that signs a client's tokens; default follows token_alg in rambo.conf");
+        let clientAlgId: PositionalKey := positional(&!clientAlg, "ID", "the client ID");
+        let clientAlgAlg: PositionalKey := positional(&!clientAlg, "ALG", "ML-DSA-44, ML-DSA-44-Ed25519 or default");
+        let clientAlgKey: SubcommandKey := addSubcommand(&!client, clientAlg);
+        var clientLax: Command := makeCommand("lax", "Let a web client leave PKCE and the nonce out of its sign-in request, or take it back");
+        let clientLaxId: PositionalKey := positional(&!clientLax, "ID", "the client ID");
+        let clientLaxOn: PositionalKey := positional(&!clientLax, "SWITCH", "on or off");
+        let clientLaxKey: SubcommandKey := addSubcommand(&!client, clientLax);
+        var clientDisable: Command := makeCommand("disable", "Block a client: no new sign-ins, no tokens");
+        let clientDisableId: PositionalKey := positional(&!clientDisable, "ID", "the client ID");
+        let clientDisableYes: FlagKey := yesOf(&!clientDisable);
+        let clientDisableKey: SubcommandKey := addSubcommand(&!client, clientDisable);
+        var clientEnable: Command := makeCommand("enable", "Unblock a client");
+        let clientEnableId: PositionalKey := positional(&!clientEnable, "ID", "the client ID");
+        let clientEnableKey: SubcommandKey := addSubcommand(&!client, clientEnable);
+        var clientRotate: Command := makeCommand("rotate-secret",
+            "Give a web or service client a new secret (shown once); the old one stops working");
+        let clientRotateId: PositionalKey := positional(&!clientRotate, "ID", "the client ID");
+        let clientRotateYes: FlagKey := yesOf(&!clientRotate);
+        let clientRotateKey: SubcommandKey := addSubcommand(&!client, clientRotate);
+        var clientStart: Command := makeCommand("start-url",
+            "Set where the portal starts the client (OIDC initiate_login_uri); --clear removes the tile");
+        let clientStartId: PositionalKey := positional(&!clientStart, "ID", "the client ID");
+        let clientStartUrl: PositionalKey := addPositional(&!clientStart, "URL", "the start page", false, false);
+        let clientStartClear: FlagKey := addFlag(&!clientStart, option("clear", 0, "remove the start page (the client loses its tile)"));
+        let clientStartKey: SubcommandKey := addSubcommand(&!client, clientStart);
+        var clientLogo: Command := makeCommand("logo",
+            "Read the client's tile picture from stdin (png, jpeg, gif or webp, at most 48 KiB); --clear removes it");
+        let clientLogoId: PositionalKey := positional(&!clientLogo, "ID", "the client ID");
+        let clientLogoClear: FlagKey := addFlag(&!clientLogo, option("clear", 0, "remove the picture"));
+        let clientLogoKey: SubcommandKey := addSubcommand(&!client, clientLogo);
+        var clientSetName: Command := makeCommand("set-name",
+            "Change the name of a client (the label under its tile and on its login page)");
+        let clientSetNameId: PositionalKey := positional(&!clientSetName, "ID", "the client ID");
+        let clientSetNameName: PositionalKey := positional(&!clientSetName, "NAME", "the new name");
+        let clientSetNameKey: SubcommandKey := addSubcommand(&!client, clientSetName);
+        let clientKey: SubcommandKey := addSubcommand(&!root, client);
+
+        var role: Command := makeCommand("role", "Manage the roles accounts hold in clients (tools)");
+        requireSubcommand(&!role);
+        var roleGrant: Command := makeCommand("grant", "Give an account (ID or e-mail address) a role in a client");
+        let roleGrantRef: PositionalKey := positional(&!roleGrant, "REF", "an account ID or e-mail address");
+        let roleGrantClient: PositionalKey := positional(&!roleGrant, "CLIENT", "the client ID");
+        let roleGrantRole: PositionalKey := positional(&!roleGrant, "ROLE", "the role");
+        let roleGrantKey: SubcommandKey := addSubcommand(&!role, roleGrant);
+        var roleRevoke: Command := makeCommand("revoke", "Take a role away; it is missing from the client's next token");
+        let roleRevokeRef: PositionalKey := positional(&!roleRevoke, "REF", "an account ID or e-mail address");
+        let roleRevokeClient: PositionalKey := positional(&!roleRevoke, "CLIENT", "the client ID");
+        let roleRevokeRole: PositionalKey := positional(&!roleRevoke, "ROLE", "the role");
+        let roleRevokeYes: FlagKey := yesOf(&!roleRevoke);
+        let roleRevokeKey: SubcommandKey := addSubcommand(&!role, roleRevoke);
+        var roleList: Command := makeCommand("list", "List the roles, all or of one client (--client) or one account (--account)");
+        let roleListClient: TextKey := addText(&!roleList, option("client", 0, "only this client"), "");
+        let roleListAccount: TextKey := addText(&!roleList, option("account", 0, "only this account (ID or e-mail address)"), "");
+        let roleListKey: SubcommandKey := addSubcommand(&!role, roleList);
+        let roleKey: SubcommandKey := addSubcommand(&!root, role);
+
+        var session: Command := makeCommand("session", "List and end browser sessions");
+        requireSubcommand(&!session);
+        var sessionList: Command := makeCommand("list", "List the live sessions, of everybody or of one account");
+        let sessionListRef: PositionalKey := addPositional(&!sessionList, "REF", "an account ID or e-mail address", false, false);
+        let sessionListKey: SubcommandKey := addSubcommand(&!session, sessionList);
+        var sessionEnd: Command := makeCommand("end", "End a session and every sign-in that hangs off it");
+        let sessionEndId: PositionalKey := positional(&!sessionEnd, "SESSION", "the session ID");
+        let sessionEndYes: FlagKey := yesOf(&!sessionEnd);
+        let sessionEndKey: SubcommandKey := addSubcommand(&!session, sessionEnd);
+        let sessionKey: SubcommandKey := addSubcommand(&!root, session);
+
+        var passkeyGroup: Command := makeCommand("passkey", "List and revoke passkeys");
+        requireSubcommand(&!passkeyGroup);
+        var passkeyList: Command := makeCommand("list", "List the passkeys, of everybody or of one account");
+        let passkeyListRef: PositionalKey := addPositional(&!passkeyList, "REF", "an account ID or e-mail address", false, false);
+        let passkeyListKey: SubcommandKey := addSubcommand(&!passkeyGroup, passkeyList);
+        var passkeyRevoke: Command := makeCommand("revoke", "Remove one passkey, whoever it belongs to");
+        let passkeyRevokeCredential: PositionalKey := positional(&!passkeyRevoke, "CREDENTIAL", "the credential ID as passkey list shows it");
+        let passkeyRevokeYes: FlagKey := yesOf(&!passkeyRevoke);
+        let passkeyRevokeKey: SubcommandKey := addSubcommand(&!passkeyGroup, passkeyRevoke);
+        let passkeyKey: SubcommandKey := addSubcommand(&!root, passkeyGroup);
+
+        var keysCommand: Command := makeCommand("keys", "Manage the signing keys");
+        requireSubcommand(&!keysCommand);
+        var keysRotate: Command := makeCommand("rotate",
+            "Make a new signing key now (the old one stays published until its tokens expire)");
+        let keysRotateKey: SubcommandKey := addSubcommand(&!keysCommand, keysRotate);
+        let keysKey: SubcommandKey := addSubcommand(&!root, keysCommand);
+
+        var migrating: Command := makeCommand("migrate",
+            "Take over an installation of the Go provider: check its vault and database and make rambo's own tables");
+        let migrateKey: SubcommandKey := addSubcommand(&!root, migrating);
+
+        return Tree(command => root, keys => Keys(verbose => verbose, config => config, sandbox => sandbox, serve => serveKey,
+            sandboxCommand => sandboxKey, setup => setupKey, setupInit => setupInitKey, setupSet => setupSetKey,
+            setupSetName => setupSetName, setupGet => setupGetKey, setupGetName => setupGetName, setupDelete => setupDeleteKey,
+            setupDeleteName => setupDeleteName, setupDeleteYes => setupDeleteYes, setupList => setupListKey,
+            setupRotateKey => setupRotateKeyKey, setupRotatePepper => setupRotatePepperKey, account => accountKey,
+            accountAdd => accountAddKey, accountAddEmail => accountAddEmail, accountAddName => accountAddName,
+            accountList => accountListKey, accountSetEmail => accountSetEmailKey, accountSetEmailRef => accountSetEmailRef,
+            accountSetEmailEmail => accountSetEmailEmail, accountSetName => accountSetNameKey,
+            accountSetNameRef => accountSetNameRef, accountSetNameName => accountSetNameName, accountLock => accountLockKey,
+            accountLockRef => accountLockRef, accountLockRoot => accountLockRoot, accountLockYes => accountLockYes,
+            accountUnlock => accountUnlockKey, accountUnlockRef => accountUnlockRef,
+            accountResetPassword => accountResetPasswordKey, accountResetPasswordRef => accountResetPasswordRef,
+            accountResetPasswordYes => accountResetPasswordYes, accountResetTotp => accountResetTotpKey,
+            accountResetTotpRef => accountResetTotpRef, accountResetTotpYes => accountResetTotpYes,
+            accountDelete => accountDeleteKey, accountDeleteRef => accountDeleteRef, accountDeleteYes => accountDeleteYes,
+            accountResetPasskeys => accountResetPasskeysKey, accountResetPasskeysRef => accountResetPasskeysRef,
+            accountResetPasskeysYes => accountResetPasskeysYes,
+            client => clientKey, clientAdd => clientAddKey, clientAddId => clientAddId, clientAddName => clientAddName,
+            clientAddKind => clientAddKind, clientAddRedirect => clientAddRedirect, clientAddLogout => clientAddLogout,
+            clientAddAudience => clientAddAudience, clientAddAlg => clientAddAlg, clientAddLax => clientAddLax,
+            clientAddStart => clientAddStart, clientList => clientListKey, clientLimits => clientLimitsKey,
+            clientLimitsId => clientLimitsId, clientLimitsIdle => clientLimitsIdle, clientLimitsMax => clientLimitsMax,
+            clientLimitsRefresh => clientLimitsRefresh, clientAlg => clientAlgKey, clientAlgId => clientAlgId,
+            clientAlgAlg => clientAlgAlg, clientLax => clientLaxKey, clientLaxId => clientLaxId, clientLaxOn => clientLaxOn,
+            clientDisable => clientDisableKey, clientDisableId => clientDisableId, clientDisableYes => clientDisableYes,
+            clientEnable => clientEnableKey, clientEnableId => clientEnableId, clientRotate => clientRotateKey,
+            clientRotateId => clientRotateId, clientRotateYes => clientRotateYes, clientStart => clientStartKey,
+            clientStartId => clientStartId, clientStartUrl => clientStartUrl, clientStartClear => clientStartClear,
+            clientLogo => clientLogoKey, clientLogoId => clientLogoId, clientLogoClear => clientLogoClear,
+            clientSetName => clientSetNameKey, clientSetNameId => clientSetNameId, clientSetNameName => clientSetNameName,
+            role => roleKey, roleGrant => roleGrantKey, roleGrantRef => roleGrantRef, roleGrantClient => roleGrantClient,
+            roleGrantRole => roleGrantRole, roleRevoke => roleRevokeKey, roleRevokeRef => roleRevokeRef,
+            roleRevokeClient => roleRevokeClient, roleRevokeRole => roleRevokeRole, roleRevokeYes => roleRevokeYes,
+            roleList => roleListKey, roleListClient => roleListClient, roleListAccount => roleListAccount,
+            session => sessionKey, sessionList => sessionListKey, sessionListRef => sessionListRef,
+            sessionEnd => sessionEndKey, sessionEndId => sessionEndId, sessionEndYes => sessionEndYes, passkey => passkeyKey,
+            passkeyList => passkeyListKey, passkeyListRef => passkeyListRef, passkeyRevoke => passkeyRevokeKey,
+            passkeyRevokeCredential => passkeyRevokeCredential, passkeyRevokeYes => passkeyRevokeYes, keys => keysKey,
+            keysRotate => keysRotateKey, migrate => migrateKey));
+    end;
+
+    --- Values of the command line
+
+    generic [M: Region]
+    function positionalText(matches: &[Matches, M], key: PositionalKey): String is
+        case positionalOf(matches, key) of
+            when Some(value as found: &[String, M]) do
+                return fromSpan(asSpan(found));
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [M: Region]
+    function textValue(matches: &[Matches, M], key: TextKey): String is
+        case textOf(matches, key) of
+            when Some(value as found: &[String, M]) do
+                return fromSpan(asSpan(found));
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [M: Region]
+    function textValues(matches: &[Matches, M], key: TextKey): Buffer[String] is
+        var all: Buffer[String] := allocateEmpty();
+        var i: Index := 0;
+        while i < textCount(matches, key) do
+            case textAt(matches, key, i) of
+                when Some(value as found: &[String, M]) do
+                    insertBack(&!all, fromSpan(asSpan(found)));
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return all;
+    end;
+
+    generic [M: Region]
+    function given(matches: &[Matches, M], key: FlagKey): Bool is
+        return flagCount(matches, key) > 0;
+    end;
+
+    -- The answer of a command: the text for the standard output, or the
+    -- text of a refusal.
+    function done(text: String): Either[String, String] is
+        return Right(right => text);
+    end;
+
+    function refused(text: String): Either[String, String] is
+        return Left(left => text);
+    end;
+
+    -- what -- repeat with --yes, as the refusal of a step that needs it.
+    generic [W: Region]
+    function needYes(what: Span[Nat8, Static], subject: Span[Nat8, W], rest: Span[Nat8, Static]): Either[String, String] is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, what);
+        writeString(&!b, subject);
+        writeString(&!b, rest);
+        writeString(&!b, " -- repeat with --yes");
+        return refused(finalize(b));
+    end;
+
+    --- The commands that work in the world
+
+    -- A command with its world: the configuration, the database, the
+    -- settings, the ring and the secrets, and the log of the audit lines.
+    generic [M: Region, P: Region, I: Region]
+    function inWorld(matches: &[Matches, M], keys: Keys, path: Span[Nat8, P], input: Span[Nat8, I]): Either[String, String] is
+        if isSuperuser() then
+            return refused(fromSpan(
+                "admin commands do not run as root: run them as the owner of RAMBO's data, e.g. `doas -u _rambo rambo ...` (doas.conf: permit nopass root as _rambo)"));
+        end if;
+        let now: Int64 := nowSeconds();
+        case openContext(path, now) of
+            when Left(left as message: String) do
+                return refused(message);
+            when Right(right as opened: Context) do
+                let { config: Config, db as connection: Database[Writing], settings: OpSettings, ring as keyRing: Buffer[RingKey],
+                    secrets: Secrets, log as written: Log } := opened;
+                let report: String := applyAdmin(&config);
+                destroyString(report);
+                var db: Database[Writing] := connection;
+                var ring: Buffer[RingKey] := keyRing;
+                var log: Log := written;
+                let actor: String := actorName();
+                let out: Either[String, String] := commanded(matches, keys, &!db, &config, &settings, &!ring, &secrets, &!log,
+                    asSpan(&actor), input, now);
+                destroyString(actor);
+                closeContext(Context(config => config, db => db, settings => settings, ring => ring, secrets => secrets,
+                    log => log));
+                return out;
+        end case;
+    end;
+
+    generic [S: Region]
+    function pepperOf(secrets: &[Secrets, S]): Span[Nat8, S] is
+        return asSpan(&(secrets->pepper));
+    end;
+
+    function orFail(problem: Option[String]): Either[String, String] is
+        case problem of
+            when Some(value as message: String) do
+                return refused(message);
+            when None do
+                return done(fromSpan(""));
+        end case;
+    end;
+
+    generic [M: Region, D: Region, C: Region, S: Region, R: Region, K: Region, L: Region, A: Region, I: Region]
+    function commanded(matches: &[Matches, M], keys: Keys, db: &![Database[Writing], D], config: &[Config, C],
+        settings: &[OpSettings, S], ring: &![Buffer[RingKey], R], secrets: &[Secrets, K], log: &![Log, L], actor: Span[Nat8, A],
+        input: Span[Nat8, I], now: Int64): Either[String, String] is
+        if chosen(matches, keys.account) then
+            return accountCommand(matches, keys, &~db, config, secrets, &~log, actor, now);
+        else if chosen(matches, keys.client) then
+            return clientCommand(matches, keys, &~db, settings, &~log, actor, input, now);
+        else if chosen(matches, keys.role) then
+            return roleCommand(matches, keys, &~db, &~log, actor, now);
+        else if chosen(matches, keys.session) then
+            return sessionCommand(matches, keys, &~db, config, &~log, actor, now);
+        else if chosen(matches, keys.passkey) then
+            return passkeyCommand(matches, keys, &~db, &~log, actor, now);
+        else if chosen(matches, keys.keys) then
+            case rotateKeysNow(&~log, config, &~ring, actor, now) of
+                when Left(left as message: String) do
+                    return refused(message);
+                when Right(right as lines: String) do
+                    var b: StringBuilder := makeStringBuilder();
+                    writeString(&!b, "signing key ");
+                    var i: Index := 0;
+                    while i < length(&lines) do
+                        let c: Nat8 := nthByte(&lines, i);
+                        writeByte(&!b, c);
+                        if c = 10 then
+                            writeString(&!b, "signing key ");
+                        end if;
+                        i := i + 1;
+                    end while;
+                    destroyString(lines);
+                    writeString(&!b, "\n\nA running daemon signs with them at once: rambo reads the ring at every request.");
+                    return done(finalize(b));
+            end case;
+        end if;
+        return refused(fromSpan("no command"));
+    end;
+
+    generic [M: Region, D: Region, C: Region, K: Region, L: Region, A: Region]
+    function accountCommand(matches: &[Matches, M], keys: Keys, db: &![Database[Writing], D], config: &[Config, C],
+        secrets: &[Secrets, K], log: &![Log, L], actor: Span[Nat8, A], now: Int64): Either[String, String] is
+        if chosen(matches, keys.accountAdd) then
+            let email: String := positionalText(matches, keys.accountAddEmail);
+            let name: String := textValue(matches, keys.accountAddName);
+            let result: Either[String, Added] := addAccount(&~db, &~log, actor, asSpan(&email), asSpan(&name), pepperOf(secrets),
+                now);
+            destroyString(email);
+            destroyString(name);
+            case result of
+                when Left(left as message: String) do
+                    return refused(message);
+                when Right(right as added: Added) do
+                    let { id: String, password: String } := added;
+                    var b: StringBuilder := makeStringBuilder();
+                    writeString(&!b, "account   ");
+                    writeString(&!b, asSpan(&id));
+                    writeString(&!b, "\npassword  ");
+                    writeString(&!b, asSpan(&password));
+                    writeString(&!b, "\n\nThe password is shown only now. It is changed at the first login,\n");
+                    writeString(&!b, "and the second factor is set up then.");
+                    destroyString(id);
+                    destroyString(password);
+                    return done(finalize(b));
+            end case;
+        else if chosen(matches, keys.accountList) then
+            return listed(accountTable(&~db, config));
+        else if chosen(matches, keys.accountSetEmail) then
+            let ref: String := positionalText(matches, keys.accountSetEmailRef);
+            let email: String := positionalText(matches, keys.accountSetEmailEmail);
+            let problem: Option[String] := setAccountEmail(&~db, &~log, actor, asSpan(&ref), asSpan(&email), now);
+            destroyString(ref);
+            destroyString(email);
+            return orFail(problem);
+        else if chosen(matches, keys.accountSetName) then
+            let ref: String := positionalText(matches, keys.accountSetNameRef);
+            let name: String := positionalText(matches, keys.accountSetNameName);
+            let problem: Option[String] := setAccountName(&~db, &~log, actor, asSpan(&ref), asSpan(&name), now);
+            destroyString(ref);
+            destroyString(name);
+            return orFail(problem);
+        else if chosen(matches, keys.accountLock) then
+            let ref: String := positionalText(matches, keys.accountLockRef);
+            if not given(matches, keys.accountLockYes) then
+                let out: Either[String, String] := needYes("would lock ", asSpan(&ref), " and end its sessions");
+                destroyString(ref);
+                return out;
+            end if;
+            let problem: Option[String] := lockAccount(&~db, &~log, config, actor, asSpan(&ref),
+                given(matches, keys.accountLockRoot), now);
+            destroyString(ref);
+            return orFail(problem);
+        else if chosen(matches, keys.accountUnlock) then
+            let ref: String := positionalText(matches, keys.accountUnlockRef);
+            let problem: Option[String] := unlockAccount(&~db, &~log, actor, asSpan(&ref), now);
+            destroyString(ref);
+            return orFail(problem);
+        else if chosen(matches, keys.accountResetPassword) then
+            let ref: String := positionalText(matches, keys.accountResetPasswordRef);
+            if not given(matches, keys.accountResetPasswordYes) then
+                let out: Either[String, String] := needYes("would replace the password of ", asSpan(&ref),
+                    " and end its sessions");
+                destroyString(ref);
+                return out;
+            end if;
+            let result: Either[String, String] := resetPassword(&~db, &~log, actor, asSpan(&ref), pepperOf(secrets), now);
+            destroyString(ref);
+            case result of
+                when Left(left as message: String) do
+                    return refused(message);
+                when Right(right as password: String) do
+                    var b: StringBuilder := makeStringBuilder();
+                    writeString(&!b, "password  ");
+                    writeString(&!b, asSpan(&password));
+                    writeString(&!b, "\n\nShown only now; it is changed at the next login.");
+                    destroyString(password);
+                    return done(finalize(b));
+            end case;
+        else if chosen(matches, keys.accountResetTotp) then
+            let ref: String := positionalText(matches, keys.accountResetTotpRef);
+            if not given(matches, keys.accountResetTotpYes) then
+                let out: Either[String, String] := needYes("would remove the second factor of ", asSpan(&ref),
+                    " and end its sessions");
+                destroyString(ref);
+                return out;
+            end if;
+            let problem: Option[String] := resetSecondFactor(&~db, &~log, actor, asSpan(&ref), now);
+            destroyString(ref);
+            return orFail(problem);
+        else if chosen(matches, keys.accountDelete) then
+            let ref: String := positionalText(matches, keys.accountDeleteRef);
+            if not given(matches, keys.accountDeleteYes) then
+                let out: Either[String, String] := needYes("would delete ", asSpan(&ref),
+                    " with its sessions, tokens and roles, for good");
+                destroyString(ref);
+                return out;
+            end if;
+            let result: Either[String, String] := deleteAccount(&~db, &~log, config, actor, asSpan(&ref), now);
+            destroyString(ref);
+            case result of
+                when Left(left as message: String) do
+                    return refused(message);
+                when Right(right as id: String) do
+                    var b: StringBuilder := makeStringBuilder();
+                    writeString(&!b, "account ");
+                    writeString(&!b, asSpan(&id));
+                    writeString(&!b, " deleted");
+                    destroyString(id);
+                    return done(finalize(b));
+            end case;
+        else if chosen(matches, keys.accountResetPasskeys) then
+            let ref: String := positionalText(matches, keys.accountResetPasskeysRef);
+            if not given(matches, keys.accountResetPasskeysYes) then
+                let out: Either[String, String] := needYes("would remove every passkey of ", asSpan(&ref), "");
+                destroyString(ref);
+                return out;
+            end if;
+            let result: Either[String, Int64] := resetPasskeys(&~db, &~log, actor, asSpan(&ref), now);
+            destroyString(ref);
+            case result of
+                when Left(left as message: String) do
+                    return refused(message);
+                when Right(right as count: Int64) do
+                    let text: String := formatInt(count);
+                    var b: StringBuilder := makeStringBuilder();
+                    writeString(&!b, asSpan(&text));
+                    writeString(&!b, " passkeys removed");
+                    destroyString(text);
+                    return done(finalize(b));
+            end case;
+        end if;
+        return refused(fromSpan("no command"));
+    end;
+
+    -- A table as the output of a command, without the line feed out adds.
+    function listed(table: Either[String, String]): Either[String, String] is
+        case table of
+            when Left(left as message: String) do
+                return refused(message);
+            when Right(right as text: String) do
+                return Right(right => withoutLastLineFeed(text));
+        end case;
+    end;
+
+    function withoutLastLineFeed(text: String): String is
+        let n: Index := length(&text);
+        if n = 0 then
+            return text;
+        end if;
+        var b: StringBuilder := makeStringBuilder();
+        borrow t: &[String, T] := &text do
+            let bytes: Span[Nat8, T] := asSpan(t);
+            var stop: Index := spanLength(bytes);
+            if bytes[stop - 1] = 10 then
+                stop := stop - 1;
+            end if;
+            var i: Index := 0;
+            while i < stop do
+                writeByte(&!b, bytes[i]);
+                i := i + 1;
+            end while;
+        end borrow;
+        destroyString(text);
+        return finalize(b);
+    end;
+
+    generic [M: Region, D: Region, S: Region, L: Region, A: Region, I: Region]
+    function clientCommand(matches: &[Matches, M], keys: Keys, db: &![Database[Writing], D], settings: &[OpSettings, S],
+        log: &![Log, L], actor: Span[Nat8, A], input: Span[Nat8, I], now: Int64): Either[String, String] is
+        if chosen(matches, keys.clientAdd) then
+            let definition: Definition := Definition(id => textValue(matches, keys.clientAddId),
+                name => textValue(matches, keys.clientAddName), kind => textValue(matches, keys.clientAddKind),
+                redirects => textValues(matches, keys.clientAddRedirect), logouts => textValues(matches, keys.clientAddLogout),
+                audience => textValues(matches, keys.clientAddAudience), signAlg => textValue(matches, keys.clientAddAlg),
+                laxAuth => given(matches, keys.clientAddLax), startUrl => textValue(matches, keys.clientAddStart));
+            let result: Either[String, String] := addNewClient(&~db, &~log, settings, actor, &definition, now);
+            let out: Either[String, String] := clientAdded(&definition, result);
+            destroyDefinition(definition);
+            return out;
+        else if chosen(matches, keys.clientList) then
+            return listed(clientTable(&~db, settings));
+        else if chosen(matches, keys.clientLimits) then
+            let id: String := positionalText(matches, keys.clientLimitsId);
+            case limitsOf(matches, keys) of
+                when Left(left as message: String) do
+                    destroyString(id);
+                    return refused(message);
+                when Right(right as limits: Limits) do
+                    let problem: Option[String] := setClientLimits(&~db, &~log, settings, actor, asSpan(&id), limits, now);
+                    destroyString(id);
+                    return orFail(problem);
+            end case;
+        else if chosen(matches, keys.clientAlg) then
+            let id: String := positionalText(matches, keys.clientAlgId);
+            let alg: String := positionalText(matches, keys.clientAlgAlg);
+            let problem: Option[String] := setClientAlg(&~db, &~log, settings, actor, asSpan(&id), asSpan(&alg), now);
+            destroyString(id);
+            destroyString(alg);
+            return orFail(problem);
+        else if chosen(matches, keys.clientLax) then
+            let id: String := positionalText(matches, keys.clientLaxId);
+            let switch: String := positionalText(matches, keys.clientLaxOn);
+            let on: Bool := equal(asSpan(&switch), "on");
+            if not (on or equal(asSpan(&switch), "off")) then
+                var b: StringBuilder := makeStringBuilder();
+                writeByte(&!b, '"');
+                writeString(&!b, asSpan(&switch));
+                writeString(&!b, "\": on or off");
+                destroyString(id);
+                destroyString(switch);
+                return refused(finalize(b));
+            end if;
+            destroyString(switch);
+            let problem: Option[String] := setClientLax(&~db, &~log, settings, actor, asSpan(&id), on, now);
+            destroyString(id);
+            return orFail(problem);
+        else if chosen(matches, keys.clientDisable) then
+            let id: String := positionalText(matches, keys.clientDisableId);
+            if not given(matches, keys.clientDisableYes) then
+                let out: Either[String, String] := needYes("would block client ", asSpan(&id), "");
+                destroyString(id);
+                return out;
+            end if;
+            let problem: Option[String] := setClientDisabled(&~db, &~log, actor, asSpan(&id), true, now);
+            destroyString(id);
+            return orFail(problem);
+        else if chosen(matches, keys.clientEnable) then
+            let id: String := positionalText(matches, keys.clientEnableId);
+            let problem: Option[String] := setClientDisabled(&~db, &~log, actor, asSpan(&id), false, now);
+            destroyString(id);
+            return orFail(problem);
+        else if chosen(matches, keys.clientRotate) then
+            let id: String := positionalText(matches, keys.clientRotateId);
+            if not given(matches, keys.clientRotateYes) then
+                let out: Either[String, String] := needYes("would replace the secret of client ", asSpan(&id), "");
+                destroyString(id);
+                return out;
+            end if;
+            let result: Either[String, String] := rotateClientSecret(&~db, &~log, actor, asSpan(&id), now);
+            destroyString(id);
+            case result of
+                when Left(left as message: String) do
+                    return refused(message);
+                when Right(right as secret: String) do
+                    var b: StringBuilder := makeStringBuilder();
+                    writeString(&!b, "secret  ");
+                    writeString(&!b, asSpan(&secret));
+                    writeString(&!b, "\n\nShown only now; the old secret no longer works.");
+                    destroyString(secret);
+                    return done(finalize(b));
+            end case;
+        else if chosen(matches, keys.clientStart) then
+            let id: String := positionalText(matches, keys.clientStartId);
+            let url: String := positionalText(matches, keys.clientStartUrl);
+            let clear: Bool := given(matches, keys.clientStartClear);
+            if clear and (length(&url) > 0) then
+                destroyString(id);
+                destroyString(url);
+                return refused(fromSpan("give a URL or --clear, not both"));
+            end if;
+            if (not clear) and (length(&url) = 0) then
+                destroyString(id);
+                destroyString(url);
+                return refused(fromSpan("give a URL, or --clear to remove it"));
+            end if;
+            let problem: Option[String] := setClientStart(&~db, &~log, settings, actor, asSpan(&id), asSpan(&url), now);
+            destroyString(id);
+            destroyString(url);
+            return orFail(problem);
+        else if chosen(matches, keys.clientLogo) then
+            let id: String := positionalText(matches, keys.clientLogoId);
+            let problem: Option[String] := setClientLogo(&~db, &~log, settings, actor, asSpan(&id), input,
+                given(matches, keys.clientLogoClear), now);
+            destroyString(id);
+            return orFail(problem);
+        else if chosen(matches, keys.clientSetName) then
+            let id: String := positionalText(matches, keys.clientSetNameId);
+            let name: String := positionalText(matches, keys.clientSetNameName);
+            let problem: Option[String] := setClientName(&~db, &~log, actor, asSpan(&id), asSpan(&name), now);
+            destroyString(id);
+            destroyString(name);
+            return orFail(problem);
+        end if;
+        return refused(fromSpan("no command"));
+    end;
+
+    generic [F: Region]
+    function clientAdded(definition: &[Definition, F], result: Either[String, String]): Either[String, String] is
+        case result of
+            when Left(left as message: String) do
+                return refused(message);
+            when Right(right as secret: String) do
+                var b: StringBuilder := makeStringBuilder();
+                writeString(&!b, "client  ");
+                writeString(&!b, asSpan(&(definition->id)));
+                if length(&secret) = 0 then
+                    writeString(&!b, "\nsecret  none (");
+                    writeString(&!b, asSpan(&(definition->kind)));
+                    writeString(&!b, " client)");
+                else
+                    writeString(&!b, "\nsecret  ");
+                    writeString(&!b, asSpan(&secret));
+                    writeString(&!b, "\n\nThe secret is shown only now; put it into the tool's vault.");
+                end if;
+                destroyString(secret);
+                return done(finalize(b));
+        end case;
+    end;
+
+    -- The seconds of the duration of key, Left when it does not read or is
+    -- negative.
+    generic [M: Region]
+    function secondsOf(matches: &[Matches, M], key: TextKey, name: Span[Nat8, Static]): Either[String, Int64] is
+        let text: String := textValue(matches, key);
+        let found: Option[Int64] := goDuration(asSpan(&text));
+        case found of
+            when None do
+                var b: StringBuilder := makeStringBuilder();
+                writeString(&!b, "invalid argument \"");
+                writeString(&!b, asSpan(&text));
+                writeString(&!b, "\" for \"--");
+                writeString(&!b, name);
+                writeString(&!b, "\" flag: time: invalid duration \"");
+                writeString(&!b, asSpan(&text));
+                writeString(&!b, "\"");
+                destroyString(text);
+                return Left(left => finalize(b));
+            when Some(value as ns: Int64) do
+                destroyString(text);
+                if ns < 0 then
+                    var m: StringBuilder := makeStringBuilder();
+                    writeString(&!m, "--");
+                    writeString(&!m, name);
+                    writeString(&!m, " must not be negative");
+                    return Left(left => finalize(m));
+                end if;
+                return Right(right => ns / 1000000000);
+        end case;
+    end;
+
+    generic [M: Region]
+    function limitsOf(matches: &[Matches, M], keys: Keys): Either[String, Limits] is
+        case secondsOf(matches, keys.clientLimitsIdle, "idle") of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as idle: Int64) do
+                case secondsOf(matches, keys.clientLimitsMax, "max") of
+                    when Left(left as message: String) do
+                        return Left(left => message);
+                    when Right(right as max: Int64) do
+                        case secondsOf(matches, keys.clientLimitsRefresh, "refresh") of
+                            when Left(left as message: String) do
+                                return Left(left => message);
+                            when Right(right as refresh: Int64) do
+                                return Right(right => Limits(idle => idle, max => max, refresh => refresh));
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [M: Region, D: Region, L: Region, A: Region]
+    function roleCommand(matches: &[Matches, M], keys: Keys, db: &![Database[Writing], D], log: &![Log, L],
+        actor: Span[Nat8, A], now: Int64): Either[String, String] is
+        if chosen(matches, keys.roleGrant) then
+            let ref: String := positionalText(matches, keys.roleGrantRef);
+            let client: String := positionalText(matches, keys.roleGrantClient);
+            let role: String := positionalText(matches, keys.roleGrantRole);
+            let result: Either[String, RoleGiven] := grantRoleTo(&~db, &~log, actor, asSpan(&ref), asSpan(&client),
+                asSpan(&role), now);
+            destroyString(ref);
+            case result of
+                when Left(left as message: String) do
+                    destroyString(client);
+                    destroyString(role);
+                    return refused(message);
+                when Right(right as granted: RoleGiven) do
+                    let { account: String, added: Bool } := granted;
+                    var b: StringBuilder := makeStringBuilder();
+                    writeString(&!b, "account ");
+                    writeString(&!b, asSpan(&account));
+                    if added then
+                        writeString(&!b, " now holds ");
+                    else
+                        writeString(&!b, " already holds ");
+                    end if;
+                    writeString(&!b, asSpan(&role));
+                    writeString(&!b, " in ");
+                    writeString(&!b, asSpan(&client));
+                    destroyString(account);
+                    destroyString(client);
+                    destroyString(role);
+                    return done(finalize(b));
+            end case;
+        else if chosen(matches, keys.roleRevoke) then
+            let ref: String := positionalText(matches, keys.roleRevokeRef);
+            let client: String := positionalText(matches, keys.roleRevokeClient);
+            let role: String := positionalText(matches, keys.roleRevokeRole);
+            if not given(matches, keys.roleRevokeYes) then
+                var w: StringBuilder := makeStringBuilder();
+                writeString(&!w, "would take ");
+                writeString(&!w, asSpan(&role));
+                writeString(&!w, " in ");
+                writeString(&!w, asSpan(&client));
+                writeString(&!w, " from ");
+                writeString(&!w, asSpan(&ref));
+                writeString(&!w, " -- repeat with --yes");
+                destroyString(ref);
+                destroyString(client);
+                destroyString(role);
+                return refused(finalize(w));
+            end if;
+            let result: Either[String, String] := revokeRoleFrom(&~db, &~log, actor, asSpan(&ref), asSpan(&client),
+                asSpan(&role), now);
+            destroyString(ref);
+            case result of
+                when Left(left as message: String) do
+                    destroyString(client);
+                    destroyString(role);
+                    return refused(message);
+                when Right(right as account: String) do
+                    var b: StringBuilder := makeStringBuilder();
+                    writeString(&!b, "account ");
+                    writeString(&!b, asSpan(&account));
+                    writeString(&!b, " no longer holds ");
+                    writeString(&!b, asSpan(&role));
+                    writeString(&!b, " in ");
+                    writeString(&!b, asSpan(&client));
+                    destroyString(account);
+                    destroyString(client);
+                    destroyString(role);
+                    return done(finalize(b));
+            end case;
+        else if chosen(matches, keys.roleList) then
+            let client: String := textValue(matches, keys.roleListClient);
+            let ref: String := textValue(matches, keys.roleListAccount);
+            let table: Either[String, String] := roleTable(&~db, asSpan(&client), asSpan(&ref));
+            destroyString(client);
+            destroyString(ref);
+            return listed(table);
+        end if;
+        return refused(fromSpan("no command"));
+    end;
+
+    generic [M: Region, D: Region, C: Region, L: Region, A: Region]
+    function sessionCommand(matches: &[Matches, M], keys: Keys, db: &![Database[Writing], D], config: &[Config, C],
+        log: &![Log, L], actor: Span[Nat8, A], now: Int64): Either[String, String] is
+        if chosen(matches, keys.sessionList) then
+            let ref: String := positionalText(matches, keys.sessionListRef);
+            let table: Either[String, String] := sessionTable(&~db, config, asSpan(&ref), now);
+            destroyString(ref);
+            return listed(table);
+        else if chosen(matches, keys.sessionEnd) then
+            let id: String := positionalText(matches, keys.sessionEndId);
+            if not given(matches, keys.sessionEndYes) then
+                let out: Either[String, String] := needYes("would end session ", asSpan(&id), "");
+                destroyString(id);
+                return out;
+            end if;
+            let problem: Option[String] := endSessionNamed(&~db, &~log, actor, asSpan(&id), now);
+            destroyString(id);
+            return orFail(problem);
+        end if;
+        return refused(fromSpan("no command"));
+    end;
+
+    generic [M: Region, D: Region, L: Region, A: Region]
+    function passkeyCommand(matches: &[Matches, M], keys: Keys, db: &![Database[Writing], D], log: &![Log, L],
+        actor: Span[Nat8, A], now: Int64): Either[String, String] is
+        if chosen(matches, keys.passkeyList) then
+            let ref: String := positionalText(matches, keys.passkeyListRef);
+            let table: Either[String, String] := passkeyTable(&~db, asSpan(&ref));
+            destroyString(ref);
+            return listed(table);
+        else if chosen(matches, keys.passkeyRevoke) then
+            let credential: String := positionalText(matches, keys.passkeyRevokeCredential);
+            if not given(matches, keys.passkeyRevokeYes) then
+                let out: Either[String, String] := needYes("would remove passkey ", asSpan(&credential), "");
+                destroyString(credential);
+                return out;
+            end if;
+            let problem: Option[String] := revokePasskey(&~db, &~log, actor, asSpan(&credential), now);
+            destroyString(credential);
+            return orFail(problem);
+        end if;
+        return refused(fromSpan("no command"));
+    end;
+
+    --- Printing
+
+    generic [T: Region, M: Region]
+    function printError(terminal: &![TerminalCapability, T], message: Span[Nat8, M]): Unit is
+        var stream: StandardError := acquireError(&~terminal);
+        let a: Bool := writeErrorText(&!stream, "rambo: ");
+        let b: Bool := writeErrorText(&!stream, message);
+        let c: Bool := writeErrorText(&!stream, "\n");
+        releaseError(stream);
+        return nil;
+    end;
+
+    -- Prints answer and gives the exit code of the programme.
+    generic [T: Region]
+    function answered(terminal: &![TerminalCapability, T], answer: Either[String, String]): ExitCode is
+        case answer of
+            when Left(left as message: String) do
+                printError(&~terminal, asSpan(&message));
+                destroyString(message);
+                return ExitFailure();
+            when Right(right as text: String) do
+                if length(&text) > 0 then
+                    printLn(asSpan(&text));
+                end if;
+                destroyString(text);
+                return ExitSuccess();
+        end case;
+    end;
+
+    function rootRefusal(): String is
+        return fromSpan(
+            "admin commands do not run as root: run them as the owner of RAMBO's data, e.g. `doas -u _rambo rambo ...` (doas.conf: permit nopass root as _rambo)");
+    end;
+
+    --- Reading the standard input
+
+    -- The bytes of the standard input, at most most and one more, so that a
+    -- larger input shows as larger.
+    generic [T: Region]
+    function inputBytes(terminal: &![TerminalCapability, T], most: Index): String is
+        var input: StandardInput := acquireInput(&~terminal);
+        var b: StringBuilder := makeStringBuilder();
+        var n: Index := 0;
+        var going: Bool := true;
+        while going do
+            case readByte(&!input) of
+                when Some(value as c: Nat8) do
+                    writeByte(&!b, c);
+                    n := n + 1;
+                    if n > most then
+                        going := false;
+                    end if;
+                when None do
+                    going := false;
+            end case;
+        end while;
+        releaseInput(input);
+        return finalize(b);
+    end;
+
+    --- The setup commands
+
+    generic [T: Region, M: Region, C: Region, L: Region, A: Region]
+    function setupWith(terminal: &![TerminalCapability, T], matches: &[Matches, M], keys: Keys, config: &[Config, C],
+        log: &![Log, L], actor: Span[Nat8, A]): Either[String, String] is
+        let now: Int64 := nowSeconds();
+        if chosen(matches, keys.setupInit) then
+            let result: Either[String, String] := initVault(config, now);
+            auditResult(&~log, actor, "setup.init", "-", &result, now);
+            return result;
+        else if chosen(matches, keys.setupSet) then
+            let name: String := positionalText(matches, keys.setupSetName);
+            var err: StandardError := acquireError(&~terminal);
+            let shown: Bool := writeErrorText(&!err, asSpan(&name));
+            let colon: Bool := writeErrorText(&!err, ": ");
+            releaseError(err);
+            var input: StandardInput := acquireInput(&~terminal);
+            let typed: Option[String] := readHiddenLine(&!input);
+            releaseInput(input);
+            case typed of
+                when None do
+                    destroyString(name);
+                    return refused(fromSpan("vaultsetup: the terminal did not switch its echo off; nothing was read"));
+                when Some(value as secret: String) do
+                    let problem: Option[String] := setVaultSecret(config, asSpan(&name), asSpan(&secret));
+                    destroyString(secret);
+                    let result: Either[String, String] := orFail(problem);
+                    auditResult(&~log, actor, "setup.set", asSpan(&name), &result, now);
+                    destroyString(name);
+                    return result;
+            end case;
+        else if chosen(matches, keys.setupGet) then
+            let name: String := positionalText(matches, keys.setupGetName);
+            var out: StandardOutput := acquireOutput(&~terminal);
+            let toTerminal: Bool := outputIsTerminal(&out);
+            releaseOutput(out);
+            let result: Either[String, String] := getVaultSecret(config, asSpan(&name), toTerminal);
+            auditResult(&~log, actor, "setup.get", asSpan(&name), &result, now);
+            destroyString(name);
+            return result;
+        else if chosen(matches, keys.setupDelete) then
+            let name: String := positionalText(matches, keys.setupDeleteName);
+            if not given(matches, keys.setupDeleteYes) then
+                let out: Either[String, String] := needYes("would delete ", asSpan(&name), "");
+                destroyString(name);
+                return out;
+            end if;
+            let result: Either[String, String] := orFail(deleteVaultSecret(config, asSpan(&name)));
+            auditResult(&~log, actor, "setup.delete", asSpan(&name), &result, now);
+            destroyString(name);
+            return result;
+        else if chosen(matches, keys.setupList) then
+            return listVaultSecrets(config);
+        else if chosen(matches, keys.setupRotateKey) then
+            let result: Either[String, String] := rotateVaultKey(config);
+            auditResult(&~log, actor, "setup.rotate-key", "-", &result, now);
+            return result;
+        else if chosen(matches, keys.setupRotatePepper) then
+            let result: Either[String, String] := rotateVaultPepper(config);
+            auditResult(&~log, actor, "setup.rotate-pepper", "-", &result, now);
+            return result;
+        end if;
+        return refused(fromSpan("no command"));
+    end;
+
+    -- The audit line of a setup command, ok or failed by result.
+    generic [L: Region, A: Region, G: Region, R: Region]
+    function auditResult(log: &![Log, L], actor: Span[Nat8, A], action: Span[Nat8, Static], target: Span[Nat8, G],
+        result: &[Either[String, String], R], now: Int64): Unit is
+        var outcome: Span[Nat8, Static] := "ok";
+        if isLeft(result) then
+            outcome := "failed";
+        end if;
+        auditCommand(&~log, actor, action, target, outcome, "", "", now);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function isLeft(result: &[Either[String, String], R]): Bool is
+        case result of
+            when Left(left as message: &[String, R]) do
+                return true;
+            when Right(right as text: &[String, R]) do
+                return false;
+        end case;
+    end;
+
+    generic [T: Region, M: Region, P: Region]
+    function setupCommand(terminal: &![TerminalCapability, T], matches: &[Matches, M], keys: Keys,
+        path: Span[Nat8, P]): Either[String, String] is
+        if isSuperuser() then
+            return refused(rootRefusal());
+        end if;
+        case loadConfig(path, systemName()) of
+            when Left(left as message: String) do
+                return refused(message);
+            when Right(right as config: Config) do
+                let report: String := applyAdmin(&config);
+                destroyString(report);
+                var log: Log := logToSystem("rambo", Daemon(), Info());
+                let actor: String := actorName();
+                let result: Either[String, String] := setupWith(&~terminal, matches, keys, &config, &!log, asSpan(&actor));
+                destroyString(actor);
+                let closed: Bool := closeLog(log);
+                destroyConfig(config);
+                return result;
+        end case;
+    end;
+
+    --- serve
+
+    -- None when config names two root accounts that exist, else why not.
+    generic [C: Region, P: Region]
+    function rootsProblem(config: &[Config, C], path: Span[Nat8, P]): Option[String] is
+        let count: Index := bufferLength(&(config->rootAccounts));
+        if count < 2 then
+            var b: StringBuilder := makeStringBuilder();
+            writeString(&!b, "root_accounts in ");
+            writeString(&!b, path);
+            writeString(&!b, " names ");
+            case toInt64(count) of
+                when Some(value as n: Int64) do
+                    let digits: String := formatNumber(n);
+                    writeString(&!b, asSpan(&digits));
+                    destroyString(digits);
+                when None do
+                    skip;
+            end case;
+            writeString(&!b, " account(s); serve needs two: create them with `rambo account add`, then put their IDs there");
+            return Some(value => finalize(b));
+        end if;
+        case openContext(path, nowSeconds()) of
+            when Left(left as message: String) do
+                return Some(value => message);
+            when Right(right as opened: Context) do
+                let { config as c: Config, db as connection: Database[Writing], settings: OpSettings, ring: Buffer[RingKey],
+                    secrets: Secrets, log: Log } := opened;
+                var db: Database[Writing] := connection;
+                let problem: Option[String] := missingRoot(&c, &!db);
+                closeContext(Context(config => c, db => db, settings => settings, ring => ring, secrets => secrets, log => log));
+                return problem;
+        end case;
+    end;
+
+    function formatNumber(n: Int64): String is
+        return formatInt(n);
+    end;
+
+    generic [C: Region, D: Region]
+    function missingRoot(config: &[Config, C], db: &![Database[Writing], D]): Option[String] is
+        var i: Index := 0;
+        while i < bufferLength(&(config->rootAccounts)) do
+            let id: Span[Nat8, C] := asSpan(nthRef(&(config->rootAccounts), i));
+            case accountById(&~db, id) of
+                when Right(right as found: Option[Account]) do
+                    case found of
+                        when Some(value as account: Account) do
+                            destroyAccount(account);
+                        when None do
+                            var b: StringBuilder := makeStringBuilder();
+                            writeString(&!b, "root_accounts: ");
+                            writeString(&!b, id);
+                            writeString(&!b, " is not an account (see `rambo account list`)");
+                            return Some(value => finalize(b));
+                    end case;
+                when Left(left as error: DbError) do
+                    var b: StringBuilder := makeStringBuilder();
+                    writeString(&!b, "root_accounts: ");
+                    writeString(&!b, id);
+                    writeString(&!b, ": the database failed");
+                    return Some(value => finalize(b));
+            end case;
+            i := i + 1;
+        end while;
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    generic [C: Region]
+    function socketPath(config: &[Config, C]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, asSpan(&(config->socketDir)));
+        writeString(&!b, "/rambo.sock");
+        return finalize(b);
+    end;
+
+    generic [C: Region]
+    function isHttp(config: &[Config, C]): Bool is
+        return equal(asSpan(&(config->listen)), "http");
+    end;
+
+    generic [P: Region]
+    function serveCommand(path: Span[Nat8, P]): Either[String, String] is
+        case loadConfig(path, systemName()) of
+            when Left(left as message: String) do
+                return refused(message);
+            when Right(right as config: Config) do
+                let http: Bool := isHttp(&config);
+                if not http then
+                    case checkSocketDir(&config) of
+                        when Some(value as message: String) do
+                            destroyConfig(config);
+                            return refused(message);
+                        when None do
+                            skip;
+                    end case;
+                end if;
+                case rootsProblem(&config, path) of
+                    when Some(value as message: String) do
+                        destroyConfig(config);
+                        return refused(message);
+                    when None do
+                        skip;
+                end case;
+                let www: String := wwwRoot();
+                let report: String := applyServe(&config, asSpan(&www));
+                destroyString(report);
+                if http then
+                    let result: Either[String, String] := servedHttp(&config, asSpan(&www));
+                    destroyString(www);
+                    destroyConfig(config);
+                    return result;
+                end if;
+                destroyString(www);
+                let socket: String := socketPath(&config);
+                destroyConfig(config);
+                let limits: ServerLimits := defaultLimits();
+                var workers: Buffer[Worker] := workersFor(path, limits.workers);
+                let served: Served := serveWith(asSpan(&socket), &!workers, handleWith, limits);
+                closeWorkers(workers);
+                destroyString(socket);
+                case served of
+                    when Stopped(accepted as n: Index) do
+                        return done(fromSpan(""));
+                    when NoSocket do
+                        return refused(fromSpan("serve: the socket could not be made"));
+                    when NotStarted do
+                        return refused(fromSpan("serve: the server did not start"));
+                end case;
+        end case;
+    end;
+
+    -- One worker for each task the server runs at a time, at least one,
+    -- each with the configuration at path.
+    generic [P: Region]
+    function workersFor(path: Span[Nat8, P], count: Index): Buffer[Worker] is
+        var workers: Buffer[Worker] := allocateEmpty();
+        insertBack(&!workers, makeWorker(path));
+        while bufferLength(&workers) < count do
+            insertBack(&!workers, makeWorker(path));
+        end while;
+        return workers;
+    end;
+
+    function closeWorkers(workers: Buffer[Worker]): Unit is
+        var rest: Buffer[Worker] := workers;
+        while bufferLength(&rest) > 0 do
+            closeWorker(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    -- The directory of the static files: the one the environment names for
+    -- them, else /usr/local/share/rambo/www.
+    function wwwRoot(): String is
+        var root: String := fromSpan("/usr/local/share/rambo/www");
+        case environmentValue("RAMBO_WWW") of
+            when Some(value as named: String) do
+                if length(&named) > 0 then
+                    destroyString(root);
+                    root := named;
+                else
+                    destroyString(named);
+                end if;
+            when None do
+                skip;
+        end case;
+        return root;
+    end;
+
+    -- Serves HTTP on the address of config, with the static files below www.
+    generic [C: Region, W: Region]
+    function servedHttp(config: &[Config, C], www: Span[Nat8, W]): Either[String, String] is
+        let result: Option[String] := serveHttp(asSpan(&(config->httpAddr)), handle, www);
+        case result of
+            when Some(value as message: String) do
+                return refused(message);
+            when None do
+                return done(fromSpan(""));
+        end case;
+    end;
+
+    --- migrate
+
+    generic [P: Region]
+    function migrateCommand(path: Span[Nat8, P]): Either[String, String] is
+        if isSuperuser() then
+            return refused(rootRefusal());
+        end if;
+        case loadConfig(path, systemName()) of
+            when Left(left as message: String) do
+                return refused(message);
+            when Right(right as config: Config) do
+                let report: String := applyAdmin(&config);
+                destroyString(report);
+                destroyConfig(config);
+                let now: Int64 := nowSeconds();
+                let result: Either[String, String] := migrate(path, now);
+                var log: Log := logToSystem("rambo", Daemon(), Info());
+                let actor: String := actorName();
+                auditResult(&!log, asSpan(&actor), "migrate", "-", &result, now);
+                destroyString(actor);
+                let closed: Bool := closeLog(log);
+                return result;
+        end case;
+    end;
+
+    --- sandbox
+
+    generic [P: Region]
+    function sandboxCommand(path: Span[Nat8, P]): Either[String, String] is
+        let loaded: Either[String, Config] := loadConfig(path, systemName());
+        let report: String := applyInfo();
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, asSpan(&report));
+        destroyString(report);
+        writeString(&!b, "\n\n");
+        let profile: String := infoProfile();
+        writeString(&!b, asSpan(&profile));
+        destroyString(profile);
+        case loaded of
+            when Left(left as message: String) do
+                destroyString(message);
+                writeString(&!b, "\n\n(no configuration readable: serve and admin profiles not shown)");
+            when Right(right as config: Config) do
+                writeString(&!b, "\n\n");
+                let profiles: String := sandboxText(&config);
+                writeString(&!b, asSpan(&profiles));
+                destroyString(profiles);
+                destroyConfig(config);
+        end case;
+        return done(finalize(b));
+    end;
+
+    --- The run
+
+    generic [T: Region, M: Region, C: Region]
+    function runMatches(terminal: &![TerminalCapability, T], matches: &[Matches, M], keys: Keys,
+        command: &[Command, C]): ExitCode is
+        let path: String := configPath();
+        var answer: Either[String, String] := done(fromSpan(""));
+        destroyAnswer(answer);
+        if given(matches, keys.sandbox) or chosen(matches, keys.sandboxCommand) then
+            answer := sandboxCommand(asSpan(&path));
+        else if chosen(matches, keys.serve) then
+            answer := serveCommand(asSpan(&path));
+        else if chosen(matches, keys.migrate) then
+            answer := migrateCommand(asSpan(&path));
+        else if chosen(matches, keys.setup) then
+            answer := setupCommand(&~terminal, matches, keys, asSpan(&path));
+        else if chosen(matches, keys.clientLogo) and (not given(matches, keys.clientLogoClear)) then
+            let bytes: String := inputBytes(&~terminal, 49152);
+            answer := inWorld(matches, keys, asSpan(&path), asSpan(&bytes));
+            destroyString(bytes);
+        else if chosen(matches, keys.account) or chosen(matches, keys.client) or chosen(matches, keys.role)
+            or chosen(matches, keys.session) or chosen(matches, keys.passkey) or chosen(matches, keys.keys) then
+            answer := inWorld(matches, keys, asSpan(&path), "");
+        else
+            answer := done(helpText(command));
+        end if;
+        destroyString(path);
+        return answered(&~terminal, answer);
+    end;
+
+    function destroyAnswer(answer: Either[String, String]): Unit is
+        case answer of
+            when Left(left as message: String) do
+                destroyString(message);
+            when Right(right as text: String) do
+                destroyString(text);
+        end case;
+        return nil;
+    end;
+
+    generic [T: Region]
+    function run(terminal: &![TerminalCapability, T]): ExitCode is
+        let made: Tree := tree();
+        let { command: Command, keys: Keys } := made;
+        let arguments: Buffer[String] := processArguments();
+        let parsed: Either[ArgumentError, Outcome] := parse(&command, &arguments);
+        destroyArguments(arguments);
+        case parsed of
+            when Left(left as error: ArgumentError) do
+                let text: String := describeError(&command, &error);
+                destroyError(error);
+                destroyCommand(command);
+                var stream: StandardError := acquireError(&~terminal);
+                let written: Bool := writeErrorText(&!stream, asSpan(&text));
+                releaseError(stream);
+                destroyString(text);
+                return ExitFailure();
+            when Right(right as outcome: Outcome) do
+                case outcome of
+                    when Help(text as help: String) do
+                        print(asSpan(&help));
+                        destroyString(help);
+                        destroyCommand(command);
+                        return ExitSuccess();
+                    when Version(text as version: String) do
+                        print(asSpan(&version));
+                        destroyString(version);
+                        destroyCommand(command);
+                        return ExitSuccess();
+                    when Run(matches as found: Matches) do
+                        let code: ExitCode := runMatches(&~terminal, &found, keys, &command);
+                        destroyMatches(found);
+                        destroyCommand(command);
+                        return code;
+                end case;
+        end case;
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        var power: RootCapability := root;
+        var terminal: TerminalCapability := acquireTerminal(&!power);
+        let code: ExitCode := run(&!terminal);
+        releaseTerminal(terminal);
+        surrenderRoot(power);
+        return code;
+    end;
+end module body.

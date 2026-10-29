@@ -1,0 +1,200 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The steps of a sign-in in an SQLite database in memory.  The expected
+-- form token and renewal key were computed with Python's hashlib over the
+-- same input.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    formatInt
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Rambo.Steps (
+    Step,
+    destroyStep,
+    prepareSteps,
+    putStep,
+    stepOf,
+    updateStep,
+    dropStep,
+    renewKey,
+    stepForm,
+    mostSteps
+);
+
+module body Rambo.Steps.Test is
+    constant now: Int64 := 1800000000;
+    constant totpKey: Span[Nat8, Static] := "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_";
+    constant key: Span[Nat8, Static] := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    function sample(secret: Span[Nat8, Static]): Step is
+        return Step(account => fromSpan("abcdefghijklmnopqrstuvwxya"), req => fromSpan("request-1"), amr => fromSpan("pwd"),
+            needPassword => true, needTotp => true, totpSecret => fromSpan(secret), totpUri => fromSpan("otpauth://x"));
+    end;
+
+    function isTrue(result: Either[DbError, Bool]): Bool is
+        case result of
+            when Right(right as b: Bool) do
+                return b;
+            when Left(left as error: DbError) do
+                abort("the database failed");
+        end case;
+    end;
+
+    function opened(): Database[Writing] is
+        case openTestDatabase() of
+            when Right(right as db: Database[Writing]) do
+                return db;
+            when Left(left as error: DbError) do
+                abort("no test database");
+        end case;
+    end;
+
+    generic [S: Region]
+    function shapeOfStep(step: &[Step, S], want: Span[Nat8, Static]): Int64 is
+        var shape: Int64 := 1;
+        if step->needPassword then
+            shape := shape + 2;
+        end if;
+        if step->needTotp then
+            shape := shape + 4;
+        end if;
+        if equal(asSpan(&(step->totpSecret)), want) then
+            shape := shape + 8;
+        end if;
+        return shape;
+    end;
+
+    -- What the step under key looks like at at: 0 none, else 1 plus 2 when
+    -- it owes a password, plus 4 when it owes a second factor, plus 8 when
+    -- its secret is want.
+    generic [R: Region]
+    function shapeOf(db: &![Database[Writing], R], at: Int64, want: Span[Nat8, Static]): Int64 is
+        case stepOf(db, key, totpKey, at) of
+            when Left(left as error: DbError) do
+                abort("the database failed");
+            when Right(right as found: Option[Step]) do
+                case found of
+                    when None do
+                        return 0;
+                    when Some(value as step: Step) do
+                        let shape: Int64 := shapeOfStep(&step, want);
+                        destroyStep(step);
+                        return shape;
+                end case;
+        end case;
+    end;
+
+    function testSteps(): Unit is
+        var db: Database[Writing] := opened();
+        case prepareSteps(&!db) of
+            when Some(value as error: DbError) do
+                abort("the table is not made");
+            when None do
+                skip;
+        end case;
+        assertTrue(shapeOf(&!db, now, "") = 0, "no step yet");
+        let first: Step := sample("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
+        assertTrue(isTrue(putStep(&!db, key, &first, totpKey, now)), "put");
+        destroyStep(first);
+        assertTrue(shapeOf(&!db, now + 599, "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP") = 15, "read back, the secret opened");
+        assertTrue(shapeOf(&!db, now + 600, "") = 0, "ran out after 600 seconds");
+        let second: Step := Step(account => fromSpan("abcdefghijklmnopqrstuvwxya"), req => fromSpan("request-1"),
+            amr => fromSpan("pwd otp mfa"), needPassword => false, needTotp => false, totpSecret => fromSpan(""),
+            totpUri => fromSpan(""));
+        assertTrue(isTrue(updateStep(&!db, key, &second, totpKey, now + 10)), "updated");
+        assertTrue(shapeOf(&!db, now + 20, "") = 9, "nothing owed, no secret");
+        assertFalse(isTrue(updateStep(&!db, key, &second, totpKey, now + 600)), "an update does not make it live longer");
+        destroyStep(second);
+        case dropStep(&!db, key) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "dropped");
+            when None do
+                skip;
+        end case;
+        assertTrue(shapeOf(&!db, now, "") = 0, "gone");
+        closeDatabase(db);
+        return nil;
+    end;
+
+    -- The key of the step number n, 64 characters.
+    function keyNumber(n: Int64): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "k");
+        let digits: String := formatInt(n);
+        writeString(&!b, asSpan(&digits));
+        destroyString(digits);
+        return finalize(b);
+    end;
+
+    function testLimit(): Unit is
+        var db: Database[Writing] := opened();
+        case prepareSteps(&!db) of
+            when Some(value as error: DbError) do
+                abort("the table is not made");
+            when None do
+                skip;
+        end case;
+        let step: Step := sample("");
+        var n: Int64 := 0;
+        var good: Int64 := 0;
+        while n < mostSteps() do
+            let k: String := keyNumber(n);
+            if isTrue(putStep(&!db, asSpan(&k), &step, totpKey, now)) then
+                good := good + 1;
+            end if;
+            destroyString(k);
+            n := n + 1;
+        end while;
+        assertTrue(good = 1024, "1024 steps fit");
+        let extra: String := keyNumber(5000);
+        assertFalse(isTrue(putStep(&!db, asSpan(&extra), &step, totpKey, now)), "the 1025th is refused");
+        destroyString(extra);
+        let again: String := keyNumber(7);
+        assertTrue(isTrue(putStep(&!db, asSpan(&again), &step, totpKey, now)), "a step that lives may be replaced");
+        destroyString(again);
+        let later: String := keyNumber(5001);
+        assertTrue(isTrue(putStep(&!db, asSpan(&later), &step, totpKey, now + 600)), "room once the others ran out");
+        destroyString(later);
+        destroyStep(step);
+        closeDatabase(db);
+        return nil;
+    end;
+
+    function testTokens(): Unit is
+        let form: String := stepForm("abc");
+        assertTrue(equal(asSpan(&form), "4LTGRVSn3G50krnW4-tYubd0teBr80Gx68pFmot5Bcs"), "the form token of Go");
+        destroyString(form);
+        let renew: String := renewKey("sid1");
+        assertTrue(equal(asSpan(&renew), "c638d7f1f99091104a7733041829450a8fb22768579c7ec40261f053950c88a6"), "the renewal key");
+        destroyString(renew);
+        return nil;
+    end;
+end module body.

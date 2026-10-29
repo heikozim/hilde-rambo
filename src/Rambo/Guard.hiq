@@ -1,0 +1,500 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    contains,
+    startsWith,
+    substring,
+    formatInt
+);
+import Standard.File (
+    FileDescriptor,
+    FileLookup,
+    FileMissing,
+    FileUnreadable,
+    FileFound,
+    FileStatus,
+    kindDirectory,
+    sameKind,
+    statusOf,
+    openRead,
+    readAll,
+    closeFile
+);
+import Standard.Sandbox (
+    Policy,
+    Report,
+    makePolicy,
+    allowPromises,
+    allowPath,
+    applyPolicy,
+    describeReport,
+    describePaths,
+    reportHas,
+    mechanismNoNewPrivileges,
+    mechanismPledge,
+    mechanismUnveil,
+    mechanismLandlock,
+    mechanismSeccomp,
+    mechanismSeatbelt,
+    mechanismCapsicum,
+    discardPolicy
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    destroyEmpty,
+    nthRef,
+    length as bufferLength
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Sort (
+    sort
+);
+import Standard.Platform (
+    systemName,
+    machineName
+);
+import Rambo.Config (
+    Config
+);
+
+module body Rambo.Guard is
+    -- The directory of path: what stands before its last slash, the root
+    -- for a path right below it.
+    generic [P: Region]
+    function dirOf(path: Span[Nat8, P]): Span[Nat8, P] is
+        var last: Index := 0;
+        var found: Bool := false;
+        var i: Index := 0;
+        while i < spanLength(path) do
+            if path[i] = '/' then
+                last := i;
+                found := true;
+            end if;
+            i := i + 1;
+        end while;
+        if not found then
+            return substring(path, 0, 0);
+        end if;
+        if last = 0 then
+            return substring(path, 0, 1);
+        end if;
+        return substring(path, 0, last);
+    end;
+
+    -- The group number of the group name in the text of /etc/group, -1 when
+    -- it has none.
+    generic [T: Region, N: Region]
+    function groupNumber(text: Span[Nat8, T], name: Span[Nat8, N]): Int64 is
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= spanLength(text) do
+            var lineEnds: Bool := i = spanLength(text);
+            if not lineEnds then
+                lineEnds := text[i] = 10;
+            end if;
+            if lineEnds then
+                let line: Span[Nat8, T] := substring(text, start, i);
+                let n: Int64 := groupOfLine(line, name);
+                if n >= 0 then
+                    return n;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return -1;
+    end;
+
+    -- The number of a line name:x:number:members when its name is name.
+    generic [L: Region, N: Region]
+    function groupOfLine(line: Span[Nat8, L], name: Span[Nat8, N]): Int64 is
+        var colons: Index := 0;
+        var first: Index := 0;
+        var second: Index := 0;
+        var third: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(line) do
+            if line[i] = ':' then
+                colons := colons + 1;
+                if colons = 1 then
+                    first := i;
+                else if colons = 2 then
+                    second := i;
+                else if colons = 3 then
+                    third := i;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        if colons < 3 then
+            return -1;
+        end if;
+        if not equal(substring(line, 0, first), name) then
+            return -1;
+        end if;
+        let digits: Span[Nat8, L] := substring(line, second + 1, third);
+        if spanLength(digits) = 0 then
+            return -1;
+        end if;
+        var value: Int64 := 0;
+        var j: Index := 0;
+        while j < spanLength(digits) do
+            if (digits[j] < '0') or (digits[j] > '9') or (value > 100000000) then
+                return -1;
+            end if;
+            value := (value * 10) + digitOf(digits[j]);
+            j := j + 1;
+        end while;
+        return value;
+    end;
+
+    function digitOf(c: Nat8): Int64 is
+        case toInt64(c - '0') of
+            when Some(value as d: Int64) do
+                return d;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function groupText(): String is
+        case openRead("/etc/group") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let text: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case text of
+                    when Some(value as found: String) do
+                        return found;
+                    when None do
+                        return fromSpan("");
+                end case;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [C: Region]
+    function socketDirOf(config: &[Config, C]): Span[Nat8, C] is
+        return asSpan(&(config->socketDir));
+    end;
+
+    generic [C: Region]
+    function socketGroupOf(config: &[Config, C]): Span[Nat8, C] is
+        return asSpan(&(config->socketGroup));
+    end;
+
+    generic [C: Region]
+    function checkSocketDir(config: &[Config, C]): Option[String] is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "socket_dir ");
+        writeString(&!b, socketDirOf(config));
+        case statusOf(socketDirOf(config)) of
+            when FileMissing do
+                writeString(&!b, ": no such file or directory (on OpenBSD /etc/rc.d/rambo creates it)");
+                return Some(value => finalize(b));
+            when FileUnreadable do
+                writeString(&!b, ": permission denied (on OpenBSD /etc/rc.d/rambo creates it)");
+                return Some(value => finalize(b));
+            when FileFound(status as found: FileStatus) do
+                if not sameKind(found.kind, kindDirectory) then
+                    writeString(&!b, ": not a directory whose group can be read");
+                    return Some(value => finalize(b));
+                end if;
+                let groups: String := groupText();
+                let want: Int64 := groupNumber(asSpan(&groups), socketGroupOf(config));
+                destroyString(groups);
+                if want < 0 then
+                    let partial: String := finalize(b);
+                    destroyString(partial);
+                    var g: StringBuilder := makeStringBuilder();
+                    writeString(&!g, "socket_group \"");
+                    writeString(&!g, socketGroupOf(config));
+                    writeString(&!g, "\": group: unknown group ");
+                    writeString(&!g, socketGroupOf(config));
+                    return Some(value => finalize(g));
+                end if;
+                var have: Int64 := -1;
+                case toInt64(found.group) of
+                    when Some(value as n: Int64) do
+                        have := n;
+                    when None do
+                        skip;
+                end case;
+                if have /= want then
+                    writeString(&!b, " belongs to group ");
+                    let number: String := formatInt(have);
+                    writeString(&!b, asSpan(&number));
+                    destroyString(number);
+                    writeString(&!b, ", socket_group is ");
+                    writeString(&!b, socketGroupOf(config));
+                    writeString(&!b, ": the socket takes the directory's group, so ");
+                    writeString(&!b, socketGroupOf(config));
+                    writeString(&!b, " could not connect");
+                    return Some(value => finalize(b));
+                end if;
+                let partial: String := finalize(b);
+                destroyString(partial);
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- policy with path and permissions, unless it holds them already: the
+    -- database, the vault and the pepper mostly lie in the etc and var
+    -- directories, and a path twice would be counted twice.
+    generic [R: Region, S: Region]
+    function allowOnce(policy: Policy, path: Span[Nat8, R], permissions: Span[Nat8, S]): Policy is
+        var line: StringBuilder := makeStringBuilder();
+        writeString(&!line, path);
+        writeByte(&!line, ' ');
+        writeString(&!line, permissions);
+        writeByte(&!line, '\n');
+        let wanted: String := finalize(line);
+        var inner: StringBuilder := makeStringBuilder();
+        writeByte(&!inner, '\n');
+        writeString(&!inner, asSpan(&wanted));
+        let within: String := finalize(inner);
+        let held: String := describePaths(&policy);
+        let found: Bool := startsWith(asSpan(&held), asSpan(&wanted)) or contains(asSpan(&held), asSpan(&within));
+        destroyString(held);
+        destroyString(within);
+        destroyString(wanted);
+        if found then
+            return policy;
+        end if;
+        return allowPath(policy, path, permissions);
+    end;
+
+    -- The paths of the data of config, each to read, write and create.
+    generic [C: Region]
+    function withData(policy: Policy, config: &[Config, C]): Policy is
+        return allowOnce(allowOnce(allowOnce(allowOnce(allowOnce(policy, asSpan(&(config->etcDir)), "rwc"),
+            asSpan(&(config->varDir)), "rwc"), dirOf(asSpan(&(config->db))), "rwc"), dirOf(asSpan(&(config->vault))), "rwc"),
+            dirOf(asSpan(&(config->pepper))), "rwc");
+    end;
+
+    -- policy with the system libraries to read on Linux, where glibc loads
+    -- libgcc_s the first time a thread ends, after the sandbox is closed.
+    function withLibraries(policy: Policy): Policy is
+        if equal(systemName(), "linux") then
+            return allowPath(allowPath(policy, "/lib", "r"), "/usr/lib", "r");
+        end if;
+        return policy;
+    end;
+
+    generic [C: Region]
+    function servePromises(config: &[Config, C]): Span[Nat8, Static] is
+        if equal(asSpan(&(config->listen)), "http") then
+            return "stdio rpath wpath cpath flock unix fattr chown inet";
+        end if;
+        return "stdio rpath wpath cpath flock unix fattr chown";
+    end;
+
+    constant adminPromises: Span[Nat8, Static] := "stdio rpath wpath cpath flock unix fattr tty";
+
+    generic [C: Region]
+    function servePolicy(config: &[Config, C]): Policy is
+        return withLibraries(allowOnce(allowOnce(withData(allowPromises(makePolicy(), servePromises(config)), config),
+            socketDirOf(config), "rwc"), "/dev/log", "rw"));
+    end;
+
+    generic [C: Region]
+    function adminPolicy(config: &[Config, C]): Policy is
+        return withLibraries(allowOnce(withData(allowPromises(makePolicy(), adminPromises), config), "/dev/log", "rw"));
+    end;
+
+    generic [C: Region, W: Region]
+    function applyServe(config: &[Config, C], www: Span[Nat8, W]): String is
+        let policy: Policy := servePolicy(config);
+        if equal(asSpan(&(config->listen)), "http") and (spanLength(www) > 0) then
+            return describeReport(applyPolicy(allowPath(policy, www, "r")));
+        end if;
+        return describeReport(applyPolicy(policy));
+    end;
+
+    generic [C: Region]
+    function applyAdmin(config: &[Config, C]): String is
+        return describeReport(applyPolicy(adminPolicy(config)));
+    end;
+
+    -- The words of the mechanisms that took effect, in the order the system
+    -- applies them, or the report itself when none did.
+    function mechanismWords(report: Report): String is
+        var b: StringBuilder := makeStringBuilder();
+        var n: Index := 0;
+        n := word(&!b, n, reportHas(report, mechanismNoNewPrivileges), "no-new-privileges");
+        n := word(&!b, n, reportHas(report, mechanismPledge), "pledge");
+        n := word(&!b, n, reportHas(report, mechanismUnveil), "unveil");
+        n := word(&!b, n, reportHas(report, mechanismLandlock), "landlock");
+        n := word(&!b, n, reportHas(report, mechanismSeccomp), "seccomp");
+        n := word(&!b, n, reportHas(report, mechanismSeatbelt), "seatbelt");
+        n := word(&!b, n, reportHas(report, mechanismCapsicum), "capsicum");
+        if n = 0 then
+            let none: String := finalize(b);
+            destroyString(none);
+            return describeReport(report);
+        end if;
+        var line: StringBuilder := makeStringBuilder();
+        writeString(&!line, "sandbox:     ");
+        let words: String := finalize(b);
+        writeString(&!line, asSpan(&words));
+        destroyString(words);
+        return finalize(line);
+    end;
+
+    -- Writes text after a comma when it holds and others came before; the
+    -- count of words written so far.
+    generic [B: Region]
+    function word(b: &![StringBuilder, B], n: Index, holds: Bool, text: Span[Nat8, Static]): Index is
+        if not holds then
+            return n;
+        end if;
+        if n > 0 then
+            writeString(&~b, ", ");
+        end if;
+        writeString(&~b, text);
+        return n + 1;
+    end;
+
+    function applyInfo(): String is
+        return mechanismWords(applyPolicy(allowPromises(makePolicy(), "stdio")));
+    end;
+
+    -- The word for a path in the sandbox output: the name of what confines
+    -- paths on this system.
+    function pathLabel(): Span[Nat8, Static] is
+        if equal(systemName(), "openbsd") then
+            return "unveil";
+        end if;
+        if equal(systemName(), "linux") then
+            return "landlock";
+        end if;
+        if equal(systemName(), "macos") then
+            return "seatbelt";
+        end if;
+        return "path";
+    end;
+
+    -- The lines of paths, one path and a blank and its permissions each, as
+    -- lines of the sandbox output: the label, the path, the permissions in
+    -- parentheses.  The permissions follow the last blank of a line.
+    generic [T: Region]
+    function pathLines(paths: Span[Nat8, T]): Buffer[String] is
+        var lines: Buffer[String] := allocateEmpty();
+        var start: Index := 0;
+        var blank: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(paths) do
+            if paths[i] = ' ' then
+                blank := i;
+            end if;
+            if (paths[i] = '\n') and (blank > start) then
+                var b: StringBuilder := makeStringBuilder();
+                writeString(&!b, "  ");
+                writeString(&!b, pathLabel());
+                writeString(&!b, ": ");
+                writeString(&!b, substring(paths, start, blank));
+                writeString(&!b, " (");
+                writeString(&!b, substring(paths, blank + 1, i));
+                writeByte(&!b, ')');
+                insertBack(&!lines, finalize(b));
+            end if;
+            if paths[i] = '\n' then
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return lines;
+    end;
+
+    -- The promises and the paths of policy, the paths sorted and each once,
+    -- one on a line, and when counted their number; the policy is given back.
+    generic [P: Region]
+    function profileBody(promises: Span[Nat8, P], policy: Policy, counted: Bool): String is
+        let paths: String := describePaths(&policy);
+        discardPolicy(policy);
+        var lines: Buffer[String] := sort(pathLines(asSpan(&paths)));
+        destroyString(paths);
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "  promises: ");
+        writeString(&!b, promises);
+        var distinct: Int64 := 0;
+        var i: Index := 0;
+        while i < bufferLength(&lines) do
+            var repeated: Bool := false;
+            if i > 0 then
+                repeated := equal(asSpan(nthRef(&lines, i)), asSpan(nthRef(&lines, i - 1)));
+            end if;
+            if not repeated then
+                writeByte(&!b, '\n');
+                writeString(&!b, asSpan(nthRef(&lines, i)));
+                distinct := distinct + 1;
+            end if;
+            i := i + 1;
+        end while;
+        while bufferLength(&lines) > 0 do
+            destroyString(removeLast(&!lines));
+        end while;
+        destroyEmpty(lines);
+        if counted then
+            writeString(&!b, "\n  paths: ");
+            let number: String := formatInt(distinct);
+            writeString(&!b, asSpan(&number));
+            destroyString(number);
+        end if;
+        return finalize(b);
+    end;
+
+    -- A profile under its heading: its name, the system and the machine.
+    generic [B: Region]
+    function writeProfile(b: &![StringBuilder, B], name: Span[Nat8, Static], content: String): Unit is
+        writeString(&~b, "sandbox profile \"");
+        writeString(&~b, name);
+        writeString(&~b, "\" (");
+        writeString(&~b, systemName());
+        writeByte(&~b, '/');
+        writeString(&~b, machineName());
+        writeString(&~b, ")\n");
+        writeString(&~b, asSpan(&content));
+        destroyString(content);
+        return nil;
+    end;
+
+    function infoProfile(): String is
+        return profileBody("stdio", makePolicy(), false);
+    end;
+
+    generic [C: Region]
+    function sandboxText(config: &[Config, C]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeProfile(&!b, "rambo-serve", profileBody(servePromises(config), servePolicy(config), true));
+        writeString(&!b, "\n\n");
+        writeProfile(&!b, "rambo-admin", profileBody(adminPromises, adminPolicy(config), true));
+        return finalize(b);
+    end;
+end module body.

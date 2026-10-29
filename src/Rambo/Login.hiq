@@ -1,0 +1,1936 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    destroyEmpty,
+    length as bufferLength
+);
+import Standard.Text (
+    equal,
+    trim,
+    constantTimeEqual,
+    formatInt
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.FcgiServer (
+    Request
+);
+import Standard.Log (
+    Log
+);
+import Standard.Ip (
+    IpAddress,
+    parseIp,
+    inSubnet,
+    sameIp
+);
+import Wolly.Request (
+    query,
+    cookie
+);
+import Wolly.OpUrl (
+    QueryPair,
+    destroyPairs,
+    queryEscape
+);
+import Wolly.OpBase (
+    OpSettings,
+    bodyOf,
+    valueOf,
+    cookieHeader
+);
+import Wolly.OpRandom (
+    randomToken,
+    tokenHash
+);
+import Wolly.OpStore (
+    OpSession,
+    RequestProblem,
+    UnknownRequest,
+    FlowMismatch,
+    destroySession
+);
+import Wolly.Op (
+    Pending,
+    Handover,
+    FinishProblem,
+    FinishRequest,
+    SubjectInactive,
+    NoMethods,
+    ClientGone,
+    NoRandom,
+    Restarted,
+    destroyPending,
+    destroyHandover,
+    destroyRestarted,
+    pending,
+    beginDirect,
+    finish,
+    restart,
+    currentSession,
+    csrfToken
+);
+import Wolly.Account (
+    Account,
+    SignIn,
+    WrongProof,
+    LockedOut,
+    Passed,
+    PasswordProblem,
+    destroyAccount,
+    destroySignIn,
+    normalizeEmail,
+    accountById,
+    accountByEmail,
+    signIn,
+    passwordProblem,
+    hashPassword,
+    storePassword,
+    newTotpSecret,
+    totpUri,
+    confirmTotp
+);
+import Wolly.Pow (
+    Puzzle,
+    PowCheck,
+    PowMalformed,
+    PowForged,
+    PowExpired,
+    PowOtherFlow,
+    PowTooEasy,
+    PowWrong,
+    PowReused,
+    PowSolved,
+    destroyPuzzle,
+    issuePuzzle,
+    checkPuzzle,
+    powReason
+);
+import Wolly.Backoff (
+    BackoffRule,
+    backoffWait,
+    backoffFail,
+    backoffFailures,
+    backoffReset
+);
+import Wolly.Strikes (
+    strike,
+    clearStrikes
+);
+import Wolly.Qr (
+    qrDataUri
+);
+import Wolly.Passkey (
+    Refusal,
+    BadName,
+    PasskeyMalformed,
+    PasskeyWrongType,
+    WrongChallenge,
+    WrongOrigin,
+    WrongParty,
+    NotVerified,
+    Attested,
+    BadKey,
+    Known,
+    Unknown,
+    BadSignature,
+    PasskeyReplayed,
+    PasskeyTooMany,
+    newDiscoverableChallenge,
+    authenticateDiscoverable,
+    fromBase64Url
+);
+import Rambo.Config (
+    goDurationText
+);
+import Rambo.Messages (
+    Key,
+    ErrBanned,
+    ErrBusy,
+    ErrCode,
+    ErrForm,
+    ErrInvalid,
+    ErrLocked,
+    ErrMismatch,
+    ErrPow,
+    ErrPasskey,
+    ErrPowHarder,
+    ErrRequest,
+    ErrTemporary,
+    ErrThrottled,
+    ErrWeak,
+    InfoLoggedOut,
+    InfoNotSignedIn,
+    InfoRestarted,
+    TitleError,
+    TitleLoggedOut,
+    TitleLogin,
+    TitleLogout,
+    TitlePassword,
+    TitleTotp
+);
+import Rambo.Pages (
+    Frame,
+    MessagePage,
+    LoginPage,
+    StepPage,
+    destroyMessagePage,
+    destroyLoginPage,
+    destroyStepPage,
+    renderMessage,
+    renderLogout,
+    renderLogin,
+    renderPassword,
+    renderTotp,
+    groupSecret,
+    localPath
+);
+import Rambo.Passkeys (
+    loginBound,
+    refusalWord,
+    partyOf,
+    originOf,
+    touchPasskey
+);
+import Rambo.Steps (
+    Step,
+    destroyStep,
+    putStep,
+    stepOf,
+    updateStep,
+    dropStep,
+    stepForm,
+    stepSeconds
+);
+import Rambo.Web (
+    World,
+    issuerOf,
+    pepperOf,
+    totpKeyOf,
+    powKeyOf,
+    remoteAddr,
+    langOf,
+    say,
+    sayWith,
+    frameOf,
+    pageAnswer,
+    redirectAnswer,
+    noCookies,
+    auditLine,
+    langCookie
+);
+
+module body Rambo.Login is
+    constant stepCookie: Span[Nat8, Static] := "__Host-rambo-step";
+    constant powSeconds: Int64 := 600;
+    constant powTimeoutMillis: Int64 := 120000;
+    constant powBatch: Int64 := 256;
+    -- A passkey with the user verified is a key the person holds and a check
+    -- of the person: two factors.
+    constant passkeyAmr: Span[Nat8, Static] := "hwk user mfa";
+
+    --- Small things
+
+    function powBits(account: Int64, address: Int64): Int64 is
+        let byAccount: Int64 := 14 + smaller(account, 2);
+        let byAddress: Int64 := 14 + smaller(address, 4);
+        if byAccount > byAddress then
+            return byAccount;
+        end if;
+        return byAddress;
+    end;
+
+    function smaller(a: Int64, b: Int64): Int64 is
+        if a < b then
+            return a;
+        end if;
+        return b;
+    end;
+
+    function orEmpty(found: Option[String]): String is
+        case found of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    function freeCookies(cookies: Buffer[String]): Unit is
+        var rest: Buffer[String] := cookies;
+        while bufferLength(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    -- A code as typed: trimmed, its blanks left out.
+    generic [C: Region]
+    function codeOf(text: Span[Nat8, C]): String is
+        let t: Span[Nat8, C] := trim(text);
+        var b: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(t) do
+            if t[i] /= ' ' then
+                writeByte(&!b, t[i]);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(b);
+    end;
+
+    -- a, then b, then c.
+    generic [A: Region, B: Region, C: Region]
+    function three(a: Span[Nat8, A], b: Span[Nat8, B], c: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, a);
+        writeString(&!out, b);
+        writeString(&!out, c);
+        return finalize(out);
+    end;
+
+    -- page?req= and req escaped.
+    generic [P: Region, R: Region]
+    function withReq(page: Span[Nat8, P], req: Span[Nat8, R]): String is
+        let escaped: String := queryEscape(req);
+        let url: String := three(page, "?req=", asSpan(&escaped));
+        destroyString(escaped);
+        return url;
+    end;
+
+    function problemReason(problem: RequestProblem): Span[Nat8, Static] is
+        case problem of
+            when FlowMismatch do
+                return "flow_mismatch";
+            when UnknownRequest do
+                return "unknown_request";
+        end case;
+    end;
+
+    generic [W: Region]
+    function settingsOf(world: &[World, W]): &[OpSettings, W] is
+        return &(world->settings);
+    end;
+
+    generic [W: Region]
+    function banAfter(world: &[World, W]): Int64 is
+        return world->config.banAfter;
+    end;
+
+    generic [W: Region]
+    function banWindow(world: &[World, W]): Int64 is
+        return world->config.banWindow;
+    end;
+
+    generic [W: Region]
+    function banSeconds(world: &[World, W]): Int64 is
+        return world->config.banSeconds;
+    end;
+
+    -- seconds as Go writes a duration, such as 15m0s.
+    function seconds(n: Int64): String is
+        return goDurationText(n * 1000000000);
+    end;
+
+    --- Answers
+
+    generic [Q: Region]
+    function failPage(request: &[Request, Q], status: Nat16, key: Key): String is
+        let lang: Span[Nat8, Static] := langOf(request);
+        let page: MessagePage := MessagePage(lang => fromSpan(lang), frame => frameOf(request, lang, TitleError(),
+            say(lang, key), fromSpan(""), "", fromSpan(""), false, ""));
+        let html: String := renderMessage(&page);
+        destroyMessagePage(page);
+        let cookies: Buffer[String] := noCookies();
+        let out: String := pageAnswer(status, asSpan(&html), &cookies, 0);
+        freeCookies(cookies);
+        destroyString(html);
+        return out;
+    end;
+
+    -- A page of title with the note info.
+    generic [Q: Region]
+    function notePage(request: &[Request, Q], title: Key, info: Key): String is
+        let lang: Span[Nat8, Static] := langOf(request);
+        let page: MessagePage := MessagePage(lang => fromSpan(lang), frame => frameOf(request, lang, title, fromSpan(""),
+            say(lang, info), "", fromSpan(""), false, ""));
+        let html: String := renderMessage(&page);
+        destroyMessagePage(page);
+        let cookies: Buffer[String] := noCookies();
+        let out: String := pageAnswer(200, asSpan(&html), &cookies, 0);
+        freeCookies(cookies);
+        destroyString(html);
+        return out;
+    end;
+
+    generic [H: Region]
+    function handoverAnswer(handover: &[Handover, H]): String is
+        let status: Nat16 := handover->status;
+        if (status >= 300) and (status <= 399) then
+            return redirectAnswer(status, asSpan(&(handover->location)), &(handover->cookies));
+        end if;
+        return redirectAnswer(303, asSpan(&(handover->location)), &(handover->cookies));
+    end;
+
+    -- A redirect with status to location and no cookie.
+    generic [L: Region]
+    function plainRedirect(status: Nat16, location: Span[Nat8, L]): String is
+        let cookies: Buffer[String] := noCookies();
+        let out: String := redirectAnswer(status, location, &cookies);
+        freeCookies(cookies);
+        return out;
+    end;
+
+    -- A redirect with status to location that sets the one cookie given.
+    generic [L: Region]
+    function redirectSetting(status: Nat16, location: Span[Nat8, L], setCookie: String): String is
+        var cookies: Buffer[String] := allocateEmpty();
+        insertBack(&!cookies, setCookie);
+        let out: String := redirectAnswer(status, location, &cookies);
+        freeCookies(cookies);
+        return out;
+    end;
+
+    --- Bans
+
+    -- Whether a ban may be asked for addr: an address that is neither a
+    -- loopback one nor the unspecified one.
+    generic [A: Region]
+    function bannable(addr: Span[Nat8, A]): Bool is
+        case parseIp(addr) of
+            when None do
+                return false;
+            when Some(value as ip: IpAddress) do
+                case parseIp("127.0.0.0") of
+                    when Some(value as loop4: IpAddress) do
+                        if inSubnet(ip, loop4, 8) then
+                            return false;
+                        end if;
+                    when None do
+                        return false;
+                end case;
+                if isAddress(ip, "::1") or isAddress(ip, "0.0.0.0") or isAddress(ip, "::") then
+                    return false;
+                end if;
+                return true;
+        end case;
+    end;
+
+    function isAddress(ip: IpAddress, text: Span[Nat8, Static]): Bool is
+        case parseIp(text) of
+            when Some(value as other: IpAddress) do
+                return sameIp(ip, other);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Counts a failed browser sign-in of addr; the seconds of a ban when it
+    -- is the one that earns it, else 0.
+    generic [D: Region, W: Region, L: Region, A: Region, C: Region]
+    function countFailure(db: &![Database[Writing], D], world: &[World, W], log: &![Log, L], addr: Span[Nat8, A],
+        account: Span[Nat8, C], now: Int64): Int64 is
+        if (banAfter(world) <= 0) or (spanLength(addr) = 0) then
+            return 0;
+        end if;
+        case strike(&~db, addr, banAfter(world), banWindow(world), now) of
+            when Left(left as error: DbError) do
+                return 0;
+            when Right(right as earned: Bool) do
+                if not earned then
+                    return 0;
+                end if;
+        end case;
+        case clearStrikes(&~db, addr) of
+            when Some(value as error: DbError) do
+                skip;
+            when None do
+                skip;
+        end case;
+        let after: String := formatInt(banAfter(world));
+        if not bannable(addr) then
+            auditLine(&~log, account, "login.ban", account, true, "loopback", "after", asSpan(&after), addr, now);
+            destroyString(after);
+            return 0;
+        end if;
+        auditLine(&~log, account, "login.ban", account, false, "", "after", asSpan(&after), addr, now);
+        destroyString(after);
+        return banSeconds(world);
+    end;
+
+    -- The seconds of a ban for a puzzle answer no browser on the page can
+    -- send, else 0.
+    generic [W: Region, L: Region, A: Region]
+    function banBot(world: &[World, W], log: &![Log, L], addr: Span[Nat8, A], reason: Span[Nat8, Static], now: Int64): Int64 is
+        if banAfter(world) <= 0 then
+            return 0;
+        end if;
+        if not (equal(reason, "malformed") or equal(reason, "forged") or equal(reason, "other_flow") or equal(reason, "wrong")) then
+            return 0;
+        end if;
+        if not bannable(addr) then
+            auditLine(&~log, "-", "login.ban", "-", true, "loopback", "pow", reason, addr, now);
+            return 0;
+        end if;
+        auditLine(&~log, "-", "login.ban", "-", false, "bot", "pow", reason, addr, now);
+        return banSeconds(world);
+    end;
+
+    --- The throttle
+
+    function pairRule(): BackoffRule is
+        return BackoffRule(free => 3, base => 1, max => 900, forget => 86400);
+    end;
+
+    function addressRule(): BackoffRule is
+        return BackoffRule(free => 20, base => 1, max => 900, forget => 86400);
+    end;
+
+    -- The keys of the throttle: the account, the pair and the address.
+    record Keys: Linear is
+        account: String;
+        pair: String;
+        address: String;
+    end;
+
+    function destroyKeys(keys: Keys): Unit is
+        let { account: String, pair: String, address: String } := keys;
+        destroyString(account);
+        destroyString(pair);
+        destroyString(address);
+        return nil;
+    end;
+
+    generic [E: Region, A: Region]
+    function keysOf(email: Span[Nat8, E], addr: Span[Nat8, A]): Keys is
+        let norm: String := orRaw(normalizeEmail(email), email);
+        var pair: StringBuilder := makeStringBuilder();
+        writeString(&!pair, "pair:");
+        writeString(&!pair, asSpan(&norm));
+        writeByte(&!pair, 0);
+        writeString(&!pair, addr);
+        let keys: Keys := Keys(account => three("acct:", asSpan(&norm), ""), pair => finalize(pair),
+            address => three("addr:", addr, ""));
+        destroyString(norm);
+        return keys;
+    end;
+
+    generic [E: Region]
+    function orRaw(found: Option[String], raw: Span[Nat8, E]): String is
+        case found of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan(raw);
+        end case;
+    end;
+
+    generic [D: Region, K: Region]
+    function failuresOf(db: &![Database[Writing], D], key: Span[Nat8, K], rule: BackoffRule, now: Int64): Int64 is
+        case backoffFailures(&~db, key, rule, now) of
+            when Right(right as n: Int64) do
+                return n;
+            when Left(left as error: DbError) do
+                return 0;
+        end case;
+    end;
+
+    generic [D: Region, K: Region]
+    function waitOf(db: &![Database[Writing], D], key: Span[Nat8, K], rule: BackoffRule, now: Int64): Int64 is
+        case backoffWait(&~db, key, rule, now) of
+            when Right(right as n: Int64) do
+                return n;
+            when Left(left as error: DbError) do
+                return 0;
+        end case;
+    end;
+
+    generic [D: Region, K: Region]
+    function failed(db: &![Database[Writing], D], key: Span[Nat8, K], rule: BackoffRule, now: Int64): Unit is
+        case backoffFail(&~db, key, rule, now) of
+            when Some(value as error: DbError) do
+                skip;
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [D: Region, K: Region]
+    function reset(db: &![Database[Writing], D], key: Span[Nat8, K]): Unit is
+        case backoffReset(&~db, key) of
+            when Some(value as error: DbError) do
+                skip;
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [K: Region]
+    function accountKey(keys: &[Keys, K]): Span[Nat8, K] is
+        return asSpan(&(keys->account));
+    end;
+
+    generic [K: Region]
+    function pairKey(keys: &[Keys, K]): Span[Nat8, K] is
+        return asSpan(&(keys->pair));
+    end;
+
+    generic [K: Region]
+    function addressKey(keys: &[Keys, K]): Span[Nat8, K] is
+        return asSpan(&(keys->address));
+    end;
+
+    -- The bits of the puzzle for email from addr.
+    generic [D: Region, E: Region, A: Region]
+    function bitsFor(db: &![Database[Writing], D], email: Span[Nat8, E], addr: Span[Nat8, A], now: Int64): Int64 is
+        let keys: Keys := keysOf(email, addr);
+        let account: Int64 := failuresOf(&~db, accountKey(&keys), pairRule(), now);
+        let address: Int64 := failuresOf(&~db, addressKey(&keys), addressRule(), now);
+        destroyKeys(keys);
+        return powBits(account, address);
+    end;
+
+    --- The login page
+
+    -- The login form for the request req of the client client, with a fresh
+    -- puzzle as hard as the failures of email and the address ask.
+    generic [Q: Region, D: Region, W: Region, R: Region, C: Region, E: Region]
+    function loginPage(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], req: Span[Nat8, R],
+        client: Span[Nat8, C], reauth: Bool, restarted: Bool, email: Span[Nat8, E], error: String, status: Nat16, ban: Int64,
+        now: Int64): String is
+        let addr: String := remoteAddr(request);
+        let bits: Int64 := bitsFor(&~db, email, asSpan(&addr), now);
+        destroyString(addr);
+        case issuePuzzle(powKeyOf(world), req, bits, now, powSeconds) of
+            when None do
+                destroyString(error);
+                return failPage(request, 500, ErrTemporary());
+            when Some(value as puzzle: Puzzle) do
+                let { token: String, id: String, bits as given: Int64, expires: Int64 } := puzzle;
+                destroyString(id);
+                let lang: Span[Nat8, Static] := langOf(request);
+                var info: String := fromSpan("");
+                if restarted then
+                    destroyString(info);
+                    info := say(lang, InfoRestarted());
+                end if;
+                var shown: String := fromSpan("");
+                if spanLength(email) <= 254 then
+                    destroyString(shown);
+                    shown := fromSpan(email);
+                end if;
+                let passkey: String := passkeyChallenge(&~db, req, now);
+                let page: LoginPage := LoginPage(lang => fromSpan(lang), frame => frameOf(request, lang, TitleLogin(), error,
+                    info, "", fromSpan(""), true, req), req => fromSpan(req), client => fromSpan(client), reauth => reauth,
+                    email => shown, pow => token, powBits => given, powTimeout => powTimeoutMillis, powBatch => powBatch,
+                    passkey => passkey, party => partyOf(issuerOf(world)));
+                let html: String := renderLogin(&page);
+                destroyLoginPage(page);
+                let cookies: Buffer[String] := noCookies();
+                let out: String := pageAnswer(status, asSpan(&html), &cookies, ban);
+                freeCookies(cookies);
+                destroyString(html);
+                return out;
+        end case;
+    end;
+
+    generic [P: Region]
+    function pendingId(waiting: &[Pending, P]): Span[Nat8, P] is
+        return asSpan(&(waiting->id));
+    end;
+
+    generic [P: Region]
+    function pendingClient(waiting: &[Pending, P]): Span[Nat8, P] is
+        return asSpan(&(waiting->clientName));
+    end;
+
+    generic [Q: Region, D: Region, W: Region, P: Region, E: Region]
+    function pendingPage(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], waiting: &[Pending, P],
+        email: Span[Nat8, E], error: String, status: Nat16, ban: Int64, now: Int64): String is
+        return loginPage(request, &~db, world, pendingId(waiting), pendingClient(waiting), waiting->reauth,
+            waiting->restarted, email, error, status, ban, now);
+    end;
+
+    --- A login that is gone
+
+    -- The answer for a login page whose request req is gone: a new login
+    -- for its client, or None when there is nothing to restart.
+    generic [Q: Region, D: Region, W: Region, L: Region, R: Region]
+    function lapsed(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        req: Span[Nat8, R], why: Span[Nat8, Static], now: Int64): Option[String] is
+        if spanLength(req) = 0 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case restart(request, &~db, settingsOf(world), req, "/", now) of
+            when Left(left as error: DbError) do
+                let none: Option[String] := None();
+                return none;
+            when Right(right as found: Either[RequestProblem, Restarted]) do
+                case found of
+                    when Left(left as problem: RequestProblem) do
+                        let none: Option[String] := None();
+                        return none;
+                    when Right(right as restarted: Restarted) do
+                        let { id: String, name: String, url: String, cookies: Buffer[String] } := restarted;
+                        destroyString(name);
+                        var next: String := fromSpan("");
+                        var how: Span[Nat8, Static] := "login";
+                        if length(&id) = 0 then
+                            destroyString(next);
+                            next := fromSpan(asSpan(&url));
+                            how := "session";
+                        else
+                            destroyString(next);
+                            next := withReq("/login", asSpan(&id));
+                        end if;
+                        destroyString(id);
+                        destroyString(url);
+                        let addr: String := remoteAddr(request);
+                        auditLine(&~log, "-", "login.restart", "-", false, why, "next", how, asSpan(&addr), now);
+                        destroyString(addr);
+                        let out: String := redirectAnswer(303, asSpan(&next), &cookies);
+                        destroyString(next);
+                        freeCookies(cookies);
+                        return Some(value => out);
+                end case;
+        end case;
+    end;
+
+    -- The answer for a request req that is gone for this browser.
+    generic [Q: Region, D: Region, W: Region, L: Region, R: Region]
+    function requestGone(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        req: Span[Nat8, R], problem: RequestProblem, actor: Span[Nat8, Static], now: Int64): String is
+        let why: Span[Nat8, Static] := problemReason(problem);
+        let addr: String := remoteAddr(request);
+        auditLine(&~log, actor, "login.request", actor, true, why, "", "", asSpan(&addr), now);
+        destroyString(addr);
+        case lapsed(request, &~db, world, &~log, req, why, now) of
+            when Some(value as out: String) do
+                return out;
+            when None do
+                return failPage(request, 400, ErrRequest());
+        end case;
+    end;
+
+    --- GET and POST /login
+
+    generic [Q: Region, D: Region, W: Region, T: Region]
+    function beginDirectAnswer(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        target: Span[Nat8, T], now: Int64): String is
+        case beginDirect(&~db, settingsOf(world), target, now) of
+            when Right(right as made: Option[Handover]) do
+                case made of
+                    when Some(value as handover: Handover) do
+                        let out: String := handoverAnswer(&handover);
+                        destroyHandover(handover);
+                        return out;
+                    when None do
+                        return failPage(request, 500, ErrTemporary());
+                end case;
+            when Left(left as error: DbError) do
+                return failPage(request, 500, ErrTemporary());
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region]
+    function hasSession(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], now: Int64): Bool is
+        let addr: String := remoteAddr(request);
+        let found: Either[DbError, Option[OpSession]] := currentSession(request, &~db, settingsOf(world), asSpan(&addr), now);
+        destroyString(addr);
+        case found of
+            when Right(right as maybe: Option[OpSession]) do
+                case maybe of
+                    when Some(value as session: OpSession) do
+                        destroySession(session);
+                        return true;
+                    when None do
+                        return false;
+                end case;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function loginForm(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String is
+        let req: String := orEmpty(query(request, "req"));
+        if length(&req) = 0 then
+            destroyString(req);
+            let loggedOut: String := orEmpty(query(request, "logged_out"));
+            let wasOut: Bool := length(&loggedOut) > 0;
+            destroyString(loggedOut);
+            if wasOut then
+                return notePage(request, TitleLoggedOut(), InfoLoggedOut());
+            end if;
+            if hasSession(request, &~db, world, now) then
+                return plainRedirect(302, "/");
+            end if;
+            return beginDirectAnswer(request, &~db, world, "/", now);
+        end if;
+        let out: String := pendingForm(request, &~db, world, &~log, asSpan(&req), now);
+        destroyString(req);
+        return out;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, R: Region]
+    function pendingForm(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        req: Span[Nat8, R], now: Int64): String is
+        case pending(request, &~db, settingsOf(world), req, now) of
+            when Left(left as error: DbError) do
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as found: Either[RequestProblem, Pending]) do
+                case found of
+                    when Left(left as problem: RequestProblem) do
+                        return requestGone(request, &~db, world, &~log, req, problem, "-", now);
+                    when Right(right as waiting: Pending) do
+                        let out: String := pendingPage(request, &~db, world, &waiting, "", fromSpan(""), 200, 0, now);
+                        destroyPending(waiting);
+                        return out;
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function loginSubmit(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String is
+        case bodyOf(request) of
+            when None do
+                return failPage(request, 400, ErrForm());
+            when Some(value as form: Buffer[QueryPair]) do
+                let req: String := valueOf(&form, "req");
+                let out: String := submitted(request, &~db, world, &~log, &form, asSpan(&req), now);
+                destroyString(req);
+                destroyPairs(form);
+                return out;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, R: Region]
+    function submitted(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], req: Span[Nat8, R], now: Int64): String is
+        case pending(request, &~db, settingsOf(world), req, now) of
+            when Left(left as error: DbError) do
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as found: Either[RequestProblem, Pending]) do
+                case found of
+                    when Left(left as problem: RequestProblem) do
+                        return requestGone(request, &~db, world, &~log, req, problem, "-", now);
+                    when Right(right as waiting: Pending) do
+                        let out: String := proved(request, &~db, world, &~log, form, &waiting, now);
+                        destroyPending(waiting);
+                        return out;
+                end case;
+        end case;
+    end;
+
+    -- The puzzle, then the throttle, then the proof.
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, P: Region]
+    function proved(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], waiting: &[Pending, P], now: Int64): String is
+        let lang: Span[Nat8, Static] := langOf(request);
+        let email: String := valueOf(form, "email");
+        let addr: String := remoteAddr(request);
+        let need: Int64 := bitsFor(&~db, asSpan(&email), asSpan(&addr), now);
+        let token: String := valueOf(form, "pow");
+        let nonce: String := valueOf(form, "pow_nonce");
+        let checked: Either[DbError, PowCheck] := checkPuzzle(&~db, powKeyOf(world), asSpan(&token), asSpan(&nonce),
+            pendingId(waiting), need, now);
+        destroyString(token);
+        destroyString(nonce);
+        case checked of
+            when Left(left as error: DbError) do
+                destroyString(email);
+                destroyString(addr);
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as check: PowCheck) do
+                let reason: Span[Nat8, Static] := powReason(check);
+                if spanLength(reason) > 0 then
+                    auditLine(&~log, "-", "login.pow", "-", true, reason, "", "", asSpan(&addr), now);
+                    let ban: Int64 := banBot(world, &~log, asSpan(&addr), reason, now);
+                    var key: Key := ErrPow();
+                    if equal(reason, "too_easy") then
+                        key := ErrPowHarder();
+                    end if;
+                    let out: String := pendingPage(request, &~db, world, waiting, asSpan(&email), say(lang, key), 400, ban, now);
+                    destroyString(email);
+                    destroyString(addr);
+                    return out;
+                end if;
+        end case;
+        let keys: Keys := keysOf(asSpan(&email), asSpan(&addr));
+        let pairWait: Int64 := waitOf(&~db, pairKey(&keys), pairRule(), now);
+        let addressWait: Int64 := waitOf(&~db, addressKey(&keys), addressRule(), now);
+        var wait: Int64 := pairWait;
+        if addressWait > wait then
+            wait := addressWait;
+        end if;
+        if wait > 0 then
+            destroyKeys(keys);
+            auditLine(&~log, "-", "login", "-", true, "throttled", "", "", asSpan(&addr), now);
+            let text: String := seconds(wait);
+            let out: String := pendingPage(request, &~db, world, waiting, asSpan(&email),
+                sayWith(lang, ErrThrottled(), asSpan(&text)), 429, 0, now);
+            destroyString(text);
+            destroyString(email);
+            destroyString(addr);
+            return out;
+        end if;
+        let password: String := valueOf(form, "password");
+        let typed: String := valueOf(form, "code");
+        let code: String := codeOf(asSpan(&typed));
+        destroyString(typed);
+        let outcome: Either[DbError, SignIn] := signIn(&~db, asSpan(&email), asSpan(&password), asSpan(&code),
+            pepperOf(world), totpKeyOf(world), now);
+        destroyString(password);
+        destroyString(code);
+        let out: String := decided(request, &~db, world, &~log, waiting, &keys, asSpan(&email), asSpan(&addr), outcome, now);
+        destroyKeys(keys);
+        destroyString(email);
+        destroyString(addr);
+        return out;
+    end;
+
+    generic [A: Region]
+    function idOf(account: &[Account, A]): Span[Nat8, A] is
+        return asSpan(&(account->id));
+    end;
+
+    generic [A: Region]
+    function emailOfAccount(account: &[Account, A]): Span[Nat8, A] is
+        return asSpan(&(account->email));
+    end;
+
+    generic [A: Region]
+    function lockedOf(account: &[Account, A]): Bool is
+        return account->locked;
+    end;
+
+    -- The ID of the account of email for the audit line, - for none.
+    generic [D: Region, E: Region]
+    function accountOf(db: &![Database[Writing], D], email: Span[Nat8, E]): String is
+        if spanLength(email) > 254 then
+            return fromSpan("-");
+        end if;
+        case accountByEmail(&~db, email) of
+            when Right(right as found: Option[Account]) do
+                case found of
+                    when Some(value as account: Account) do
+                        let id: String := fromSpan(idOf(&account));
+                        destroyAccount(account);
+                        return id;
+                    when None do
+                        return fromSpan("-");
+                end case;
+            when Left(left as error: DbError) do
+                return fromSpan("-");
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, P: Region, K: Region, E: Region, A: Region]
+    function decided(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        waiting: &[Pending, P], keys: &[Keys, K], email: Span[Nat8, E], addr: Span[Nat8, A],
+        outcome: Either[DbError, SignIn], now: Int64): String is
+        let lang: Span[Nat8, Static] := langOf(request);
+        case outcome of
+            when Left(left as error: DbError) do
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as result: SignIn) do
+                case result of
+                    when WrongProof do
+                        failed(&~db, pairKey(keys), pairRule(), now);
+                        failed(&~db, addressKey(keys), addressRule(), now);
+                        failed(&~db, accountKey(keys), pairRule(), now);
+                        let account: String := accountOf(&~db, email);
+                        let ban: Int64 := countFailure(&~db, world, &~log, addr, asSpan(&account), now);
+                        auditLine(&~log, "-", "login", asSpan(&account), true, "invalid", "", "", addr, now);
+                        destroyString(account);
+                        if ban > 0 then
+                            let text: String := seconds(banSeconds(world));
+                            let out: String := pendingPage(request, &~db, world, waiting, email,
+                                sayWith(lang, ErrBanned(), asSpan(&text)), 429, ban, now);
+                            destroyString(text);
+                            return out;
+                        end if;
+                        return pendingPage(request, &~db, world, waiting, email, say(lang, ErrInvalid()), 401, 0, now);
+                    when LockedOut do
+                        reset(&~db, pairKey(keys));
+                        reset(&~db, accountKey(keys));
+                        auditLine(&~log, "-", "login", "-", true, "locked", "", "", addr, now);
+                        return pendingPage(request, &~db, world, waiting, email, say(lang, ErrLocked()), 403, 0, now);
+                    when Passed(account: String, amr: String, mustChangePassword: Bool, needsTotp: Bool) do
+                        reset(&~db, pairKey(keys));
+                        reset(&~db, accountKey(keys));
+                        let out: String := passed(request, &~db, world, &~log, pendingId(waiting), asSpan(&account),
+                            asSpan(&amr), mustChangePassword, needsTotp, now);
+                        destroyString(account);
+                        destroyString(amr);
+                        return out;
+                end case;
+        end case;
+    end;
+
+    -- A proof that held: the session, or a step for what is still owed.
+    generic [Q: Region, D: Region, W: Region, L: Region, R: Region, U: Region, M: Region]
+    function passed(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        req: Span[Nat8, R], account: Span[Nat8, U], amr: Span[Nat8, M], mustChange: Bool, needsTotp: Bool,
+        now: Int64): String is
+        if not (mustChange or needsTotp) then
+            return finished(request, &~db, world, &~log, req, account, amr, now);
+        end if;
+        case randomToken() of
+            when None do
+                return failPage(request, 500, ErrTemporary());
+            when Some(value as token: String) do
+                let key: String := tokenHash(asSpan(&token));
+                let step: Step := Step(account => fromSpan(account), req => fromSpan(req), amr => fromSpan(amr),
+                    needPassword => mustChange, needTotp => needsTotp, totpSecret => fromSpan(""), totpUri => fromSpan(""));
+                let put: Either[DbError, Bool] := putStep(&~db, asSpan(&key), &step, totpKeyOf(world), now);
+                destroyStep(step);
+                destroyString(key);
+                case put of
+                    when Left(left as error: DbError) do
+                        destroyString(token);
+                        return failPage(request, 500, ErrTemporary());
+                    when Right(right as done: Bool) do
+                        if not done then
+                            destroyString(token);
+                            return failPage(request, 503, ErrBusy());
+                        end if;
+                end case;
+                var owes: Span[Nat8, Static] := "password,totp";
+                if not mustChange then
+                    owes := "totp";
+                else if not needsTotp then
+                    owes := "password";
+                end if;
+                let addr: String := remoteAddr(request);
+                auditLine(&~log, account, "login.password", account, false, "", "owes", owes, asSpan(&addr), now);
+                destroyString(addr);
+                var next: Span[Nat8, Static] := "/login/totp";
+                if mustChange then
+                    next := "/login/password";
+                end if;
+                let location: String := withReq(next, req);
+                let set: String := cookieHeader(stepCookie, asSpan(&token), stepSeconds());
+                destroyString(token);
+                let out: String := redirectSetting(303, asSpan(&location), set);
+                destroyString(location);
+                return out;
+        end case;
+    end;
+
+    -- Hands a verified login to the provider, which starts the session and
+    -- sends the browser on.
+    generic [Q: Region, D: Region, W: Region, L: Region, R: Region, U: Region, M: Region]
+    function finished(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        req: Span[Nat8, R], account: Span[Nat8, U], amr: Span[Nat8, M], now: Int64): String is
+        let addr: String := remoteAddr(request);
+        let result: Either[DbError, Either[FinishProblem, Handover]] := finish(request, &~db, settingsOf(world), &~log, req,
+            account, amr, asSpan(&addr), now);
+        case result of
+            when Left(left as error: DbError) do
+                destroyString(addr);
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as found: Either[FinishProblem, Handover]) do
+                case found of
+                    when Right(right as handover: Handover) do
+                        case clearStrikes(&~db, asSpan(&addr)) of
+                            when Some(value as error: DbError) do
+                                skip;
+                            when None do
+                                skip;
+                        end case;
+                        auditLine(&~log, account, "login", account, false, "", "amr", amr, asSpan(&addr), now);
+                        destroyString(addr);
+                        let out: String := handoverAnswer(&handover);
+                        destroyHandover(handover);
+                        return out;
+                    when Left(left as problem: FinishProblem) do
+                        case problem of
+                            when SubjectInactive do
+                                auditLine(&~log, account, "login", account, true, "locked", "", "", asSpan(&addr), now);
+                                destroyString(addr);
+                                return failPage(request, 403, ErrLocked());
+                            when FinishRequest(problem as lost: RequestProblem) do
+                                destroyString(addr);
+                                return requestGone(request, &~db, world, &~log, req, lost, "-", now);
+                            when NoMethods do
+                                return internal(request, &~log, account, addr, now);
+                            when ClientGone do
+                                return internal(request, &~log, account, addr, now);
+                            when NoRandom do
+                                return internal(request, &~log, account, addr, now);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, L: Region, U: Region]
+    function internal(request: &[Request, Q], log: &![Log, L], account: Span[Nat8, U], addr: String, now: Int64): String is
+        auditLine(&~log, account, "login", account, true, "internal", "", "", asSpan(&addr), now);
+        destroyString(addr);
+        return failPage(request, 500, ErrTemporary());
+    end;
+
+    --- A passkey
+
+    -- A challenge for a passkey login of the request req, empty when none
+    -- is made: the login page goes on without one.
+    generic [D: Region, R: Region]
+    function passkeyChallenge(db: &![Database[Writing], D], req: Span[Nat8, R], now: Int64): String is
+        let bound: String := loginBound(req);
+        if length(&bound) = 0 then
+            destroyString(bound);
+            return fromSpan("");
+        end if;
+        let made: Either[DbError, Option[String]] := newDiscoverableChallenge(&~db, asSpan(&bound), now);
+        destroyString(bound);
+        case made of
+            when Right(right as found: Option[String]) do
+                return orEmpty(found);
+            when Left(left as error: DbError) do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- The bytes of the field name of form in base64url, empty for anything
+    -- else: an empty part fails the checks of Wolly.Passkey.
+    generic [F: Region]
+    function decodedField(form: &[Buffer[QueryPair], F], name: Span[Nat8, Static]): String is
+        let text: String := valueOf(form, name);
+        let bytes: Option[String] := fromBase64Url(asSpan(&text));
+        destroyString(text);
+        return orEmpty(bytes);
+    end;
+
+    generic [A: Region]
+    function mustChangeOf(account: &[Account, A]): Bool is
+        return account->mustChangePassword;
+    end;
+
+    -- Whether the account of id must change its password.
+    generic [D: Region, I: Region]
+    function owesNewPassword(db: &![Database[Writing], D], id: Span[Nat8, I]): Bool is
+        case accountById(&~db, id) of
+            when Right(right as found: Option[Account]) do
+                case found of
+                    when Some(value as account: Account) do
+                        let must: Bool := mustChangeOf(&account);
+                        destroyAccount(account);
+                        return must;
+                    when None do
+                        return false;
+                end case;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function passkeySubmit(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String is
+        case bodyOf(request) of
+            when None do
+                return failPage(request, 400, ErrForm());
+            when Some(value as form: Buffer[QueryPair]) do
+                let req: String := valueOf(&form, "req");
+                let out: String := passkeyPending(request, &~db, world, &~log, &form, asSpan(&req), now);
+                destroyString(req);
+                destroyPairs(form);
+                return out;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, R: Region]
+    function passkeyPending(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], req: Span[Nat8, R], now: Int64): String is
+        case pending(request, &~db, settingsOf(world), req, now) of
+            when Left(left as error: DbError) do
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as found: Either[RequestProblem, Pending]) do
+                case found of
+                    when Left(left as problem: RequestProblem) do
+                        return requestGone(request, &~db, world, &~log, req, problem, "-", now);
+                    when Right(right as waiting: Pending) do
+                        let out: String := passkeyProved(request, &~db, world, &~log, form, &waiting, now);
+                        destroyPending(waiting);
+                        return out;
+                end case;
+        end case;
+    end;
+
+    -- The throttle of the address, then the passkey: the challenge of this
+    -- login, the signature, the counter, then the account.
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, P: Region]
+    function passkeyProved(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], waiting: &[Pending, P], now: Int64): String is
+        let lang: Span[Nat8, Static] := langOf(request);
+        let addr: String := remoteAddr(request);
+        let key: String := three("addr:", asSpan(&addr), "");
+        let wait: Int64 := waitOf(&~db, asSpan(&key), addressRule(), now);
+        if wait > 0 then
+            destroyString(key);
+            auditLine(&~log, "-", "login.passkey", "-", true, "throttled", "", "", asSpan(&addr), now);
+            destroyString(addr);
+            let text: String := seconds(wait);
+            let out: String := pendingPage(request, &~db, world, waiting, "", sayWith(lang, ErrThrottled(), asSpan(&text)),
+                429, 0, now);
+            destroyString(text);
+            return out;
+        end if;
+        let credential: String := valueOf(form, "credential");
+        let clientData: String := decodedField(form, "clientData");
+        let authenticatorData: String := decodedField(form, "authenticatorData");
+        let signature: String := decodedField(form, "signature");
+        let bound: String := loginBound(pendingId(waiting));
+        let issuer: Span[Nat8, W] := issuerOf(world);
+        let party: String := partyOf(issuer);
+        let origin: String := originOf(issuer);
+        let verdict: Either[DbError, Either[Refusal, String]] := authenticateDiscoverable(&~db, asSpan(&bound),
+            asSpan(&credential), asSpan(&clientData), asSpan(&authenticatorData), asSpan(&signature), asSpan(&party),
+            asSpan(&origin), now);
+        destroyString(bound);
+        destroyString(party);
+        destroyString(origin);
+        destroyString(clientData);
+        destroyString(authenticatorData);
+        destroyString(signature);
+        case verdict of
+            when Left(left as error: DbError) do
+                destroyString(credential);
+                destroyString(key);
+                destroyString(addr);
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as result: Either[Refusal, String]) do
+                case result of
+                    when Left(left as refusal: Refusal) do
+                        destroyString(credential);
+                        failed(&~db, asSpan(&key), addressRule(), now);
+                        destroyString(key);
+                        auditLine(&~log, "-", "login.passkey", "-", true, refusalWord(refusal), "", "", asSpan(&addr), now);
+                        let ban: Int64 := countFailure(&~db, world, &~log, asSpan(&addr), "-", now);
+                        destroyString(addr);
+                        if ban > 0 then
+                            let text: String := seconds(banSeconds(world));
+                            let out: String := pendingPage(request, &~db, world, waiting, "",
+                                sayWith(lang, ErrBanned(), asSpan(&text)), 429, ban, now);
+                            destroyString(text);
+                            return out;
+                        end if;
+                        return pendingPage(request, &~db, world, waiting, "", say(lang, ErrPasskey()), 401, 0, now);
+                    when Right(right as account: String) do
+                        destroyString(key);
+                        if not isActive(&~db, asSpan(&account)) then
+                            destroyString(credential);
+                            auditLine(&~log, asSpan(&account), "login.passkey", asSpan(&account), true, "locked", "", "",
+                                asSpan(&addr), now);
+                            destroyString(addr);
+                            destroyString(account);
+                            return pendingPage(request, &~db, world, waiting, "", say(lang, ErrLocked()), 403, 0, now);
+                        end if;
+                        case touchPasskey(&~db, asSpan(&credential), now) of
+                            when Some(value as error: DbError) do
+                                skip;
+                            when None do
+                                skip;
+                        end case;
+                        destroyString(credential);
+                        destroyString(addr);
+                        let must: Bool := owesNewPassword(&~db, asSpan(&account));
+                        let out: String := passed(request, &~db, world, &~log, pendingId(waiting), asSpan(&account),
+                            passkeyAmr, must, false, now);
+                        destroyString(account);
+                        return out;
+                end case;
+        end case;
+    end;
+
+    --- Steps
+
+    -- The step of this request: its key, its form token and the step.
+    record Current: Linear is
+        key: String;
+        form: String;
+        step: Step;
+    end;
+
+    function destroyCurrent(current: Current): Unit is
+        let { key: String, form: String, step: Step } := current;
+        destroyString(key);
+        destroyString(form);
+        destroyStep(step);
+        return nil;
+    end;
+
+    generic [C: Region]
+    function currentKey(current: &[Current, C]): Span[Nat8, C] is
+        return asSpan(&(current->key));
+    end;
+
+    generic [C: Region]
+    function currentForm(current: &[Current, C]): Span[Nat8, C] is
+        return asSpan(&(current->form));
+    end;
+
+    generic [C: Region]
+    function stepAccount(current: &[Current, C]): Span[Nat8, C] is
+        return asSpan(&(current->step.account));
+    end;
+
+    generic [C: Region]
+    function stepReq(current: &[Current, C]): Span[Nat8, C] is
+        return asSpan(&(current->step.req));
+    end;
+
+    generic [C: Region]
+    function stepAmr(current: &[Current, C]): Span[Nat8, C] is
+        return asSpan(&(current->step.amr));
+    end;
+
+    generic [C: Region]
+    function stepSecret(current: &[Current, C]): Span[Nat8, C] is
+        return asSpan(&(current->step.totpSecret));
+    end;
+
+    generic [C: Region]
+    function stepUri(current: &[Current, C]): Span[Nat8, C] is
+        return asSpan(&(current->step.totpUri));
+    end;
+
+    generic [C: Region]
+    function owesPassword(current: &[Current, C]): Bool is
+        return current->step.needPassword;
+    end;
+
+    generic [C: Region]
+    function owesTotp(current: &[Current, C]): Bool is
+        return current->step.needTotp;
+    end;
+
+    -- Whether the account id is there and not locked.
+    generic [D: Region, I: Region]
+    function isActive(db: &![Database[Writing], D], id: Span[Nat8, I]): Bool is
+        case accountById(&~db, id) of
+            when Right(right as found: Option[Account]) do
+                case found of
+                    when Some(value as account: Account) do
+                        let locked: Bool := lockedOf(&account);
+                        destroyAccount(account);
+                        return not locked;
+                    when None do
+                        return false;
+                end case;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    -- The step of the request, when all four hold: the cookie names a live
+    -- step, req is its request, the flow cookie still owns that request,
+    -- and the account is not locked.  Each refusal is in the audit log.
+    generic [Q: Region, D: Region, W: Region, L: Region, R: Region]
+    function currentStep(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        req: Span[Nat8, R], now: Int64): Option[Current] is
+        let addr: String := remoteAddr(request);
+        let value: String := orEmpty(cookie(request, stepCookie));
+        if (length(&value) < 40) or (length(&value) > 200) then
+            auditLine(&~log, "-", "login.step", "-", true, "no_step", "", "", asSpan(&addr), now);
+            destroyString(addr);
+            destroyString(value);
+            let none: Option[Current] := None();
+            return none;
+        end if;
+        let key: String := tokenHash(asSpan(&value));
+        case stepOf(&~db, asSpan(&key), totpKeyOf(world), now) of
+            when Left(left as error: DbError) do
+                destroyString(key);
+                destroyString(value);
+                destroyString(addr);
+                let none: Option[Current] := None();
+                return none;
+            when Right(right as found: Option[Step]) do
+                case found of
+                    when None do
+                        auditLine(&~log, "-", "login.step", "-", true, "unknown_step", "", "", asSpan(&addr), now);
+                        destroyString(key);
+                        destroyString(value);
+                        destroyString(addr);
+                        let none: Option[Current] := None();
+                        return none;
+                    when Some(value as step: Step) do
+                        let current: Current := Current(key => key, form => stepForm(asSpan(&value)), step => step);
+                        destroyString(value);
+                        let held: Bool := stepHolds(request, &~db, world, &~log, &current, req, asSpan(&addr), now);
+                        destroyString(addr);
+                        if not held then
+                            destroyCurrent(current);
+                            let none: Option[Current] := None();
+                            return none;
+                        end if;
+                        return Some(value => current);
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, C: Region, R: Region, A: Region]
+    function stepHolds(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        current: &[Current, C], req: Span[Nat8, R], addr: Span[Nat8, A], now: Int64): Bool is
+        if not constantTimeEqual(req, stepReq(current)) then
+            auditLine(&~log, stepAccount(current), "login.step", stepAccount(current), true, "other_request", "", "", addr, now);
+            return false;
+        end if;
+        case pending(request, &~db, settingsOf(world), stepReq(current), now) of
+            when Left(left as error: DbError) do
+                return false;
+            when Right(right as found: Either[RequestProblem, Pending]) do
+                case found of
+                    when Left(left as problem: RequestProblem) do
+                        auditLine(&~log, stepAccount(current), "login.step", stepAccount(current), true,
+                            problemReason(problem), "", "", addr, now);
+                        return false;
+                    when Right(right as waiting: Pending) do
+                        destroyPending(waiting);
+                end case;
+        end case;
+        if not isActive(&~db, stepAccount(current)) then
+            case dropStep(&~db, currentKey(current)) of
+                when Some(value as error: DbError) do
+                    skip;
+                when None do
+                    skip;
+            end case;
+            auditLine(&~log, stepAccount(current), "login.step", stepAccount(current), true, "locked", "", "", addr, now);
+            return false;
+        end if;
+        return true;
+    end;
+
+    -- The answer for a step page that cannot go on: a restart when its
+    -- request is gone for this browser, else the error page.
+    generic [Q: Region, D: Region, W: Region, L: Region, R: Region]
+    function stepLost(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        req: Span[Nat8, R], now: Int64): String is
+        if spanLength(req) > 0 then
+            case pending(request, &~db, settingsOf(world), req, now) of
+                when Right(right as found: Either[RequestProblem, Pending]) do
+                    case found of
+                        when Left(left as problem: RequestProblem) do
+                            case lapsed(request, &~db, world, &~log, req, problemReason(problem), now) of
+                                when Some(value as out: String) do
+                                    return out;
+                                when None do
+                                    skip;
+                            end case;
+                        when Right(right as waiting: Pending) do
+                            destroyPending(waiting);
+                    end case;
+                when Left(left as error: DbError) do
+                    skip;
+            end case;
+        end if;
+        return failPage(request, 400, ErrRequest());
+    end;
+
+    -- The next page the step owes, empty when it owes nothing.
+    generic [C: Region]
+    function nextOf(current: &[Current, C]): Span[Nat8, Static] is
+        if owesPassword(current) then
+            return "/login/password";
+        end if;
+        if owesTotp(current) then
+            return "/login/totp";
+        end if;
+        return "";
+    end;
+
+    -- Goes to the next owed page, or finishes the login.
+    generic [Q: Region, D: Region, W: Region, L: Region, C: Region]
+    function advance(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        current: &[Current, C], now: Int64): String is
+        let next: Span[Nat8, Static] := nextOf(current);
+        if spanLength(next) > 0 then
+            let location: String := withReq(next, stepReq(current));
+            let out: String := plainRedirect(303, asSpan(&location));
+            destroyString(location);
+            return out;
+        end if;
+        case dropStep(&~db, currentKey(current)) of
+            when Some(value as error: DbError) do
+                skip;
+            when None do
+                skip;
+        end case;
+        let out: String := finished(request, &~db, world, &~log, stepReq(current), stepAccount(current), stepAmr(current), now);
+        let gone: String := cookieHeader(stepCookie, "", -1);
+        let withCookie: String := addCookieTo(out, asSpan(&gone));
+        destroyString(gone);
+        return withCookie;
+    end;
+
+    -- output with one more Set-Cookie header before its empty line.
+    generic [C: Region]
+    function addCookieTo(output: String, setCookie: Span[Nat8, C]): String is
+        return insertHeader(output, setCookie);
+    end;
+
+    generic [C: Region]
+    function insertHeader(output: String, setCookie: Span[Nat8, C]): String is
+        var b: StringBuilder := makeStringBuilder();
+        let text: Span[Nat8, Static] := "";
+        borrow o: &[String, O] := &output do
+            let all: Span[Nat8, O] := asSpan(o);
+            let split: Index := headerEnd(all);
+            var i: Index := 0;
+            while i < split do
+                writeByte(&!b, all[i]);
+                i := i + 1;
+            end while;
+            writeString(&!b, "Set-Cookie: ");
+            writeString(&!b, setCookie);
+            writeString(&!b, "\r\n");
+            while i < spanLength(all) do
+                writeByte(&!b, all[i]);
+                i := i + 1;
+            end while;
+        end borrow;
+        destroyString(output);
+        return finalize(b);
+    end;
+
+    -- The position of the empty line that ends the headers of output, the
+    -- length when there is none.
+    generic [O: Region]
+    function headerEnd(output: Span[Nat8, O]): Index is
+        var i: Index := 0;
+        while (i + 3) < spanLength(output) do
+            if (output[i] = 13) and (output[i + 1] = 10) and (output[i + 2] = 13) and (output[i + 3] = 10) then
+                return i + 2;
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(output);
+    end;
+
+    generic [Q: Region, C: Region]
+    function stepPage(request: &[Request, Q], current: &[Current, C], title: Key, error: String, totp: Bool,
+        status: Nat16, ban: Int64): String is
+        let lang: Span[Nat8, Static] := langOf(request);
+        var qr: String := fromSpan("");
+        var secret: String := fromSpan("");
+        if totp then
+            destroyString(qr);
+            qr := orEmpty(qrDataUri(stepUri(current)));
+            destroyString(secret);
+            secret := groupSecret(stepSecret(current));
+        end if;
+        let page: StepPage := StepPage(lang => fromSpan(lang), frame => frameOf(request, lang, title, error, fromSpan(""), "",
+            fromSpan(""), true, stepReq(current)), req => fromSpan(stepReq(current)), step => fromSpan(currentForm(current)),
+            qr => qr, secret => secret);
+        var html: String := fromSpan("");
+        destroyString(html);
+        if totp then
+            html := renderTotp(&page);
+        else
+            html := renderPassword(&page);
+        end if;
+        destroyStepPage(page);
+        let cookies: Buffer[String] := noCookies();
+        let out: String := pageAnswer(status, asSpan(&html), &cookies, ban);
+        freeCookies(cookies);
+        destroyString(html);
+        return out;
+    end;
+
+    -- The form of a step's POST: the body, the step, and its form token.
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function stepPost(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): Either[String, Posted] is
+        case bodyOf(request) of
+            when None do
+                return Left(left => failPage(request, 400, ErrForm()));
+            when Some(value as form: Buffer[QueryPair]) do
+                let req: String := valueOf(&form, "req");
+                case currentStep(request, &~db, world, &~log, asSpan(&req), now) of
+                    when None do
+                        let out: String := stepLost(request, &~db, world, &~log, asSpan(&req), now);
+                        destroyString(req);
+                        destroyPairs(form);
+                        return Left(left => out);
+                    when Some(value as current: Current) do
+                        destroyString(req);
+                        let given: String := valueOf(&form, "step");
+                        let holds: Bool := constantTimeEqual(asSpan(&given), currentForm(&current));
+                        destroyString(given);
+                        if not holds then
+                            let addr: String := remoteAddr(request);
+                            auditLine(&~log, stepAccount(&current), "login.step", stepAccount(&current), true, "step_form", "",
+                                "", asSpan(&addr), now);
+                            destroyString(addr);
+                            destroyCurrent(current);
+                            destroyPairs(form);
+                            return Left(left => failPage(request, 400, ErrRequest()));
+                        end if;
+                        return Right(right => Posted(form => form, current => current));
+                end case;
+        end case;
+    end;
+
+    -- A step's POST that holds: its form and its step.
+    record Posted: Linear is
+        form: Buffer[QueryPair];
+        current: Current;
+    end;
+
+    -- The step of a GET, by the req of its query.
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function stepGet(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): Either[String, Current] is
+        let req: String := orEmpty(query(request, "req"));
+        case currentStep(request, &~db, world, &~log, asSpan(&req), now) of
+            when None do
+                let out: String := stepLost(request, &~db, world, &~log, asSpan(&req), now);
+                destroyString(req);
+                return Left(left => out);
+            when Some(value as current: Current) do
+                destroyString(req);
+                return Right(right => current);
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function passwordForm(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String is
+        case stepGet(request, &~db, world, &~log, now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as current: Current) do
+                var out: String := fromSpan("");
+                destroyString(out);
+                if not owesPassword(&current) then
+                    out := advance(request, &~db, world, &~log, &current, now);
+                else
+                    out := stepPage(request, &current, TitlePassword(), fromSpan(""), false, 200, 0);
+                end if;
+                destroyCurrent(current);
+                return out;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function passwordSubmit(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String is
+        case stepPost(request, &~db, world, &~log, now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as posted: Posted) do
+                let { form: Buffer[QueryPair], current: Current } := posted;
+                let out: String := newPassword(request, &~db, world, &~log, &form, &current, now);
+                destroyPairs(form);
+                destroyCurrent(current);
+                return out;
+        end case;
+    end;
+
+    -- The address of the account id, empty when it cannot be read.
+    generic [D: Region, I: Region]
+    function emailOf(db: &![Database[Writing], D], id: Span[Nat8, I]): String is
+        case accountById(&~db, id) of
+            when Right(right as found: Option[Account]) do
+                case found of
+                    when Some(value as account: Account) do
+                        let email: String := fromSpan(emailOfAccount(&account));
+                        destroyAccount(account);
+                        return email;
+                    when None do
+                        return fromSpan("");
+                end case;
+            when Left(left as error: DbError) do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- current with the methods amr, what it owes, and the secret of a second
+    -- factor with its URI; the key and the form token stay.
+    generic [C: Region]
+    function changed(current: &[Current, C], amr: String, needPassword: Bool, needTotp: Bool, secret: String,
+        uri: String): Current is
+        return Current(key => fromSpan(currentKey(current)), form => fromSpan(currentForm(current)),
+            step => Step(account => fromSpan(stepAccount(current)), req => fromSpan(stepReq(current)), amr => amr,
+                needPassword => needPassword, needTotp => needTotp, totpSecret => secret, totpUri => uri));
+    end;
+
+    generic [C: Region]
+    function stepPart(current: &[Current, C]): &[Step, C] is
+        return &(current->step);
+    end;
+
+    -- Keeps next as the step of its key and goes on from it.
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function onward(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        next: Current, now: Int64): String is
+        case updateStep(&~db, currentKey(&next), stepPart(&next), totpKeyOf(world), now) of
+            when Left(left as error: DbError) do
+                destroyCurrent(next);
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as kept: Bool) do
+                if not kept then
+                    destroyCurrent(next);
+                    return failPage(request, 400, ErrRequest());
+                end if;
+        end case;
+        let out: String := advance(request, &~db, world, &~log, &next, now);
+        destroyCurrent(next);
+        return out;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, C: Region]
+    function newPassword(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], current: &[Current, C], now: Int64): String is
+        if not owesPassword(current) then
+            return advance(request, &~db, world, &~log, current, now);
+        end if;
+        let lang: Span[Nat8, Static] := langOf(request);
+        let addr: String := remoteAddr(request);
+        let password: String := valueOf(form, "password");
+        let again: String := valueOf(form, "password2");
+        let same: Bool := equal(asSpan(&password), asSpan(&again));
+        destroyString(again);
+        if not same then
+            destroyString(password);
+            auditLine(&~log, stepAccount(current), "account.password.set", stepAccount(current), true, "mismatch", "", "",
+                asSpan(&addr), now);
+            destroyString(addr);
+            return stepPage(request, current, TitlePassword(), say(lang, ErrMismatch()), false, 400, 0);
+        end if;
+        let email: String := emailOf(&~db, stepAccount(current));
+        let weak: Bool := isSome(passwordProblem(asSpan(&password), asSpan(&email)));
+        destroyString(email);
+        if weak then
+            destroyString(password);
+            auditLine(&~log, stepAccount(current), "account.password.set", stepAccount(current), true, "weak", "", "",
+                asSpan(&addr), now);
+            destroyString(addr);
+            return stepPage(request, current, TitlePassword(), say(lang, ErrWeak()), false, 400, 0);
+        end if;
+        let stored: Bool := storedPassword(&~db, world, stepAccount(current), asSpan(&password), now);
+        destroyString(password);
+        auditLine(&~log, stepAccount(current), "account.password.set", stepAccount(current), not stored, "", "", "",
+            asSpan(&addr), now);
+        destroyString(addr);
+        if not stored then
+            return failPage(request, 500, ErrTemporary());
+        end if;
+        let next: Current := changed(current, fromSpan(stepAmr(current)), false, owesTotp(current),
+            fromSpan(stepSecret(current)), fromSpan(stepUri(current)));
+        return onward(request, &~db, world, &~log, next, now);
+    end;
+
+    function isSome(problem: Option[PasswordProblem]): Bool is
+        case problem of
+            when Some(value as p: PasswordProblem) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Hashes password under the pepper and stores it for the account id,
+    -- to be kept.
+    generic [D: Region, W: Region, I: Region, P: Region]
+    function storedPassword(db: &![Database[Writing], D], world: &[World, W], id: Span[Nat8, I], password: Span[Nat8, P],
+        now: Int64): Bool is
+        case hashPassword(password, pepperOf(world)) of
+            when None do
+                return false;
+            when Some(value as encoded: String) do
+                let result: Either[DbError, Bool] := storePassword(&~db, id, asSpan(&encoded), false, now);
+                destroyString(encoded);
+                case result of
+                    when Right(right as done: Bool) do
+                        return done;
+                    when Left(left as error: DbError) do
+                        return false;
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function totpForm(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String is
+        case stepGet(request, &~db, world, &~log, now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as current: Current) do
+                let out: String := enrolment(request, &~db, world, &~log, &current, now);
+                destroyCurrent(current);
+                return out;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, C: Region]
+    function enrolment(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        current: &[Current, C], now: Int64): String is
+        if not owesTotp(current) then
+            return advance(request, &~db, world, &~log, current, now);
+        end if;
+        if spanLength(stepSecret(current)) > 0 then
+            return stepPage(request, current, TitleTotp(), fromSpan(""), true, 200, 0);
+        end if;
+        case newTotpSecret() of
+            when None do
+                return failPage(request, 500, ErrTemporary());
+            when Some(value as secret: String) do
+                let email: String := emailOf(&~db, stepAccount(current));
+                let uri: String := totpUri("RAMBO", asSpan(&email), asSpan(&secret));
+                destroyString(email);
+                let next: Current := changed(current, fromSpan(stepAmr(current)), owesPassword(current), true, secret, uri);
+                case updateStep(&~db, currentKey(&next), stepPart(&next), totpKeyOf(world), now) of
+                    when Left(left as error: DbError) do
+                        destroyCurrent(next);
+                        return failPage(request, 500, ErrTemporary());
+                    when Right(right as kept: Bool) do
+                        if not kept then
+                            destroyCurrent(next);
+                            return failPage(request, 400, ErrRequest());
+                        end if;
+                end case;
+                let out: String := stepPage(request, &next, TitleTotp(), fromSpan(""), true, 200, 0);
+                destroyCurrent(next);
+                return out;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function totpSubmit(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String is
+        case stepPost(request, &~db, world, &~log, now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as posted: Posted) do
+                let { form: Buffer[QueryPair], current: Current } := posted;
+                let out: String := firstCode(request, &~db, world, &~log, &form, &current, now);
+                destroyPairs(form);
+                destroyCurrent(current);
+                return out;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, C: Region]
+    function firstCode(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], current: &[Current, C], now: Int64): String is
+        if (not owesTotp(current)) or (spanLength(stepSecret(current)) = 0) then
+            return advance(request, &~db, world, &~log, current, now);
+        end if;
+        let lang: Span[Nat8, Static] := langOf(request);
+        let addr: String := remoteAddr(request);
+        let typed: String := valueOf(form, "code");
+        let code: String := codeOf(asSpan(&typed));
+        destroyString(typed);
+        let confirmed: Either[DbError, Bool] := confirmTotp(&~db, stepAccount(current), stepSecret(current), asSpan(&code),
+            totpKeyOf(world), now);
+        destroyString(code);
+        case confirmed of
+            when Left(left as error: DbError) do
+                destroyString(addr);
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as done: Bool) do
+                if not done then
+                    auditLine(&~log, stepAccount(current), "account.totp.enroll", stepAccount(current), true, "invalid_code",
+                        "", "", asSpan(&addr), now);
+                    let ban: Int64 := countFailure(&~db, world, &~log, asSpan(&addr), stepAccount(current), now);
+                    destroyString(addr);
+                    if ban > 0 then
+                        let text: String := seconds(banSeconds(world));
+                        let out: String := stepPage(request, current, TitleTotp(), sayWith(lang, ErrBanned(), asSpan(&text)),
+                            true, 429, ban);
+                        destroyString(text);
+                        return out;
+                    end if;
+                    return stepPage(request, current, TitleTotp(), say(lang, ErrCode()), true, 400, 0);
+                end if;
+        end case;
+        auditLine(&~log, stepAccount(current), "account.totp.enroll", stepAccount(current), false, "", "", "",
+            asSpan(&addr), now);
+        destroyString(addr);
+        let next: Current := changed(current, fromSpan("pwd otp mfa"), owesPassword(current), false, fromSpan(""),
+            fromSpan(""));
+        return onward(request, &~db, world, &~log, next, now);
+    end;
+
+    --- The logout question and the language
+
+    generic [Q: Region, D: Region, W: Region]
+    function logoutForm(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], now: Int64): String is
+        if not hasSession(request, &~db, world, now) then
+            return notePage(request, TitleLogout(), InfoNotSignedIn());
+        end if;
+        let lang: Span[Nat8, Static] := langOf(request);
+        let page: MessagePage := MessagePage(lang => fromSpan(lang), frame => frameOf(request, lang, TitleLogout(),
+            fromSpan(""), fromSpan(""), "", csrfToken(request, settingsOf(world), "logout"), false, ""));
+        let html: String := renderLogout(&page);
+        destroyMessagePage(page);
+        let cookies: Buffer[String] := noCookies();
+        let out: String := pageAnswer(200, asSpan(&html), &cookies, 0);
+        freeCookies(cookies);
+        destroyString(html);
+        return out;
+    end;
+
+    generic [Q: Region]
+    function setLanguage(request: &[Request, Q]): String is
+        case bodyOf(request) of
+            when None do
+                return failPage(request, 400, ErrForm());
+            when Some(value as form: Buffer[QueryPair]) do
+                let lang: String := valueOf(&form, "lang");
+                let back: String := valueOf(&form, "back");
+                destroyPairs(form);
+                if not (equal(asSpan(&lang), "de") or equal(asSpan(&lang), "en")) then
+                    destroyString(lang);
+                    destroyString(back);
+                    return failPage(request, 400, ErrForm());
+                end if;
+                var b: StringBuilder := makeStringBuilder();
+                writeString(&!b, langCookie());
+                writeByte(&!b, '=');
+                writeString(&!b, asSpan(&lang));
+                writeString(&!b, "; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Lax");
+                destroyString(lang);
+                let target: String := localPath(asSpan(&back));
+                destroyString(back);
+                let out: String := redirectSetting(303, asSpan(&target), finalize(b));
+                destroyString(target);
+                return out;
+        end case;
+    end;
+end module body.

@@ -1,0 +1,228 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The world of a request over a copy of a data set of the earlier Go provider in the temporary directory: the
+-- vault, its pepper and the database are copied, a rambo.conf names them.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    nthRef,
+    length as bufferLength
+);
+import Wolly.OpKey (
+    RingKey
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    openWrite,
+    readAll,
+    writeAll,
+    closeFile,
+    environmentValue
+);
+import Rambo.Fixture (
+    fixtureVault,
+    fixturePepper,
+    fixtureDatabase
+);
+import Rambo.Context (
+    Context,
+    Secrets,
+    Maintained,
+    closeContext,
+    openContext,
+    maintain
+);
+
+module body Rambo.Context.Test is
+    constant later: Int64 := 1900000000;
+
+    function env(name: Span[Nat8, Static]): String is
+        case environmentValue(name) of
+            when Some(value as found: String) do
+                return found;
+            when None do
+                abort("the environment lacks a variable the test needs");
+        end case;
+    end;
+
+    generic [R: Region]
+    function joined(a: Span[Nat8, R], b: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, a);
+        writeString(&!out, b);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function readText(path: Span[Nat8, R]): String is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let text: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case text of
+                    when Some(value as found: String) do
+                        return found;
+                    when None do
+                        abort("a file does not read");
+                end case;
+            when None do
+                abort("a file does not open");
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function writeText(path: Span[Nat8, R], text: Span[Nat8, S]): Unit is
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, text);
+                let closed: Bool := closeFile(file);
+                if not (written and closed) then
+                    abort("a file is not written");
+                end if;
+                return nil;
+            when None do
+                abort("a file does not open for writing");
+        end case;
+    end;
+
+    -- Copies the file at source to the path target.
+    generic [R: Region]
+    function copied(source: Span[Nat8, Static], target: Span[Nat8, R]): Unit is
+        let text: String := readText(source);
+        writeText(target, asSpan(&text));
+        destroyString(text);
+        return nil;
+    end;
+
+    -- The path of the configuration of the copy, made.
+    function preparedCopy(): String is
+        let tmp: String := env("TMPDIR");
+        let vault: String := joined(asSpan(&tmp), "/ctx.rambo.env");
+        let pepper: String := joined(asSpan(&tmp), "/ctx.rambo_pepper");
+        let db: String := joined(asSpan(&tmp), "/ctx.rambo.db");
+        let conf: String := joined(asSpan(&tmp), "/ctx.rambo.conf");
+        copied(fixtureVault(), asSpan(&vault));
+        copied(fixturePepper(), asSpan(&pepper));
+        copied(fixtureDatabase(), asSpan(&db));
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "# a copy of the Go provider's data set\nissuer = https://auth.example.org\nvault = ");
+        writeString(&!b, asSpan(&vault));
+        writeString(&!b, "\npepper = ");
+        writeString(&!b, asSpan(&pepper));
+        writeString(&!b, "\ndb = ");
+        writeString(&!b, asSpan(&db));
+        writeString(&!b, "\n");
+        let text: String := finalize(b);
+        writeText(asSpan(&conf), asSpan(&text));
+        destroyString(text);
+        destroyString(vault);
+        destroyString(pepper);
+        destroyString(db);
+        destroyString(tmp);
+        return conf;
+    end;
+
+    generic [R: Region]
+    function contextAt(path: Span[Nat8, R], now: Int64): Context is
+        case openContext(path, now) of
+            when Right(right as context: Context) do
+                return context;
+            when Left(left as message: String) do
+                printLn(asSpan(&message));
+                destroyString(message);
+                abort("the context does not open");
+        end case;
+    end;
+
+    generic [C: Region]
+    function ringSize(context: &[Context, C]): Index is
+        return bufferLength(&(context->ring));
+    end;
+
+    -- When the newest key of the ring of context was made.
+    generic [C: Region]
+    function newestKey(context: &[Context, C]): Int64 is
+        var newest: Int64 := 0;
+        var i: Index := 0;
+        while i < bufferLength(&(context->ring)) do
+            let key: &[RingKey, C] := nthRef(&(context->ring), i);
+            if key->created > newest then
+                newest := key->created;
+            end if;
+            i := i + 1;
+        end while;
+        return newest;
+    end;
+
+    generic [C: Region]
+    function secretsHold(context: &[Context, C]): Bool is
+        return (length(&(context->secrets.pepper)) = 32) and (length(&(context->secrets.powKey)) >= 32)
+            and (length(&(context->secrets.totpKey)) > 0);
+    end;
+
+    -- Maintains context at now and says whether it did.
+    function maintainedAt(context: Context, now: Int64): Bool is
+        let { context as after: Context, outcome: Either[String, Bool] } := maintain(context, now);
+        closeContext(after);
+        case outcome of
+            when Right(right as done: Bool) do
+                return done;
+            when Left(left as message: String) do
+                printLn(asSpan(&message));
+                destroyString(message);
+                abort("the maintenance failed");
+        end case;
+    end;
+
+    function testOpenAndMaintain(): Unit is
+        let conf: String := preparedCopy();
+        let first: Context := contextAt(asSpan(&conf), 1761141900);
+        assertTrue(secretsHold(&first), "the three secrets of the vault");
+        let before: Index := ringSize(&first);
+        assertTrue(before >= 1, "a signing key");
+        closeContext(first);
+        assertTrue(maintainedAt(contextAt(asSpan(&conf), later), later), "the first request of the hour maintains");
+        assertFalse(maintainedAt(contextAt(asSpan(&conf), later + 10), later + 10), "the next one does not");
+        let after: Context := contextAt(asSpan(&conf), later + 20);
+        assertTrue(newestKey(&after) = later, "a key made at the round was rotated in and saved in the vault");
+        assertTrue(ringSize(&after) >= 1, "and the ring is not empty");
+        closeContext(after);
+        assertTrue(maintainedAt(contextAt(asSpan(&conf), later + 3600), later + 3600), "an hour later it maintains again");
+        destroyString(conf);
+        return nil;
+    end;
+
+    function testRefusal(): Unit is
+        case openContext("/nonexistent/rambo.conf", later) of
+            when Right(right as context: Context) do
+                closeContext(context);
+                assertTrue(false, "no configuration, no context");
+            when Left(left as message: String) do
+                assertTrue(length(&message) > 0, "a text says why");
+                destroyString(message);
+        end case;
+        return nil;
+    end;
+end module body.

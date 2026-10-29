@@ -1,0 +1,1576 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    destroyEmpty,
+    nthRef,
+    length as bufferLength
+);
+import Standard.Text (
+    equal,
+    startsWith,
+    trim
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.FcgiServer (
+    Request
+);
+import Standard.Log (
+    Log
+);
+import Wolly.Request (
+    requestMethod,
+    requestPath,
+    query
+);
+import Wolly.OpUrl (
+    QueryPair,
+    destroyPairs
+);
+import Wolly.OpBase (
+    OpSettings,
+    bodyOf,
+    valueOf
+);
+import Wolly.OpClient (
+    OpClient,
+    destroyClients,
+    listClients,
+    isListed,
+    startUrl
+);
+import Wolly.OpStore (
+    OpSession,
+    Device,
+    destroySession,
+    destroySessions,
+    destroyDevices,
+    sessionById,
+    endSession,
+    liveSessions,
+    devicesOf,
+    revokeDevice
+);
+import Wolly.Op (
+    currentSession,
+    csrfToken,
+    csrfHolds
+);
+import Wolly.Account (
+    Account,
+    destroyAccount,
+    accountById,
+    passwordProblem,
+    PasswordProblem,
+    hashPassword,
+    storePassword,
+    reauthenticate,
+    newTotpSecret,
+    totpUri,
+    confirmTotp
+);
+import Wolly.Backoff (
+    BackoffRule,
+    backoffWait,
+    backoffFail,
+    backoffReset
+);
+import Wolly.Qr (
+    qrDataUri
+);
+import Wolly.Passkey (
+    Refusal,
+    BadName,
+    PasskeyMalformed,
+    PasskeyWrongType,
+    WrongChallenge,
+    WrongOrigin,
+    WrongParty,
+    NotVerified,
+    Attested,
+    BadKey,
+    Known,
+    Unknown,
+    BadSignature,
+    PasskeyReplayed,
+    PasskeyTooMany,
+    Create,
+    newChallenge,
+    registerCredential,
+    fromBase64Url,
+    toBase64Url
+);
+import Rambo.Passkeys (
+    PasskeyView,
+    destroyPasskeyViews,
+    passkeysOf,
+    partyOf,
+    originOf,
+    cleanLabel,
+    keepLabel,
+    renamePasskey,
+    forgetPasskey,
+    refusalWord
+);
+import Rambo.Config (
+    goDurationText
+);
+import Rambo.Messages (
+    Key,
+    ErrCode,
+    ErrCsrf,
+    ErrForm,
+    ErrMismatch,
+    ErrNotFound,
+    ErrPasskeyAdd,
+    ErrPasskeyGone,
+    ErrPasskeyKnown,
+    ErrPasskeyLabel,
+    ErrPasskeyMany,
+    ErrReauth,
+    ErrRenewal,
+    ErrSession,
+    ErrTemporary,
+    ErrThrottled,
+    ErrWeak,
+    InfoDoneDevice,
+    InfoDonePassword,
+    InfoDoneSession,
+    InfoDoneTotp,
+    InfoPasskeyAdded,
+    InfoPasskeyRemoved,
+    InfoPasskeyRenamed,
+    TitleAccount,
+    TitleConfirm,
+    TitleHome,
+    TitlePasskeyAdd,
+    TitleTotpRenew
+);
+import Rambo.Pages (
+    Frame,
+    AccountPage,
+    RenewPage,
+    ConfirmPage,
+    HomePage,
+    PasskeyRow,
+    PasskeyAddPage,
+    Tile,
+    AppRow,
+    SessionRow,
+    destroyAccountPage,
+    destroyRenewPage,
+    destroyConfirmPage,
+    destroyHomePage,
+    destroyPasskeyAddPage,
+    renderAccount,
+    renderRenew,
+    renderConfirm,
+    renderHome,
+    renderPasskeyAdd,
+    whenText,
+    ipHtml,
+    initialOf,
+    groupSecret
+);
+import Rambo.Steps (
+    Step,
+    destroyStep,
+    putStep,
+    stepOf,
+    dropStep,
+    renewKey
+);
+import Rambo.Web (
+    World,
+    issuerOf,
+    pepperOf,
+    totpKeyOf,
+    remoteAddr,
+    langOf,
+    say,
+    sayWith,
+    frameOf,
+    pageAnswer,
+    redirectAnswer,
+    noCookies,
+    auditLine
+);
+import Rambo.Login (
+    failPage,
+    beginDirectAnswer
+);
+
+module body Rambo.Portal is
+    constant mostRef: Index := 128;
+
+    function orEmpty(found: Option[String]): String is
+        case found of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    function freeCookies(cookies: Buffer[String]): Unit is
+        var rest: Buffer[String] := cookies;
+        while bufferLength(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    generic [L: Region]
+    function redirect(location: Span[Nat8, L]): String is
+        let cookies: Buffer[String] := noCookies();
+        let out: String := redirectAnswer(303, location, &cookies);
+        freeCookies(cookies);
+        return out;
+    end;
+
+    function answer(status: Nat16, html: String): String is
+        let cookies: Buffer[String] := noCookies();
+        let out: String := pageAnswer(status, asSpan(&html), &cookies, 0);
+        freeCookies(cookies);
+        destroyString(html);
+        return out;
+    end;
+
+    generic [W: Region]
+    function settingsOf(world: &[World, W]): &[OpSettings, W] is
+        return &(world->settings);
+    end;
+
+    generic [W: Region]
+    function idleOf(world: &[World, W]): Int64 is
+        return world->config.sessionIdle;
+    end;
+
+    generic [W: Region]
+    function maxOf(world: &[World, W]): Int64 is
+        return world->config.sessionMax;
+    end;
+
+    -- seconds as Go writes a duration.
+    function seconds(n: Int64): String is
+        return goDurationText(n * 1000000000);
+    end;
+
+    -- A code as typed: trimmed, its blanks left out.
+    generic [C: Region]
+    function codeOf(text: Span[Nat8, C]): String is
+        let t: Span[Nat8, C] := trim(text);
+        var b: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(t) do
+            if t[i] /= ' ' then
+                writeByte(&!b, t[i]);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(b);
+    end;
+
+    --- Who is signed in
+
+    -- The session of the request and its account.
+    record Signed: Linear is
+        session: OpSession;
+        account: Account;
+    end;
+
+    function destroySigned(signed: Signed): Unit is
+        let { session: OpSession, account as holder: Account } := signed;
+        destroySession(session);
+        destroyAccount(holder);
+        return nil;
+    end;
+
+    generic [S: Region]
+    function sessionId(signed: &[Signed, S]): Span[Nat8, S] is
+        return asSpan(&(signed->session.id));
+    end;
+
+    generic [S: Region]
+    function accountId(signed: &[Signed, S]): Span[Nat8, S] is
+        return asSpan(&(signed->account.id));
+    end;
+
+    generic [S: Region]
+    function accountEmail(signed: &[Signed, S]): Span[Nat8, S] is
+        return asSpan(&(signed->account.email));
+    end;
+
+    generic [S: Region]
+    function accountName(signed: &[Signed, S]): Span[Nat8, S] is
+        return asSpan(&(signed->account.name));
+    end;
+
+    generic [A: Region]
+    function isLocked(holder: &[Account, A]): Bool is
+        return holder->locked;
+    end;
+
+    generic [A: Region]
+    function subjectOf(session: &[OpSession, A]): Span[Nat8, A] is
+        return asSpan(&(session->subject));
+    end;
+
+    -- Whether the request is a GET.
+    generic [Q: Region]
+    function isGet(request: &[Request, Q]): Bool is
+        let verb: String := orEmpty(requestMethod(request));
+        let get: Bool := equal(asSpan(&verb), "GET");
+        destroyString(verb);
+        return get;
+    end;
+
+    -- A live session of an unlocked account, or the answer: a GET goes to
+    -- the login and comes back, anything else is refused.
+    generic [Q: Region, D: Region, W: Region]
+    function signedIn(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        now: Int64): Either[String, Signed] is
+        let addr: String := remoteAddr(request);
+        let found: Either[DbError, Option[OpSession]] := currentSession(request, &~db, settingsOf(world), asSpan(&addr), now);
+        destroyString(addr);
+        case found of
+            when Left(left as error: DbError) do
+                return Left(left => failPage(request, 500, ErrTemporary()));
+            when Right(right as maybe: Option[OpSession]) do
+                case maybe of
+                    when None do
+                        if isGet(request) then
+                            let path: String := orEmpty(requestPath(request));
+                            var back: Span[Nat8, Static] := "/";
+                            if equal(asSpan(&path), "/account") then
+                                back := "/account";
+                            end if;
+                            destroyString(path);
+                            return Left(left => beginDirectAnswer(request, &~db, world, back, now));
+                        end if;
+                        return Left(left => failPage(request, 403, ErrSession()));
+                    when Some(value as session: OpSession) do
+                        case accountById(&~db, subjectOf(&session)) of
+                            when Right(right as owner: Option[Account]) do
+                                case owner of
+                                    when Some(value as holder: Account) do
+                                        if isLocked(&holder) then
+                                            destroyAccount(holder);
+                                            destroySession(session);
+                                            return Left(left => failPage(request, 403, ErrSession()));
+                                        end if;
+                                        return Right(right => Signed(session => session, account => holder));
+                                    when None do
+                                        destroySession(session);
+                                        return Left(left => failPage(request, 403, ErrSession()));
+                                end case;
+                            when Left(left as error: DbError) do
+                                destroySession(session);
+                                return Left(left => failPage(request, 500, ErrTemporary()));
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- A POST of action by a signed-in person: its form and who it is.
+    record Post: Linear is
+        form: Buffer[QueryPair];
+        signed: Signed;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function signedInPost(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        action: Span[Nat8, Static], now: Int64): Either[String, Post] is
+        case bodyOf(request) of
+            when None do
+                return Left(left => failPage(request, 400, ErrForm()));
+            when Some(value as form: Buffer[QueryPair]) do
+                case signedIn(request, &~db, world, now) of
+                    when Left(left as out: String) do
+                        destroyPairs(form);
+                        return Left(left => out);
+                    when Right(right as signed: Signed) do
+                        let token: String := valueOf(&form, "csrf");
+                        let holds: Bool := csrfHolds(request, settingsOf(world), action, asSpan(&token));
+                        destroyString(token);
+                        if not holds then
+                            let addr: String := remoteAddr(request);
+                            auditLine(&~log, accountId(&signed), action, accountId(&signed), true, "csrf", "", "",
+                                asSpan(&addr), now);
+                            destroyString(addr);
+                            destroySigned(signed);
+                            destroyPairs(form);
+                            return Left(left => failPage(request, 403, ErrCsrf()));
+                        end if;
+                        return Right(right => Post(form => form, signed => signed));
+                end case;
+        end case;
+    end;
+
+    -- The note of ?done=, empty for anything else: a page never echoes a
+    -- value of the query.
+    generic [Q: Region, L: Region]
+    function doneNote(request: &[Request, Q], lang: Span[Nat8, L]): String is
+        let done: String := orEmpty(query(request, "done"));
+        var note: String := fromSpan("");
+        if equal(asSpan(&done), "password") then
+            destroyString(note);
+            note := say(lang, InfoDonePassword());
+        else if equal(asSpan(&done), "totp") then
+            destroyString(note);
+            note := say(lang, InfoDoneTotp());
+        else if equal(asSpan(&done), "session") then
+            destroyString(note);
+            note := say(lang, InfoDoneSession());
+        else if equal(asSpan(&done), "device") then
+            destroyString(note);
+            note := say(lang, InfoDoneDevice());
+        else if equal(asSpan(&done), "passkey") then
+            destroyString(note);
+            note := say(lang, InfoPasskeyAdded());
+        else if equal(asSpan(&done), "passkey-renamed") then
+            destroyString(note);
+            note := say(lang, InfoPasskeyRenamed());
+        else if equal(asSpan(&done), "passkey-removed") then
+            destroyString(note);
+            note := say(lang, InfoPasskeyRemoved());
+        end if;
+        destroyString(done);
+        return note;
+    end;
+
+    generic [Q: Region, W: Region, L: Region]
+    function frameFor(request: &[Request, Q], world: &[World, W], lang: Span[Nat8, L], title: Key, error: String, info: String,
+        nav: Span[Nat8, Static]): Frame is
+        return frameOf(request, lang, title, error, info, nav, csrfToken(request, settingsOf(world), "logout"), false, "");
+    end;
+
+    --- The portal
+
+    generic [C: Region]
+    function clientName(client: &[OpClient, C]): Span[Nat8, C] is
+        return asSpan(&(client->name));
+    end;
+
+    generic [C: Region]
+    function clientId(client: &[OpClient, C]): Span[Nat8, C] is
+        return asSpan(&(client->id));
+    end;
+
+    generic [C: Region]
+    function clientLogo(client: &[OpClient, C]): Span[Nat8, C] is
+        return asSpan(&(client->logo));
+    end;
+
+    -- The tiles of the clients that are listed.
+    generic [C: Region, W: Region]
+    function tilesOf(clients: &[Buffer[OpClient], C], world: &[World, W]): Buffer[Tile] is
+        var tiles: Buffer[Tile] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(clients) do
+            let client: &[OpClient, C] := nthRef(clients, i);
+            if isListed(client) then
+                var logo: String := fromSpan("");
+                if startsWith(clientLogo(client), "data:image/") then
+                    destroyString(logo);
+                    logo := fromSpan(clientLogo(client));
+                end if;
+                insertBack(&!tiles, Tile(name => fromSpan(clientName(client)), initial => initialOf(clientName(client)),
+                    logo => logo, start => startUrl(client, issuerOf(world))));
+            end if;
+            i := i + 1;
+        end while;
+        return tiles;
+    end;
+
+    -- The start page of the listed client id, empty when it is not listed.
+    generic [C: Region, I: Region, W: Region]
+    function startOf(clients: &[Buffer[OpClient], C], id: Span[Nat8, I], world: &[World, W]): String is
+        var i: Index := 0;
+        while i < bufferLength(clients) do
+            let client: &[OpClient, C] := nthRef(clients, i);
+            if equal(clientId(client), id) and isListed(client) then
+                return startUrl(client, issuerOf(world));
+            end if;
+            i := i + 1;
+        end while;
+        return fromSpan("");
+    end;
+
+    generic [S: Region, C: Region]
+    function sessionRows(sessions: &[Buffer[OpSession], S], current: Span[Nat8, C]): Buffer[SessionRow] is
+        var rows: Buffer[SessionRow] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(sessions) do
+            let s: &[OpSession, S] := nthRef(sessions, i);
+            insertBack(&!rows, SessionRow(userAgent => fromSpan(asSpan(&(s->userAgent))), created => whenText(s->created),
+                firstIp => ipHtml(asSpan(&(s->firstIp))), lastSeen => whenText(s->lastSeen),
+                lastIp => ipHtml(asSpan(&(s->lastIp))), id => fromSpan(asSpan(&(s->id))),
+                current => equal(asSpan(&(s->id)), current)));
+            i := i + 1;
+        end while;
+        return rows;
+    end;
+
+    generic [V: Region, C: Region, W: Region]
+    function appRows(devices: &[Buffer[Device], V], clients: &[Buffer[OpClient], C], world: &[World, W]): Buffer[AppRow] is
+        var rows: Buffer[AppRow] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(devices) do
+            let d: &[Device, V] := nthRef(devices, i);
+            insertBack(&!rows, AppRow(clientName => fromSpan(asSpan(&(d->clientName))), label => fromSpan(asSpan(&(d->label))),
+                created => whenText(d->created), firstIp => ipHtml(asSpan(&(d->firstIp))),
+                hasFirstIp => spanLength(asSpan(&(d->firstIp))) > 0, lastUsed => whenText(d->lastUsed),
+                lastIp => ipHtml(asSpan(&(d->lastIp))), hasLastIp => spanLength(asSpan(&(d->lastIp))) > 0,
+                start => startOf(clients, asSpan(&(d->clientId)), world), family => fromSpan(asSpan(&(d->family)))));
+            i := i + 1;
+        end while;
+        return rows;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function home(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String is
+        case signedIn(request, &~db, world, now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as signed: Signed) do
+                let out: String := portal(request, &~db, world, &signed, now);
+                destroySigned(signed);
+                return out;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, S: Region]
+    function portal(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], signed: &[Signed, S],
+        now: Int64): String is
+        case listClients(&~db) of
+            when Left(left as error: DbError) do
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as clients: Buffer[OpClient]) do
+                case liveSessions(&~db, accountId(signed), now, idleOf(world), maxOf(world)) of
+                    when Left(left as error: DbError) do
+                        destroyClients(clients);
+                        return failPage(request, 500, ErrTemporary());
+                    when Right(right as sessions: Buffer[OpSession]) do
+                        case devicesOf(&~db, accountId(signed), false, now) of
+                            when Left(left as error: DbError) do
+                                destroyClients(clients);
+                                destroySessions(sessions);
+                                return failPage(request, 500, ErrTemporary());
+                            when Right(right as devices: Buffer[Device]) do
+                                let lang: Span[Nat8, Static] := langOf(request);
+                                let page: HomePage := HomePage(lang => fromSpan(lang), frame => frameFor(request, world, lang,
+                                    TitleHome(), fromSpan(""), doneNote(request, lang), "home"),
+                                    tiles => tilesOf(&clients, world), apps => appRows(&devices, &clients, world),
+                                    sessions => sessionRows(&sessions, sessionId(signed)),
+                                    csrfSessionEnd => csrfToken(request, settingsOf(world), "account.session.end"),
+                                    csrfDeviceRevoke => csrfToken(request, settingsOf(world), "account.device.revoke"));
+                                destroyClients(clients);
+                                destroySessions(sessions);
+                                destroyDevices(devices);
+                                let html: String := renderHome(&page);
+                                destroyHomePage(page);
+                                return answer(200, html);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    --- The account page
+
+    generic [V: Region]
+    function passkeyRows(views: &[Buffer[PasskeyView], V]): Buffer[PasskeyRow] is
+        var rows: Buffer[PasskeyRow] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(views) do
+            let view: &[PasskeyView, V] := nthRef(views, i);
+            var used: String := fromSpan("");
+            if view->lastUsed > 0 then
+                destroyString(used);
+                used := whenText(view->lastUsed);
+            end if;
+            insertBack(&!rows, PasskeyRow(credential => fromSpan(asSpan(&(view->credential))),
+                label => fromSpan(asSpan(&(view->label))), created => whenText(view->createdAt), lastUsed => used));
+            i := i + 1;
+        end while;
+        return rows;
+    end;
+
+    -- The passkeys of the account of signed as the page shows them, none
+    -- when they cannot be read.
+    generic [D: Region, S: Region]
+    function passkeysShown(db: &![Database[Writing], D], signed: &[Signed, S]): Buffer[PasskeyRow] is
+        case passkeysOf(&~db, accountId(signed)) of
+            when Right(right as views: Buffer[PasskeyView]) do
+                let rows: Buffer[PasskeyRow] := passkeyRows(&views);
+                destroyPasskeyViews(views);
+                return rows;
+            when Left(left as error: DbError) do
+                return allocateEmpty();
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, S: Region]
+    function accountPage(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], signed: &[Signed, S],
+        status: Nat16, error: String, info: String): String is
+        let lang: Span[Nat8, Static] := langOf(request);
+        let page: AccountPage := AccountPage(lang => fromSpan(lang), frame => frameFor(request, world, lang, TitleAccount(),
+            error, info, "account"), name => fromSpan(accountName(signed)), email => fromSpan(accountEmail(signed)),
+            id => fromSpan(accountId(signed)), csrfPassword => csrfToken(request, settingsOf(world), "account.password"),
+            csrfTotp => csrfToken(request, settingsOf(world), "account.totp"), passkeys => passkeysShown(&~db, signed),
+            csrfPasskey => csrfToken(request, settingsOf(world), "account.passkey"),
+            csrfPasskeyRename => csrfToken(request, settingsOf(world), "account.passkey.rename"),
+            csrfPasskeyRemove => csrfToken(request, settingsOf(world), "account.passkey.remove"));
+        let html: String := renderAccount(&page);
+        destroyAccountPage(page);
+        return answer(status, html);
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function account(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String is
+        case signedIn(request, &~db, world, now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as signed: Signed) do
+                let lang: Span[Nat8, Static] := langOf(request);
+                let out: String := accountPage(request, &~db, world, &signed, 200, fromSpan(""), doneNote(request, lang));
+                destroySigned(signed);
+                return out;
+        end case;
+    end;
+
+    --- Asking again
+
+    function reauthRule(): BackoffRule is
+        return BackoffRule(free => 3, base => 1, max => 900, forget => 86400);
+    end;
+
+    -- The key of the delay of wrong guesses on the account page of id.
+    generic [I: Region]
+    function reauthKey(id: Span[Nat8, I]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "reauth:");
+        writeString(&!b, id);
+        return finalize(b);
+    end;
+
+    -- The proof every change asks for, old and code of form, checked
+    -- together; the code counts as used.  None when it holds, else the
+    -- answer: the account page with why.
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, S: Region]
+    function reauth(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], signed: &[Signed, S], action: Span[Nat8, Static], now: Int64): Option[String] is
+        let lang: Span[Nat8, Static] := langOf(request);
+        let addr: String := remoteAddr(request);
+        let key: String := reauthKey(accountId(signed));
+        var wait: Int64 := 0;
+        case backoffWait(&~db, asSpan(&key), reauthRule(), now) of
+            when Right(right as n: Int64) do
+                wait := n;
+            when Left(left as error: DbError) do
+                skip;
+        end case;
+        if wait > 0 then
+            destroyString(key);
+            auditLine(&~log, accountId(signed), action, accountId(signed), true, "throttled", "", "", asSpan(&addr), now);
+            destroyString(addr);
+            let text: String := seconds(wait);
+            let out: String := accountPage(request, &~db, world, signed, 429, sayWith(lang, ErrThrottled(), asSpan(&text)),
+                fromSpan(""));
+            destroyString(text);
+            return Some(value => out);
+        end if;
+        let old: String := valueOf(form, "old");
+        let typed: String := valueOf(form, "code");
+        let code: String := codeOf(asSpan(&typed));
+        destroyString(typed);
+        let checked: Either[DbError, Bool] := reauthenticate(&~db, accountId(signed), asSpan(&old), asSpan(&code),
+            pepperOf(world), totpKeyOf(world), now);
+        destroyString(old);
+        destroyString(code);
+        case checked of
+            when Left(left as error: DbError) do
+                destroyString(key);
+                destroyString(addr);
+                return Some(value => failPage(request, 500, ErrTemporary()));
+            when Right(right as holds: Bool) do
+                if holds then
+                    case backoffReset(&~db, asSpan(&key)) of
+                        when Some(value as error: DbError) do
+                            skip;
+                        when None do
+                            skip;
+                    end case;
+                    destroyString(key);
+                    destroyString(addr);
+                    let none: Option[String] := None();
+                    return none;
+                end if;
+                auditLine(&~log, accountId(signed), action, accountId(signed), true, "reauth", "", "", asSpan(&addr), now);
+                destroyString(addr);
+                case backoffFail(&~db, asSpan(&key), reauthRule(), now) of
+                    when Some(value as error: DbError) do
+                        skip;
+                    when None do
+                        skip;
+                end case;
+                destroyString(key);
+                return Some(value => accountPage(request, &~db, world, signed, 400, say(lang, ErrReauth()), fromSpan("")));
+        end case;
+    end;
+
+    generic [S: Region]
+    function sessionIdAt(sessions: &[Buffer[OpSession], S], i: Index): Span[Nat8, S] is
+        let s: &[OpSession, S] := nthRef(sessions, i);
+        return asSpan(&(s->id));
+    end;
+
+    generic [V: Region]
+    function familyAt(devices: &[Buffer[Device], V], i: Index): Span[Nat8, V] is
+        let d: &[Device, V] := nthRef(devices, i);
+        return asSpan(&(d->family));
+    end;
+
+    -- Ends every session of the account but keep, and every sign-in handed
+    -- to an app.
+    generic [D: Region, W: Region, A: Region, K: Region]
+    function signOutElsewhere(db: &![Database[Writing], D], world: &[World, W], owner: Span[Nat8, A], keep: Span[Nat8, K],
+        reason: Span[Nat8, Static], now: Int64): Bool is
+        case liveSessions(&~db, owner, now, idleOf(world), maxOf(world)) of
+            when Left(left as error: DbError) do
+                return false;
+            when Right(right as sessions: Buffer[OpSession]) do
+                var ok: Bool := true;
+                var i: Index := 0;
+                while i < bufferLength(&sessions) do
+                    if not equal(sessionIdAt(&sessions, i), keep) then
+                        case endSession(&~db, sessionIdAt(&sessions, i), reason, now) of
+                            when Some(value as error: DbError) do
+                                ok := false;
+                            when None do
+                                skip;
+                        end case;
+                    end if;
+                    i := i + 1;
+                end while;
+                destroySessions(sessions);
+                if not ok then
+                    return false;
+                end if;
+        end case;
+        case devicesOf(&~db, owner, false, now) of
+            when Left(left as error: DbError) do
+                return false;
+            when Right(right as devices: Buffer[Device]) do
+                var ok: Bool := true;
+                var i: Index := 0;
+                while i < bufferLength(&devices) do
+                    case revokeDevice(&~db, owner, familyAt(&devices, i), now) of
+                        when Left(left as error: DbError) do
+                            ok := false;
+                        when Right(right as done: Bool) do
+                            skip;
+                    end case;
+                    i := i + 1;
+                end while;
+                destroyDevices(devices);
+                return ok;
+        end case;
+    end;
+
+    --- A new password
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountPassword(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String is
+        case signedInPost(request, &~db, world, &~log, "account.password", now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as post: Post) do
+                let { form: Buffer[QueryPair], signed: Signed } := post;
+                let out: String := passwordChange(request, &~db, world, &~log, &form, &signed, now);
+                destroyPairs(form);
+                destroySigned(signed);
+                return out;
+        end case;
+    end;
+
+    function isSome(problem: Option[PasswordProblem]): Bool is
+        case problem of
+            when Some(value as p: PasswordProblem) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, S: Region]
+    function passwordChange(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], signed: &[Signed, S], now: Int64): String is
+        let lang: Span[Nat8, Static] := langOf(request);
+        let addr: String := remoteAddr(request);
+        let fresh: String := valueOf(form, "new");
+        let again: String := valueOf(form, "new2");
+        let same: Bool := equal(asSpan(&fresh), asSpan(&again));
+        destroyString(again);
+        if not same then
+            destroyString(fresh);
+            auditLine(&~log, accountId(signed), "account.password.change", accountId(signed), true, "mismatch", "", "",
+                asSpan(&addr), now);
+            destroyString(addr);
+            return accountPage(request, &~db, world, signed, 400, say(lang, ErrMismatch()), fromSpan(""));
+        end if;
+        if isSome(passwordProblem(asSpan(&fresh), accountEmail(signed))) then
+            destroyString(fresh);
+            auditLine(&~log, accountId(signed), "account.password.change", accountId(signed), true, "weak", "", "",
+                asSpan(&addr), now);
+            destroyString(addr);
+            return accountPage(request, &~db, world, signed, 400, say(lang, ErrWeak()), fromSpan(""));
+        end if;
+        case reauth(request, &~db, world, &~log, form, signed, "account.password.change", now) of
+            when Some(value as out: String) do
+                destroyString(fresh);
+                destroyString(addr);
+                return out;
+            when None do
+                skip;
+        end case;
+        var stored: Bool := false;
+        case hashPassword(asSpan(&fresh), pepperOf(world)) of
+            when Some(value as encoded: String) do
+                case storePassword(&~db, accountId(signed), asSpan(&encoded), false, now) of
+                    when Right(right as done: Bool) do
+                        stored := done;
+                    when Left(left as error: DbError) do
+                        skip;
+                end case;
+                destroyString(encoded);
+            when None do
+                skip;
+        end case;
+        destroyString(fresh);
+        auditLine(&~log, accountId(signed), "account.password.change", accountId(signed), not stored, "", "", "",
+            asSpan(&addr), now);
+        destroyString(addr);
+        if not stored then
+            return failPage(request, 500, ErrTemporary());
+        end if;
+        if not signOutElsewhere(&~db, world, accountId(signed), sessionId(signed), "password changed", now) then
+            return failPage(request, 500, ErrTemporary());
+        end if;
+        return redirect("/account?done=password");
+    end;
+
+    --- Passkeys
+
+    -- The credentials of the account of signed separated by blanks, which
+    -- the authenticator is not to make again.
+    generic [D: Region, S: Region]
+    function excludedOf(db: &![Database[Writing], D], signed: &[Signed, S]): String is
+        var b: StringBuilder := makeStringBuilder();
+        case passkeysOf(&~db, accountId(signed)) of
+            when Right(right as views: Buffer[PasskeyView]) do
+                writeCredentials(&!b, &views);
+                destroyPasskeyViews(views);
+            when Left(left as error: DbError) do
+                skip;
+        end case;
+        return finalize(b);
+    end;
+
+    generic [B: Region, V: Region]
+    function writeCredentials(b: &![StringBuilder, B], views: &[Buffer[PasskeyView], V]): Unit is
+        var i: Index := 0;
+        while i < bufferLength(views) do
+            let view: &[PasskeyView, V] := nthRef(views, i);
+            if i > 0 then
+                writeByte(&~b, ' ');
+            end if;
+            writeString(&~b, asSpan(&(view->credential)));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountPasskeyBegin(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        log: &![Log, L], now: Int64): String is
+        case signedInPost(request, &~db, world, &~log, "account.passkey", now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as post: Post) do
+                let { form: Buffer[QueryPair], signed: Signed } := post;
+                let out: String := passkeyBegun(request, &~db, world, &~log, &form, &signed, now);
+                destroyPairs(form);
+                destroySigned(signed);
+                return out;
+        end case;
+    end;
+
+    -- The password and the code, then a challenge for the account and the
+    -- page that asks the authenticator.
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, S: Region]
+    function passkeyBegun(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], signed: &[Signed, S], now: Int64): String is
+        case reauth(request, &~db, world, &~log, form, signed, "account.passkey.begin", now) of
+            when Some(value as out: String) do
+                return out;
+            when None do
+                skip;
+        end case;
+        var challenge: String := fromSpan("");
+        case newChallenge(&~db, accountId(signed), Create(), now) of
+            when Right(right as made: Option[String]) do
+                destroyString(challenge);
+                challenge := orEmpty(made);
+            when Left(left as error: DbError) do
+                skip;
+        end case;
+        if length(&challenge) = 0 then
+            destroyString(challenge);
+            return failPage(request, 500, ErrTemporary());
+        end if;
+        let addr: String := remoteAddr(request);
+        auditLine(&~log, accountId(signed), "account.passkey.begin", accountId(signed), false, "", "", "", asSpan(&addr), now);
+        destroyString(addr);
+        let lang: Span[Nat8, Static] := langOf(request);
+        var display: String := fromSpan(accountName(signed));
+        if length(&display) = 0 then
+            destroyString(display);
+            display := fromSpan(accountEmail(signed));
+        end if;
+        let page: PasskeyAddPage := PasskeyAddPage(lang => fromSpan(lang), frame => frameFor(request, world, lang,
+            TitlePasskeyAdd(), fromSpan(""), fromSpan(""), "account"), challenge => challenge,
+            party => partyOf(issuerOf(world)), userId => toBase64Url(accountId(signed)),
+            userName => fromSpan(accountEmail(signed)), display => display, exclude => excludedOf(&~db, signed),
+            csrfAdd => csrfToken(request, settingsOf(world), "account.passkey.add"));
+        let html: String := renderPasskeyAdd(&page);
+        destroyPasskeyAddPage(page);
+        return answer(200, html);
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountPasskeyAdd(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        log: &![Log, L], now: Int64): String is
+        case signedInPost(request, &~db, world, &~log, "account.passkey.add", now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as post: Post) do
+                let { form: Buffer[QueryPair], signed: Signed } := post;
+                let out: String := passkeyAdded(request, &~db, world, &~log, &form, &signed, now);
+                destroyPairs(form);
+                destroySigned(signed);
+                return out;
+        end case;
+    end;
+
+    -- The bytes of the field name of form in base64url, empty for anything
+    -- else: an empty part fails the checks of Wolly.Passkey.
+    generic [F: Region]
+    function decodedField(form: &[Buffer[QueryPair], F], name: Span[Nat8, Static]): String is
+        let text: String := valueOf(form, name);
+        let bytes: Option[String] := fromBase64Url(asSpan(&text));
+        destroyString(text);
+        return orEmpty(bytes);
+    end;
+
+    -- The text an account page shows for a registration refused.
+    function addRefusal(refusal: Refusal): Key is
+        case refusal of
+            when PasskeyTooMany do
+                return ErrPasskeyMany();
+            when Known do
+                return ErrPasskeyKnown();
+            when BadName do
+                return ErrPasskeyAdd();
+            when PasskeyMalformed do
+                return ErrPasskeyAdd();
+            when PasskeyWrongType do
+                return ErrPasskeyAdd();
+            when WrongChallenge do
+                return ErrPasskeyAdd();
+            when WrongOrigin do
+                return ErrPasskeyAdd();
+            when WrongParty do
+                return ErrPasskeyAdd();
+            when NotVerified do
+                return ErrPasskeyAdd();
+            when Attested do
+                return ErrPasskeyAdd();
+            when BadKey do
+                return ErrPasskeyAdd();
+            when Unknown do
+                return ErrPasskeyAdd();
+            when BadSignature do
+                return ErrPasskeyAdd();
+            when PasskeyReplayed do
+                return ErrPasskeyAdd();
+        end case;
+    end;
+
+    -- The registration with the challenge of the account: the key and its
+    -- name kept, or the account page with why not.
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, S: Region]
+    function passkeyAdded(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], signed: &[Signed, S], now: Int64): String is
+        let lang: Span[Nat8, Static] := langOf(request);
+        let typed: String := valueOf(form, "label");
+        let cleaned: Option[String] := cleanLabel(asSpan(&typed));
+        destroyString(typed);
+        case cleaned of
+            when None do
+                return accountPage(request, &~db, world, signed, 400, say(lang, ErrPasskeyLabel()), fromSpan(""));
+            when Some(value as label: String) do
+                let clientData: String := decodedField(form, "clientData");
+                let attestation: String := decodedField(form, "attestation");
+                let issuer: Span[Nat8, W] := issuerOf(world);
+                let party: String := partyOf(issuer);
+                let origin: String := originOf(issuer);
+                let verdict: Either[DbError, Either[Refusal, String]] := registerCredential(&~db, accountId(signed),
+                    asSpan(&clientData), asSpan(&attestation), asSpan(&party), asSpan(&origin), now);
+                destroyString(clientData);
+                destroyString(attestation);
+                destroyString(party);
+                destroyString(origin);
+                let addr: String := remoteAddr(request);
+                case verdict of
+                    when Left(left as error: DbError) do
+                        destroyString(label);
+                        destroyString(addr);
+                        return failPage(request, 500, ErrTemporary());
+                    when Right(right as result: Either[Refusal, String]) do
+                        case result of
+                            when Left(left as refusal: Refusal) do
+                                destroyString(label);
+                                auditLine(&~log, accountId(signed), "account.passkey.add", accountId(signed), true,
+                                    refusalWord(refusal), "", "", asSpan(&addr), now);
+                                destroyString(addr);
+                                return accountPage(request, &~db, world, signed, 400, say(lang, addRefusal(refusal)),
+                                    fromSpan(""));
+                            when Right(right as credential: String) do
+                                let kept: Option[DbError] := keepLabel(&~db, asSpan(&credential), accountId(signed),
+                                    asSpan(&label));
+                                destroyString(label);
+                                auditLine(&~log, accountId(signed), "account.passkey.add", accountId(signed), false, "",
+                                    "credential", asSpan(&credential), asSpan(&addr), now);
+                                destroyString(credential);
+                                destroyString(addr);
+                                case kept of
+                                    when Some(value as error: DbError) do
+                                        return failPage(request, 500, ErrTemporary());
+                                    when None do
+                                        return redirect("/account?done=passkey");
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountPasskeyRename(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        log: &![Log, L], now: Int64): String is
+        case signedInPost(request, &~db, world, &~log, "account.passkey.rename", now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as post: Post) do
+                let { form: Buffer[QueryPair], signed: Signed } := post;
+                let out: String := passkeyRenamed(request, &~db, world, &~log, &form, &signed, now);
+                destroyPairs(form);
+                destroySigned(signed);
+                return out;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, S: Region]
+    function passkeyRenamed(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], signed: &[Signed, S], now: Int64): String is
+        let lang: Span[Nat8, Static] := langOf(request);
+        let typed: String := valueOf(form, "label");
+        let cleaned: Option[String] := cleanLabel(asSpan(&typed));
+        destroyString(typed);
+        case cleaned of
+            when None do
+                return accountPage(request, &~db, world, signed, 400, say(lang, ErrPasskeyLabel()), fromSpan(""));
+            when Some(value as label: String) do
+                let credential: String := valueOf(form, "credential");
+                let renamed: Either[DbError, Bool] := renamePasskey(&~db, accountId(signed), asSpan(&credential),
+                    asSpan(&label));
+                destroyString(label);
+                let addr: String := remoteAddr(request);
+                case renamed of
+                    when Left(left as error: DbError) do
+                        destroyString(credential);
+                        destroyString(addr);
+                        return failPage(request, 500, ErrTemporary());
+                    when Right(right as done: Bool) do
+                        auditLine(&~log, accountId(signed), "account.passkey.rename", accountId(signed), not done,
+                            "", "credential", asSpan(&credential), asSpan(&addr), now);
+                        destroyString(credential);
+                        destroyString(addr);
+                        if not done then
+                            return accountPage(request, &~db, world, signed, 404, say(lang, ErrPasskeyGone()),
+                                fromSpan(""));
+                        end if;
+                        return redirect("/account?done=passkey-renamed");
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountPasskeyRemove(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        log: &![Log, L], now: Int64): String is
+        case signedInPost(request, &~db, world, &~log, "account.passkey.remove", now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as post: Post) do
+                let { form: Buffer[QueryPair], signed: Signed } := post;
+                let out: String := passkeyRemoved(request, &~db, world, &~log, &form, &signed, now);
+                destroyPairs(form);
+                destroySigned(signed);
+                return out;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, S: Region]
+    function passkeyRemoved(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], signed: &[Signed, S], now: Int64): String is
+        let lang: Span[Nat8, Static] := langOf(request);
+        let credential: String := valueOf(form, "credential");
+        let removed: Either[DbError, Bool] := forgetPasskey(&~db, accountId(signed), asSpan(&credential));
+        let addr: String := remoteAddr(request);
+        case removed of
+            when Left(left as error: DbError) do
+                destroyString(credential);
+                destroyString(addr);
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as done: Bool) do
+                auditLine(&~log, accountId(signed), "account.passkey.remove", accountId(signed), not done,
+                    "", "credential", asSpan(&credential), asSpan(&addr), now);
+                destroyString(credential);
+                destroyString(addr);
+                if not done then
+                    return accountPage(request, &~db, world, signed, 404, say(lang, ErrPasskeyGone()), fromSpan(""));
+                end if;
+                return redirect("/account?done=passkey-removed");
+        end case;
+    end;
+
+    --- A new second factor
+
+    generic [Q: Region, W: Region, S: Region, U: Region]
+    function renewPage(request: &[Request, Q], world: &[World, W], secret: Span[Nat8, S], uri: Span[Nat8, U],
+        status: Nat16, error: String): String is
+        let lang: Span[Nat8, Static] := langOf(request);
+        let page: RenewPage := RenewPage(lang => fromSpan(lang), frame => frameFor(request, world, lang, TitleTotpRenew(),
+            error, fromSpan(""), "account"), qr => orEmpty(qrDataUri(uri)), secret => groupSecret(secret),
+            csrfConfirm => csrfToken(request, settingsOf(world), "account.totp.confirm"));
+        let html: String := renderRenew(&page);
+        destroyRenewPage(page);
+        return answer(status, html);
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountTotpBegin(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String is
+        case signedInPost(request, &~db, world, &~log, "account.totp", now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as post: Post) do
+                let { form: Buffer[QueryPair], signed: Signed } := post;
+                let out: String := renewal(request, &~db, world, &~log, &form, &signed, now);
+                destroyPairs(form);
+                destroySigned(signed);
+                return out;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, S: Region]
+    function renewal(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], signed: &[Signed, S], now: Int64): String is
+        case reauth(request, &~db, world, &~log, form, signed, "account.totp.renew", now) of
+            when Some(value as out: String) do
+                return out;
+            when None do
+                skip;
+        end case;
+        case newTotpSecret() of
+            when None do
+                return failPage(request, 500, ErrTemporary());
+            when Some(value as secret: String) do
+                let uri: String := totpUri("RAMBO", accountEmail(signed), asSpan(&secret));
+                let step: Step := Step(account => fromSpan(accountId(signed)), req => fromSpan(""), amr => fromSpan(""),
+                    needPassword => false, needTotp => true, totpSecret => fromSpan(asSpan(&secret)),
+                    totpUri => fromSpan(asSpan(&uri)));
+                let key: String := renewKey(sessionId(signed));
+                let put: Either[DbError, Bool] := putStep(&~db, asSpan(&key), &step, totpKeyOf(world), now);
+                destroyString(key);
+                destroyStep(step);
+                var kept: Bool := false;
+                case put of
+                    when Right(right as done: Bool) do
+                        kept := done;
+                    when Left(left as error: DbError) do
+                        skip;
+                end case;
+                if not kept then
+                    destroyString(secret);
+                    destroyString(uri);
+                    return failPage(request, 500, ErrTemporary());
+                end if;
+                let addr: String := remoteAddr(request);
+                auditLine(&~log, accountId(signed), "account.totp.begin", accountId(signed), false, "", "", "",
+                    asSpan(&addr), now);
+                destroyString(addr);
+                let out: String := renewPage(request, world, asSpan(&secret), asSpan(&uri), 200, fromSpan(""));
+                destroyString(secret);
+                destroyString(uri);
+                return out;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountTotpConfirm(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        log: &![Log, L], now: Int64): String is
+        case signedInPost(request, &~db, world, &~log, "account.totp.confirm", now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as post: Post) do
+                let { form: Buffer[QueryPair], signed: Signed } := post;
+                let key: String := renewKey(sessionId(&signed));
+                let out: String := confirmed(request, &~db, world, &~log, &form, &signed, asSpan(&key), now);
+                destroyString(key);
+                destroyPairs(form);
+                destroySigned(signed);
+                return out;
+        end case;
+    end;
+
+    generic [T: Region]
+    function stepAccount(step: &[Step, T]): Span[Nat8, T] is
+        return asSpan(&(step->account));
+    end;
+
+    generic [T: Region]
+    function stepSecret(step: &[Step, T]): Span[Nat8, T] is
+        return asSpan(&(step->totpSecret));
+    end;
+
+    generic [T: Region]
+    function stepUri(step: &[Step, T]): Span[Nat8, T] is
+        return asSpan(&(step->totpUri));
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, S: Region, K: Region]
+    function confirmed(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], signed: &[Signed, S], key: Span[Nat8, K], now: Int64): String is
+        let addr: String := remoteAddr(request);
+        case stepOf(&~db, key, totpKeyOf(world), now) of
+            when Left(left as error: DbError) do
+                destroyString(addr);
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as found: Option[Step]) do
+                case found of
+                    when None do
+                        auditLine(&~log, accountId(signed), "account.totp.renew", accountId(signed), true, "no_renewal", "",
+                            "", asSpan(&addr), now);
+                        destroyString(addr);
+                        return failPage(request, 400, ErrRenewal());
+                    when Some(value as step: Step) do
+                        if not equal(stepAccount(&step), accountId(signed)) then
+                            destroyStep(step);
+                            case dropStep(&~db, key) of
+                                when Some(value as error: DbError) do
+                                    skip;
+                                when None do
+                                    skip;
+                            end case;
+                            auditLine(&~log, accountId(signed), "account.totp.renew", accountId(signed), true, "no_renewal",
+                                "", "", asSpan(&addr), now);
+                            destroyString(addr);
+                            return failPage(request, 400, ErrRenewal());
+                        end if;
+                        let out: String := renewed(request, &~db, world, &~log, form, signed, &step, key, asSpan(&addr), now);
+                        destroyStep(step);
+                        destroyString(addr);
+                        return out;
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, S: Region, T: Region, K: Region, A: Region]
+    function renewed(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], signed: &[Signed, S], step: &[Step, T], key: Span[Nat8, K], addr: Span[Nat8, A],
+        now: Int64): String is
+        let lang: Span[Nat8, Static] := langOf(request);
+        let typed: String := valueOf(form, "code");
+        let code: String := codeOf(asSpan(&typed));
+        destroyString(typed);
+        let result: Either[DbError, Bool] := confirmTotp(&~db, accountId(signed), stepSecret(step), asSpan(&code),
+            totpKeyOf(world), now);
+        destroyString(code);
+        case result of
+            when Left(left as error: DbError) do
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as done: Bool) do
+                if not done then
+                    auditLine(&~log, accountId(signed), "account.totp.renew", accountId(signed), true, "invalid_code", "", "",
+                        addr, now);
+                    return renewPage(request, world, stepSecret(step), stepUri(step), 400, say(lang, ErrCode()));
+                end if;
+        end case;
+        auditLine(&~log, accountId(signed), "account.totp.renew", accountId(signed), false, "", "", "", addr, now);
+        case dropStep(&~db, key) of
+            when Some(value as error: DbError) do
+                skip;
+            when None do
+                skip;
+        end case;
+        if not signOutElsewhere(&~db, world, accountId(signed), sessionId(signed), "second factor renewed", now) then
+            return failPage(request, 500, ErrTemporary());
+        end if;
+        return redirect("/account?done=totp");
+    end;
+
+    --- Ending a session or an app's sign-in
+
+    -- What the confirmation page names before it ends something.
+    record Ending: Linear is
+        kind: Span[Nat8, Static];
+        id: String;
+        label: String;
+        created: Int64;
+        lastSeen: Int64;
+        firstIp: String;
+        lastIp: String;
+    end;
+
+    function destroyEnding(ending: Ending): Unit is
+        let { kind: Span[Nat8, Static], id: String, label: String, created: Int64, lastSeen: Int64, firstIp: String,
+            lastIp: String } := ending;
+        destroyString(id);
+        destroyString(label);
+        destroyString(firstIp);
+        destroyString(lastIp);
+        return nil;
+    end;
+
+    generic [Q: Region, W: Region, E: Region]
+    function confirmPage(request: &[Request, Q], world: &[World, W], action: Span[Nat8, Static], path: Span[Nat8, Static],
+        ending: &[Ending, E]): String is
+        let lang: Span[Nat8, Static] := langOf(request);
+        let device: Bool := equal(ending->kind, "device");
+        let page: ConfirmPage := ConfirmPage(lang => fromSpan(lang), frame => frameFor(request, world, lang, TitleConfirm(),
+            fromSpan(""), fromSpan(""), "home"), kind => fromSpan(ending->kind), id => fromSpan(asSpan(&(ending->id))),
+            label => fromSpan(asSpan(&(ending->label))), created => whenText(ending->created),
+            firstIp => ipHtml(asSpan(&(ending->firstIp))),
+            appFirstIp => device and (spanLength(asSpan(&(ending->firstIp))) > 0),
+            lastSeen => whenText(ending->lastSeen), lastIp => ipHtml(asSpan(&(ending->lastIp))),
+            appLastIp => device and (spanLength(asSpan(&(ending->lastIp))) > 0), action => fromSpan(path),
+            csrfConfirm => csrfToken(request, settingsOf(world), action));
+        let html: String := renderConfirm(&page);
+        destroyConfirmPage(page);
+        return answer(200, html);
+    end;
+
+    generic [T: Region]
+    function sessionEnding(target: &[OpSession, T]): Ending is
+        return Ending(kind => "session", id => fromSpan(asSpan(&(target->id))), label => fromSpan(asSpan(&(target->userAgent))),
+            created => target->created, lastSeen => target->lastSeen, firstIp => fromSpan(asSpan(&(target->firstIp))),
+            lastIp => fromSpan(asSpan(&(target->lastIp))));
+    end;
+
+    generic [T: Region]
+    function endedOf(target: &[OpSession, T]): Int64 is
+        return target->ended;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountEndSession(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        log: &![Log, L], now: Int64): String is
+        case signedInPost(request, &~db, world, &~log, "account.session.end", now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as post: Post) do
+                let { form: Buffer[QueryPair], signed: Signed } := post;
+                let out: String := endOther(request, &~db, world, &~log, &form, &signed, now);
+                destroyPairs(form);
+                destroySigned(signed);
+                return out;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, S: Region]
+    function endOther(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], signed: &[Signed, S], now: Int64): String is
+        let id: String := valueOf(form, "id");
+        if (length(&id) = 0) or (length(&id) > mostRef) or equal(asSpan(&id), sessionId(signed)) then
+            destroyString(id);
+            return failPage(request, 400, ErrNotFound());
+        end if;
+        case sessionById(&~db, asSpan(&id)) of
+            when Left(left as error: DbError) do
+                destroyString(id);
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as found: Option[OpSession]) do
+                case found of
+                    when None do
+                        destroyString(id);
+                        return failPage(request, 404, ErrNotFound());
+                    when Some(value as target: OpSession) do
+                        if (not equal(subjectOf(&target), accountId(signed))) or (endedOf(&target) > 0) then
+                            destroySession(target);
+                            destroyString(id);
+                            return failPage(request, 404, ErrNotFound());
+                        end if;
+                        let ending: Ending := sessionEnding(&target);
+                        destroySession(target);
+                        let confirm: String := valueOf(form, "confirm");
+                        let yes: Bool := equal(asSpan(&confirm), "yes");
+                        destroyString(confirm);
+                        if not yes then
+                            let out: String := confirmPage(request, world, "account.session.end", "/account/session/end",
+                                &ending);
+                            destroyEnding(ending);
+                            destroyString(id);
+                            return out;
+                        end if;
+                        destroyEnding(ending);
+                        let ended: Option[DbError] := endSession(&~db, asSpan(&id), "ended by owner", now);
+                        let addr: String := remoteAddr(request);
+                        case ended of
+                            when Some(value as error: DbError) do
+                                auditLine(&~log, accountId(signed), "session.end", asSpan(&id), true, "", "", "",
+                                    asSpan(&addr), now);
+                                destroyString(addr);
+                                destroyString(id);
+                                return failPage(request, 500, ErrTemporary());
+                            when None do
+                                auditLine(&~log, accountId(signed), "session.end", asSpan(&id), false, "", "", "",
+                                    asSpan(&addr), now);
+                                destroyString(addr);
+                                destroyString(id);
+                                return redirect("/?done=session");
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountRevokeDevice(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        log: &![Log, L], now: Int64): String is
+        case signedInPost(request, &~db, world, &~log, "account.device.revoke", now) of
+            when Left(left as out: String) do
+                return out;
+            when Right(right as post: Post) do
+                let { form: Buffer[QueryPair], signed: Signed } := post;
+                let out: String := revokeOne(request, &~db, world, &~log, &form, &signed, now);
+                destroyPairs(form);
+                destroySigned(signed);
+                return out;
+        end case;
+    end;
+
+    -- The ending of the family family among devices, None when it is not
+    -- one of them.
+    generic [V: Region, F: Region]
+    function deviceEnding(devices: &[Buffer[Device], V], family: Span[Nat8, F]): Option[Ending] is
+        var i: Index := 0;
+        while i < bufferLength(devices) do
+            let d: &[Device, V] := nthRef(devices, i);
+            if equal(asSpan(&(d->family)), family) then
+                var b: StringBuilder := makeStringBuilder();
+                writeString(&!b, asSpan(&(d->clientName)));
+                if spanLength(asSpan(&(d->label))) > 0 then
+                    writeString(&!b, " (");
+                    writeString(&!b, asSpan(&(d->label)));
+                    writeString(&!b, ")");
+                end if;
+                return Some(value => Ending(kind => "device", id => fromSpan(family), label => finalize(b),
+                    created => d->created, lastSeen => d->lastUsed, firstIp => fromSpan(asSpan(&(d->firstIp))),
+                    lastIp => fromSpan(asSpan(&(d->lastIp)))));
+            end if;
+            i := i + 1;
+        end while;
+        let none: Option[Ending] := None();
+        return none;
+    end;
+
+    generic [Q: Region, D: Region, W: Region, L: Region, F: Region, S: Region]
+    function revokeOne(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        form: &[Buffer[QueryPair], F], signed: &[Signed, S], now: Int64): String is
+        let family: String := valueOf(form, "id");
+        if (length(&family) = 0) or (length(&family) > mostRef) then
+            destroyString(family);
+            return failPage(request, 400, ErrNotFound());
+        end if;
+        case devicesOf(&~db, accountId(signed), false, now) of
+            when Left(left as error: DbError) do
+                destroyString(family);
+                return failPage(request, 500, ErrTemporary());
+            when Right(right as devices: Buffer[Device]) do
+                let found: Option[Ending] := deviceEnding(&devices, asSpan(&family));
+                destroyDevices(devices);
+                case found of
+                    when None do
+                        destroyString(family);
+                        return failPage(request, 404, ErrNotFound());
+                    when Some(value as ending: Ending) do
+                        let confirm: String := valueOf(form, "confirm");
+                        let yes: Bool := equal(asSpan(&confirm), "yes");
+                        destroyString(confirm);
+                        if not yes then
+                            let out: String := confirmPage(request, world, "account.device.revoke", "/account/device/revoke",
+                                &ending);
+                            destroyEnding(ending);
+                            destroyString(family);
+                            return out;
+                        end if;
+                        destroyEnding(ending);
+                        let revoked: Either[DbError, Bool] := revokeDevice(&~db, accountId(signed), asSpan(&family), now);
+                        let addr: String := remoteAddr(request);
+                        case revoked of
+                            when Left(left as error: DbError) do
+                                auditLine(&~log, accountId(signed), "device.revoke", asSpan(&family), true, "", "", "",
+                                    asSpan(&addr), now);
+                                destroyString(addr);
+                                destroyString(family);
+                                return failPage(request, 500, ErrTemporary());
+                            when Right(right as done: Bool) do
+                                auditLine(&~log, accountId(signed), "device.revoke", asSpan(&family), false, "", "", "",
+                                    asSpan(&addr), now);
+                                destroyString(addr);
+                                destroyString(family);
+                                return redirect("/?done=device");
+                        end case;
+                end case;
+        end case;
+    end;
+end module body.

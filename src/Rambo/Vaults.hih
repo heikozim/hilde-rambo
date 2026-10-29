@@ -1,0 +1,83 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The vault of rambo as the setup commands manage it: its key, its pepper,
+the secrets rambo makes itself and those an operator stores.
+
+- init makes what is missing and nothing else: the pepper, the key, the
+  pepper of the passwords, the key of the second factors, the key of the
+  puzzles, and a first signing key of ML-DSA-44 and of ML-DSA-44-Ed25519.
+- A name an operator sets is A to Z first, then A to Z, 0 to 9 and _, at
+  most 64 in all, never the key's name and never one rambo makes itself.
+- A secret is printed only to a terminal.
+- Every Right holds what the command prints, Left the text of a refusal.
+
+    case initVault(&config, now) of
+        when Right(right as said: String) do
+            ...
+"""
+import Standard.String (
+    String
+);
+import Rambo.Config (
+    Config
+);
+
+module Rambo.Vaults is
+    """
+    Makes what is missing of the vault of config at now.  Right the lines
+    that say what was written, empty when nothing was.
+    No ensures: files are written.
+    """
+    generic [C: Region]
+    function initVault(config: &[Config, C], now: Int64): Either[String, String]
+        requires now > 0;
+
+    """
+    Stores value under name in the vault of config.
+    No contract: the vault is written.
+    """
+    generic [C: Region, N: Region, V: Region]
+    function setVaultSecret(config: &[Config, C], name: Span[Nat8, N], value: Span[Nat8, V]): Option[String];
+
+    """
+    The value under name in the vault of config, refused when toTerminal is
+    false.
+    No contract: the vault is read.
+    """
+    generic [C: Region, N: Region]
+    function getVaultSecret(config: &[Config, C], name: Span[Nat8, N], toTerminal: Bool): Either[String, String];
+
+    """
+    Removes the value under name from the vault of config.
+    No contract: the vault is written.
+    """
+    generic [C: Region, N: Region]
+    function deleteVaultSecret(config: &[Config, C], name: Span[Nat8, N]): Option[String];
+
+    """
+    The names in the vault of config, each on a line after two blanks, or
+    (no secrets).
+    No contract: the vault is read.
+    """
+    generic [C: Region]
+    function listVaultSecrets(config: &[Config, C]): Either[String, String];
+
+    """
+    A new key for the vault of config, every value sealed again.
+    No contract: the vault is written.
+    """
+    generic [C: Region]
+    function rotateVaultKey(config: &[Config, C]): Either[String, String];
+
+    """
+    A new pepper for the vault of config, every value sealed again.
+    No contract: the vault is written.
+    """
+    generic [C: Region]
+    function rotateVaultPepper(config: &[Config, C]): Either[String, String];
+end module.

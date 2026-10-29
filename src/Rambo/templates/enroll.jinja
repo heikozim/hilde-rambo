@@ -1,0 +1,12 @@
+{#
+Part of rambo.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The new second factor: its QR code, a data URI the code made, and the
+secret in blocks of four for typing it in.
+-#}
+{% if qr %}<p class="qr"><img src="{{ qr|safe }}" alt="{{ _("TotpQrAlt") }}"></p>{% endif %}
+<p>{{ _("TotpManual") }}</p>
+<p class="secret"><code>{{ secret }}</code></p>

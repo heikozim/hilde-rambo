@@ -1,0 +1,35 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The take-over of an installation of the earlier Go provider: rambo reads its vault and its
+database as they are, so a migration copies nothing and checks everything.
+
+- The vault must yield the pepper of the passwords, the key of the second
+  factors, the key of the puzzles and the signing keys, whose kids stay.
+- The database must hold every column rambo reads, and its schema must not
+  be newer than the one rambo knows: accountkit 1, oidcop 6, powkit 1.
+- rambo's own tables are made, and the time of the migration is kept.
+- The report counts the accounts, clients, roles, live sessions and keys.
+
+    case migrate(path, now) of
+        when Right(right as report: String) do
+            ...
+"""
+import Standard.String (
+    String
+);
+
+module Rambo.Migrate is
+    """
+    Takes over the installation the configuration at path names at now.
+    Right the report, Left what does not hold.
+    No ensures: the vault and the database are read and written.
+    """
+    generic [P: Region]
+    function migrate(path: Span[Nat8, P], now: Int64): Either[String, String]
+        requires now > 0;
+end module.

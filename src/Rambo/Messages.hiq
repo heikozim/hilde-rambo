@@ -1,0 +1,576 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Written by tools/genmessages.pl from the page texts of the earlier Go provider and texts/;
+-- change the generator or the texts, not this file.
+import Standard.I18n (
+    Message,
+    Text,
+    Language,
+    Catalog,
+    englishPlural,
+    germanPlural
+);
+
+module body Rambo.Messages is
+    function english(key: Key): Message is
+        case key of
+            when AccountApp do
+                return Text(text => "App");
+            when AccountAppServer do
+                return Text(text => "app server");
+            when AccountBrowser do
+                return Text(text => "Browser");
+            when AccountCode do
+                return Text(text => "Current code from the app");
+            when AccountDeviceIpNote do
+                return Text(text => "For apps these are the addresses of the app's server, not of your device.");
+            when AccountEmail do
+                return Text(text => "E-mail address");
+            when AccountEnd do
+                return Text(text => "End");
+            when AccountId do
+                return Text(text => "Account ID");
+            when AccountLastSeen do
+                return Text(text => "Last used (UTC) / last IP");
+            when AccountName do
+                return Text(text => "Name");
+            when AccountOldPassword do
+                return Text(text => "Current password");
+            when AccountPasskeyAdd do
+                return Text(text => "Add a passkey");
+            when AccountPasskeyAddHint do
+                return Text(text => "Adding a passkey asks for your current password and a fresh code.");
+            when AccountPasskeyCreated do
+                return Text(text => "Added");
+            when AccountPasskeyLabel do
+                return Text(text => "Name of the passkey");
+            when AccountPasskeyLabelHint do
+                return Text(text => "So that you know the device again, for instance laptop or phone.");
+            when AccountPasskeyLastUsed do
+                return Text(text => "Last used");
+            when AccountPasskeyName do
+                return Text(text => "Name");
+            when AccountPasskeyNever do
+                return Text(text => "never");
+            when AccountPasskeyNone do
+                return Text(text => "No passkey yet.");
+            when AccountPasskeyRemove do
+                return Text(text => "Remove");
+            when AccountPasskeyRename do
+                return Text(text => "Rename");
+            when AccountPasskeys do
+                return Text(text => "Passkeys");
+            when AccountPasskeysHint do
+                return Text(text => "A passkey signs you in without password and code: the device checks you by fingerprint, face or PIN. Password and code stay valid as the way back in.");
+            when AccountPassword do
+                return Text(text => "Change password");
+            when AccountPasswordHint do
+                return Text(text => "A code counts only once. If you just signed in with it, wait for the next one.");
+            when AccountPasswordSubmit do
+                return Text(text => "Change password");
+            when AccountReauthHint do
+                return Text(text => "Every change here asks for your current password and a fresh code from the authenticator app. All other sessions and all apps are signed out afterwards.");
+            when AccountSessions do
+                return Text(text => "Signed-in browsers");
+            when AccountSince do
+                return Text(text => "Since (UTC) / first IP");
+            when AccountThisSession do
+                return Text(text => "this session");
+            when AccountTotp do
+                return Text(text => "Second factor");
+            when AccountTotpHint do
+                return Text(text => "For a new authenticator app. You then scan the new code and confirm it; until then the current one stays valid.");
+            when AccountTotpSubmit do
+                return Text(text => "Set up again");
+            when BoundEnd do
+                return Text(text => "Sign out");
+            when BoundSwitch do
+                return Text(text => "Go to {arg}");
+            when CommonCancel do
+                return Text(text => "Cancel");
+            when ConfirmDevice do
+                return Text(text => "This app will be signed out and has to sign in again.");
+            when ConfirmEndSession do
+                return Text(text => "End session");
+            when ConfirmRevokeDevice do
+                return Text(text => "Sign out app");
+            when ConfirmSession do
+                return Text(text => "This session will end. The sign-in then also ends in every application that hangs off it.");
+            when ErrBanned do
+                return Text(text => "Too many failed attempts. This address is blocked for {arg}.");
+            when ErrBusy do
+                return Text(text => "Too many sign-ins are in progress. Please try again in a few minutes.");
+            when ErrCode do
+                return Text(text => "The code is not right. Please enter the current code from the app.");
+            when ErrCsrf do
+                return Text(text => "The form has expired. Please reload the page and send it again.");
+            when ErrForm do
+                return Text(text => "The form was incomplete.");
+            when ErrInvalid do
+                return Text(text => "E-mail address, password or code is not right.");
+            when ErrLocked do
+                return Text(text => "This account is locked. Please contact the administrators.");
+            when ErrMismatch do
+                return Text(text => "The two new passwords are not the same.");
+            when ErrNotFound do
+                return Text(text => "That does not exist (any more).");
+            when ErrPasskey do
+                return Text(text => "The passkey was not accepted.");
+            when ErrPasskeyAdd do
+                return Text(text => "The passkey could not be added. Please start again.");
+            when ErrPasskeyGone do
+                return Text(text => "There is no such passkey.");
+            when ErrPasskeyKnown do
+                return Text(text => "This passkey is registered already.");
+            when ErrPasskeyLabel do
+                return Text(text => "A name of at most 64 characters, please.");
+            when ErrPasskeyMany do
+                return Text(text => "This account has the most passkeys it may have (20).");
+            when ErrPow do
+                return Text(text => "The browser check was missing or has expired. Please sign in again.");
+            when ErrPowHarder do
+                return Text(text => "After several failed attempts a more demanding browser check is needed. Please sign in again.");
+            when ErrReauth do
+                return Text(text => "Password or code is not right. A code counts only once: please wait for the next one.");
+            when ErrRenewal do
+                return Text(text => "The renewal has expired. Please start again.");
+            when ErrRequest do
+                return Text(text => "This sign-in has expired or belongs to another browser. Please start again in the application.");
+            when ErrSession do
+                return Text(text => "You are not signed in (any more).");
+            when ErrTemporary do
+                return Text(text => "Temporary failure. Please try again.");
+            when ErrThrottled do
+                return Text(text => "Too many failed attempts. Please try again in {arg}.");
+            when ErrWeak do
+                return Text(text => "The password is too weak: at least 12 characters, not the e-mail address.");
+            when FooterAcronym do
+                return Text(text => "Rights, Accounts, Multi-factor, Bearer tokens & OAuth");
+            when FooterAuthor do
+                return Text(text => "Heiko Zimmermann");
+            when FooterCopyright do
+                return Text(text => "(c) 2026");
+            when HomeBound do
+                return Text(text => "Signed-in apps");
+            when HomeBoundHint do
+                return Text(text => "Apps this sign-in was handed to.");
+            when HomeNoApps do
+                return Text(text => "No apps are set up for your account yet.");
+            when HomeNoBound do
+                return Text(text => "No app signed in.");
+            when InfoDoneDevice do
+                return Text(text => "The app is signed out.");
+            when InfoDonePassword do
+                return Text(text => "The password is changed. Your other sessions and all apps are signed out.");
+            when InfoDoneSession do
+                return Text(text => "The session has ended.");
+            when InfoDoneTotp do
+                return Text(text => "The new second factor applies from now on; the old one no longer does. Your other sessions and all apps are signed out.");
+            when InfoLoggedOut do
+                return Text(text => "You are signed out.");
+            when InfoNotSignedIn do
+                return Text(text => "You are not signed in.");
+            when InfoPasskeyAdded do
+                return Text(text => "The passkey was added.");
+            when InfoPasskeyRemoved do
+                return Text(text => "The passkey was removed.");
+            when InfoPasskeyRenamed do
+                return Text(text => "The passkey was renamed.");
+            when InfoRestarted do
+                return Text(text => "Your previous sign-in had expired. Please sign in once more.");
+            when LangDe do
+                return Text(text => "Deutsch");
+            when LangDeShort do
+                return Text(text => "DE");
+            when LangEn do
+                return Text(text => "English");
+            when LangEnShort do
+                return Text(text => "EN");
+            when LangLabel do
+                return Text(text => "Language");
+            when LoginCode do
+                return Text(text => "Code");
+            when LoginCodeHint do
+                return Text(text => "from the authenticator app, once set up");
+            when LoginEmail do
+                return Text(text => "E-mail address");
+            when LoginFor do
+                return Text(text => "Signing in to");
+            when LoginPasskey do
+                return Text(text => "Sign in with a passkey");
+            when LoginPasskeyOr do
+                return Text(text => "or with password and code");
+            when LoginPassword do
+                return Text(text => "Password");
+            when LoginReauth do
+                return Text(text => "The application asks for a fresh sign-in.");
+            when LoginSubmit do
+                return Text(text => "Sign in");
+            when LogoutLead do
+                return Text(text => "Do you want to sign out? The sign-in then ends in every application that hangs off this session.");
+            when LogoutSubmit do
+                return Text(text => "Sign out");
+            when MessageContinue do
+                return Text(text => "Go to the start page");
+            when NavAccount do
+                return Text(text => "Account");
+            when NavHome do
+                return Text(text => "Apps");
+            when NavLabel do
+                return Text(text => "Main menu");
+            when PasskeyCancelled do
+                return Text(text => "The passkey was not used. Please try again.");
+            when PasskeyCreate do
+                return Text(text => "Create the passkey");
+            when PasskeyCreateHint do
+                return Text(text => "Your browser now asks for the passkey. Confirm with fingerprint, face or PIN.");
+            when PasskeyUnsupported do
+                return Text(text => "This browser offers no passkeys.");
+            when PasskeyWorking do
+                return Text(text => "Waiting for the passkey ...");
+            when PasswordAgain do
+                return Text(text => "Repeat the new password");
+            when PasswordLead do
+                return Text(text => "You signed in with a one-time password. Please choose your own now.");
+            when PasswordNew do
+                return Text(text => "New password");
+            when PasswordRule do
+                return Text(text => "at least 12 characters");
+            when PasswordSubmit do
+                return Text(text => "Set password");
+            when PowDone do
+                return Text(text => "Browser check passed.");
+            when PowNoscript do
+                return Text(text => "Signing in needs JavaScript: the page runs a short browser check that keeps bots out. Please turn JavaScript on.");
+            when PowTimeout do
+                return Text(text => "The browser check took too long and was stopped. Please reload the page and try again.");
+            when PowUnsupported do
+                return Text(text => "This browser cannot run the browser check (it needs JavaScript, Web Workers and WebCrypto over HTTPS). Signing in is not possible with it.");
+            when PowWorking do
+                return Text(text => "This browser is running a short browser check that keeps bots out. It usually takes less than a second; after failed attempts or on a slow device longer, at most 2 minutes.");
+            when RenewLead do
+                return Text(text => "Scan the code with the new app. The current second factor stays valid until you confirm the new one.");
+            when TitleAccount do
+                return Text(text => "Your account");
+            when TitleConfirm do
+                return Text(text => "Please confirm");
+            when TitleError do
+                return Text(text => "That did not work");
+            when TitleHome do
+                return Text(text => "Your apps");
+            when TitleLoggedOut do
+                return Text(text => "Signed out");
+            when TitleLogin do
+                return Text(text => "Sign in");
+            when TitleLogout do
+                return Text(text => "Sign out");
+            when TitlePasskeyAdd do
+                return Text(text => "Add a passkey");
+            when TitlePassword do
+                return Text(text => "New password");
+            when TitleTotp do
+                return Text(text => "Second factor");
+            when TitleTotpRenew do
+                return Text(text => "Renew second factor");
+            when TotpCode do
+                return Text(text => "Code from the app");
+            when TotpLead do
+                return Text(text => "Set up the second factor now: scan the code with an authenticator app and enter the code it shows.");
+            when TotpManual do
+                return Text(text => "Or type the key in by hand:");
+            when TotpQrAlt do
+                return Text(text => "QR code for the authenticator app");
+            when TotpSubmit do
+                return Text(text => "Confirm");
+        end case;
+    end;
+
+    function german(key: Key): Message is
+        case key of
+            when AccountApp do
+                return Text(text => "App");
+            when AccountAppServer do
+                return Text(text => "App-Server");
+            when AccountBrowser do
+                return Text(text => "Browser");
+            when AccountCode do
+                return Text(text => "Aktueller Code aus der App");
+            when AccountDeviceIpNote do
+                return Text(text => "Bei Apps sind es die Adressen des Servers der App, nicht die Ihres Ger\u{e4}ts.");
+            when AccountEmail do
+                return Text(text => "E-Mail-Adresse");
+            when AccountEnd do
+                return Text(text => "Beenden");
+            when AccountId do
+                return Text(text => "Konto-ID");
+            when AccountLastSeen do
+                return Text(text => "Zuletzt genutzt (UTC) / letzte IP");
+            when AccountName do
+                return Text(text => "Name");
+            when AccountOldPassword do
+                return Text(text => "Aktuelles Passwort");
+            when AccountPasskeyAdd do
+                return Text(text => "Passkey hinzuf\u{fc}gen");
+            when AccountPasskeyAddHint do
+                return Text(text => "Ein neuer Passkey verlangt Ihr aktuelles Passwort und einen frischen Code.");
+            when AccountPasskeyCreated do
+                return Text(text => "Hinzugef\u{fc}gt");
+            when AccountPasskeyLabel do
+                return Text(text => "Name des Passkeys");
+            when AccountPasskeyLabelHint do
+                return Text(text => "Damit Sie das Ger\u{e4}t wiedererkennen, etwa Laptop oder Telefon.");
+            when AccountPasskeyLastUsed do
+                return Text(text => "Zuletzt verwendet");
+            when AccountPasskeyName do
+                return Text(text => "Name");
+            when AccountPasskeyNever do
+                return Text(text => "nie");
+            when AccountPasskeyNone do
+                return Text(text => "Noch kein Passkey.");
+            when AccountPasskeyRemove do
+                return Text(text => "Entfernen");
+            when AccountPasskeyRename do
+                return Text(text => "Umbenennen");
+            when AccountPasskeys do
+                return Text(text => "Passkeys");
+            when AccountPasskeysHint do
+                return Text(text => "Ein Passkey meldet Sie ohne Passwort und Code an: das Ger\u{e4}t pr\u{fc}ft Sie per Fingerabdruck, Gesicht oder PIN. Passwort und Code bleiben als Weg zur\u{fc}ck g\u{fc}ltig.");
+            when AccountPassword do
+                return Text(text => "Passwort \u{e4}ndern");
+            when AccountPasswordHint do
+                return Text(text => "Der Code gilt nur einmal. Haben Sie sich gerade mit ihm angemeldet, warten Sie auf den n\u{e4}chsten.");
+            when AccountPasswordSubmit do
+                return Text(text => "Passwort \u{e4}ndern");
+            when AccountReauthHint do
+                return Text(text => "Jede \u{c4}nderung hier verlangt Ihr aktuelles Passwort und einen frischen Code aus der Authenticator-App. Danach sind alle anderen Sitzungen und alle Apps abgemeldet.");
+            when AccountSessions do
+                return Text(text => "Angemeldete Browser");
+            when AccountSince do
+                return Text(text => "Seit (UTC) / erste IP");
+            when AccountThisSession do
+                return Text(text => "diese Sitzung");
+            when AccountTotp do
+                return Text(text => "Zweiter Faktor");
+            when AccountTotpHint do
+                return Text(text => "F\u{fc}r eine neue Authenticator-App. Sie scannen danach den neuen Code und best\u{e4}tigen ihn; bis dahin gilt der bisherige.");
+            when AccountTotpSubmit do
+                return Text(text => "Neu einrichten");
+            when BoundEnd do
+                return Text(text => "Abmelden");
+            when BoundSwitch do
+                return Text(text => "Zu {arg} wechseln");
+            when CommonCancel do
+                return Text(text => "Abbrechen");
+            when ConfirmDevice do
+                return Text(text => "Diese App wird abgemeldet und muss sich neu anmelden.");
+            when ConfirmEndSession do
+                return Text(text => "Sitzung beenden");
+            when ConfirmRevokeDevice do
+                return Text(text => "App abmelden");
+            when ConfirmSession do
+                return Text(text => "Diese Sitzung wird beendet. Die Anmeldung endet damit auch in allen Anwendungen, die an ihr h\u{e4}ngen.");
+            when ErrBanned do
+                return Text(text => "Zu viele Fehlversuche. Diese Adresse ist f\u{fc}r {arg} gesperrt.");
+            when ErrBusy do
+                return Text(text => "Gerade laufen zu viele Anmeldungen. Bitte in einigen Minuten erneut versuchen.");
+            when ErrCode do
+                return Text(text => "Der Code stimmt nicht. Bitte den aktuellen Code aus der App eingeben.");
+            when ErrCsrf do
+                return Text(text => "Das Formular ist abgelaufen. Bitte die Seite neu laden und noch einmal senden.");
+            when ErrForm do
+                return Text(text => "Das Formular war unvollst\u{e4}ndig.");
+            when ErrInvalid do
+                return Text(text => "E-Mail-Adresse, Passwort oder Code stimmen nicht.");
+            when ErrLocked do
+                return Text(text => "Dieses Konto ist gesperrt. Bitte wenden Sie sich an die Verwaltung.");
+            when ErrMismatch do
+                return Text(text => "Die beiden neuen Passw\u{f6}rter sind nicht gleich.");
+            when ErrNotFound do
+                return Text(text => "Das gibt es nicht (mehr).");
+            when ErrPasskey do
+                return Text(text => "Der Passkey wurde nicht angenommen.");
+            when ErrPasskeyAdd do
+                return Text(text => "Der Passkey konnte nicht hinzugef\u{fc}gt werden. Bitte neu beginnen.");
+            when ErrPasskeyGone do
+                return Text(text => "Diesen Passkey gibt es nicht.");
+            when ErrPasskeyKnown do
+                return Text(text => "Dieser Passkey ist schon registriert.");
+            when ErrPasskeyLabel do
+                return Text(text => "Bitte einen Namen mit h\u{f6}chstens 64 Zeichen.");
+            when ErrPasskeyMany do
+                return Text(text => "Dieses Konto hat schon die meisten Passkeys, die es haben darf (20).");
+            when ErrPow do
+                return Text(text => "Die Browserpr\u{fc}fung fehlte oder ist abgelaufen. Bitte noch einmal anmelden.");
+            when ErrPowHarder do
+                return Text(text => "Nach mehreren Fehlversuchen ist eine aufwendigere Browserpr\u{fc}fung n\u{f6}tig. Bitte noch einmal anmelden.");
+            when ErrReauth do
+                return Text(text => "Passwort oder Code stimmen nicht. Ein Code gilt nur einmal: bitte den n\u{e4}chsten abwarten.");
+            when ErrRenewal do
+                return Text(text => "Die Erneuerung ist abgelaufen. Bitte noch einmal beginnen.");
+            when ErrRequest do
+                return Text(text => "Diese Anmeldung ist abgelaufen oder geh\u{f6}rt zu einem anderen Browser. Bitte in der Anwendung neu beginnen.");
+            when ErrSession do
+                return Text(text => "Sie sind nicht (mehr) angemeldet.");
+            when ErrTemporary do
+                return Text(text => "Vor\u{fc}bergehender Fehler. Bitte noch einmal versuchen.");
+            when ErrThrottled do
+                return Text(text => "Zu viele Fehlversuche. Bitte in {arg} erneut versuchen.");
+            when ErrWeak do
+                return Text(text => "Das Passwort ist zu schwach: mindestens 12 Zeichen, nicht die E-Mail-Adresse.");
+            when FooterAcronym do
+                return Text(text => "Rights, Accounts, Multi-factor, Bearer tokens & OAuth");
+            when FooterAuthor do
+                return Text(text => "Heiko Zimmermann");
+            when FooterCopyright do
+                return Text(text => "(c) 2026");
+            when HomeBound do
+                return Text(text => "Angemeldete Apps");
+            when HomeBoundHint do
+                return Text(text => "Apps, denen diese Anmeldung weitergegeben wurde.");
+            when HomeNoApps do
+                return Text(text => "F\u{fc}r Ihr Konto sind noch keine Apps eingerichtet.");
+            when HomeNoBound do
+                return Text(text => "Keine App angemeldet.");
+            when InfoDoneDevice do
+                return Text(text => "Die App ist abgemeldet.");
+            when InfoDonePassword do
+                return Text(text => "Das Passwort ist ge\u{e4}ndert. Ihre anderen Sitzungen und alle Apps sind abgemeldet.");
+            when InfoDoneSession do
+                return Text(text => "Die Sitzung ist beendet.");
+            when InfoDoneTotp do
+                return Text(text => "Der neue zweite Faktor gilt ab sofort; der alte nicht mehr. Ihre anderen Sitzungen und alle Apps sind abgemeldet.");
+            when InfoLoggedOut do
+                return Text(text => "Sie sind abgemeldet.");
+            when InfoNotSignedIn do
+                return Text(text => "Sie sind nicht angemeldet.");
+            when InfoPasskeyAdded do
+                return Text(text => "Der Passkey wurde hinzugef\u{fc}gt.");
+            when InfoPasskeyRemoved do
+                return Text(text => "Der Passkey wurde entfernt.");
+            when InfoPasskeyRenamed do
+                return Text(text => "Der Passkey wurde umbenannt.");
+            when InfoRestarted do
+                return Text(text => "Ihre vorherige Anmeldung war abgelaufen. Bitte melden Sie sich noch einmal an.");
+            when LangDe do
+                return Text(text => "Deutsch");
+            when LangDeShort do
+                return Text(text => "DE");
+            when LangEn do
+                return Text(text => "English");
+            when LangEnShort do
+                return Text(text => "EN");
+            when LangLabel do
+                return Text(text => "Sprache");
+            when LoginCode do
+                return Text(text => "Code");
+            when LoginCodeHint do
+                return Text(text => "aus der Authenticator-App, sobald eingerichtet");
+            when LoginEmail do
+                return Text(text => "E-Mail-Adresse");
+            when LoginFor do
+                return Text(text => "Anmeldung f\u{fc}r");
+            when LoginPasskey do
+                return Text(text => "Mit Passkey anmelden");
+            when LoginPasskeyOr do
+                return Text(text => "oder mit Passwort und Code");
+            when LoginPassword do
+                return Text(text => "Passwort");
+            when LoginReauth do
+                return Text(text => "Die Anwendung verlangt eine frische Anmeldung.");
+            when LoginSubmit do
+                return Text(text => "Anmelden");
+            when LogoutLead do
+                return Text(text => "M\u{f6}chten Sie sich abmelden? Die Anmeldung endet dann in allen Anwendungen, die an dieser Sitzung h\u{e4}ngen.");
+            when LogoutSubmit do
+                return Text(text => "Abmelden");
+            when MessageContinue do
+                return Text(text => "Zur Startseite");
+            when NavAccount do
+                return Text(text => "Konto");
+            when NavHome do
+                return Text(text => "Apps");
+            when NavLabel do
+                return Text(text => "Hauptmen\u{fc}");
+            when PasskeyCancelled do
+                return Text(text => "Der Passkey wurde nicht verwendet. Bitte noch einmal versuchen.");
+            when PasskeyCreate do
+                return Text(text => "Passkey erstellen");
+            when PasskeyCreateHint do
+                return Text(text => "Ihr Browser fragt jetzt nach dem Passkey. Best\u{e4}tigen Sie per Fingerabdruck, Gesicht oder PIN.");
+            when PasskeyUnsupported do
+                return Text(text => "Dieser Browser bietet keine Passkeys an.");
+            when PasskeyWorking do
+                return Text(text => "Warte auf den Passkey ...");
+            when PasswordAgain do
+                return Text(text => "Neues Passwort wiederholen");
+            when PasswordLead do
+                return Text(text => "Sie haben sich mit einem Einmal-Passwort angemeldet. Bitte legen Sie jetzt Ihr eigenes fest.");
+            when PasswordNew do
+                return Text(text => "Neues Passwort");
+            when PasswordRule do
+                return Text(text => "mindestens 12 Zeichen");
+            when PasswordSubmit do
+                return Text(text => "Passwort festlegen");
+            when PowDone do
+                return Text(text => "Browserpr\u{fc}fung abgeschlossen.");
+            when PowNoscript do
+                return Text(text => "Die Anmeldung braucht JavaScript: die Seite f\u{fc}hrt eine kurze Browserpr\u{fc}fung durch, die Bots fernh\u{e4}lt. Bitte JavaScript einschalten.");
+            when PowTimeout do
+                return Text(text => "Die Browserpr\u{fc}fung hat zu lange gedauert und wurde abgebrochen. Bitte die Seite neu laden und es noch einmal versuchen.");
+            when PowUnsupported do
+                return Text(text => "Dieser Browser kann die Browserpr\u{fc}fung nicht durchf\u{fc}hren (n\u{f6}tig sind JavaScript, Web Worker und WebCrypto \u{fc}ber HTTPS). Eine Anmeldung ist damit nicht m\u{f6}glich.");
+            when PowWorking do
+                return Text(text => "Dieser Browser f\u{fc}hrt eine kurze Browserpr\u{fc}fung durch, die Bots fernh\u{e4}lt. Das dauert meist unter einer Sekunde, nach Fehlversuchen oder auf langsamen Ger\u{e4}ten l\u{e4}nger, h\u{f6}chstens 2 Minuten.");
+            when RenewLead do
+                return Text(text => "Scannen Sie den Code mit der neuen App. Der bisherige zweite Faktor gilt, bis Sie den neuen best\u{e4}tigt haben.");
+            when TitleAccount do
+                return Text(text => "Ihr Konto");
+            when TitleConfirm do
+                return Text(text => "Bitte best\u{e4}tigen");
+            when TitleError do
+                return Text(text => "Das hat nicht geklappt");
+            when TitleHome do
+                return Text(text => "Ihre Apps");
+            when TitleLoggedOut do
+                return Text(text => "Abgemeldet");
+            when TitleLogin do
+                return Text(text => "Anmelden");
+            when TitleLogout do
+                return Text(text => "Abmelden");
+            when TitlePasskeyAdd do
+                return Text(text => "Passkey hinzuf\u{fc}gen");
+            when TitlePassword do
+                return Text(text => "Neues Passwort");
+            when TitleTotp do
+                return Text(text => "Zweiter Faktor");
+            when TitleTotpRenew do
+                return Text(text => "Zweiten Faktor erneuern");
+            when TotpCode do
+                return Text(text => "Code aus der App");
+            when TotpLead do
+                return Text(text => "Richten Sie jetzt den zweiten Faktor ein: Scannen Sie den Code mit einer Authenticator-App und geben Sie den angezeigten Code ein.");
+            when TotpManual do
+                return Text(text => "Oder den Schl\u{fc}ssel von Hand eingeben:");
+            when TotpQrAlt do
+                return Text(text => "QR-Code f\u{fc}r die Authenticator-App");
+            when TotpSubmit do
+                return Text(text => "Best\u{e4}tigen");
+        end case;
+    end;
+
+    function others(i: Index): Option[Language[Key]] is
+        if i = 0 then
+            return Some(value => Language(code => "de", texts => german, plural => germanPlural));
+        end if;
+        return None();
+    end;
+
+    function messages(): Catalog[Key] is
+        return Catalog(default => Language(code => "en", texts => english, plural => englishPlural),
+            others => others);
+    end;
+end module body.

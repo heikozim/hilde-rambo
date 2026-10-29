@@ -1,0 +1,357 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQL of its own over Standard.Database: every statement is a constant,
+-- every value is bound.  Putting a step counts the live ones and writes in
+-- one transaction, so two sign-ins at once cannot both take the last place.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring
+);
+import Standard.Base64 (
+    encodeUnpadded,
+    decodeUnpadded,
+    encodeUrl
+);
+import Standard.Libcrypto (
+    sha256
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Transaction,
+    noValues,
+    withInt64,
+    withText,
+    begin,
+    commit,
+    rollback,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    finish
+);
+import Wolly.Fernet (
+    sealFernet,
+    openFernet
+);
+import Wolly.OpRandom (
+    tokenHash
+);
+
+module body Rambo.Steps is
+    constant makeTable: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS rambo_steps (key TEXT PRIMARY KEY, account TEXT NOT NULL, req TEXT NOT NULL, amr TEXT NOT NULL, need_password INTEGER NOT NULL, need_totp INTEGER NOT NULL, totp_secret TEXT NOT NULL, totp_uri TEXT NOT NULL, expires INTEGER NOT NULL) STRICT";
+    constant dropOld: Span[Nat8, Static] := "DELETE FROM rambo_steps WHERE expires <= ?";
+    constant countLive: Span[Nat8, Static] := "SELECT count(*), coalesce(sum(key = ?), 0) FROM rambo_steps";
+    constant putRow: Span[Nat8, Static] := "INSERT INTO rambo_steps (key, account, req, amr, need_password, need_totp, totp_secret, totp_uri, expires) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (key) DO UPDATE SET account = excluded.account, req = excluded.req, amr = excluded.amr, need_password = excluded.need_password, need_totp = excluded.need_totp, totp_secret = excluded.totp_secret, totp_uri = excluded.totp_uri, expires = excluded.expires";
+    constant readRow: Span[Nat8, Static] := "SELECT account, req, amr, need_password, need_totp, totp_secret, totp_uri FROM rambo_steps WHERE key = ? AND expires > ?";
+    constant changeRow: Span[Nat8, Static] := "UPDATE rambo_steps SET account = ?, req = ?, amr = ?, need_password = ?, need_totp = ?, totp_secret = ?, totp_uri = ? WHERE key = ? AND expires > ?";
+    constant dropRow: Span[Nat8, Static] := "DELETE FROM rambo_steps WHERE key = ?";
+
+    function stepSeconds(): Int64 is
+        return 600;
+    end;
+
+    function mostSteps(): Int64 is
+        return 1024;
+    end;
+
+    function destroyStep(step: Step): Unit is
+        let { account: String, req: String, amr: String, needPassword: Bool, needTotp: Bool, totpSecret: String,
+            totpUri: String } := step;
+        destroyString(account);
+        destroyString(req);
+        destroyString(amr);
+        destroyString(totpSecret);
+        destroyString(totpUri);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function prepareSteps(db: &![Database[Writing], R]): Option[DbError] is
+        case execute(&~db, makeTable, noValues()) of
+            when Right(right as changed: Nat64) do
+                return None();
+            when Left(left as error: DbError) do
+                return Some(value => error);
+        end case;
+    end;
+
+    function flag(b: Bool): Int64 is
+        if b then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    -- The secret sealed under totpKey in standard Base64, empty for an empty
+    -- secret; None when it does not seal.
+    generic [S: Region, T: Region]
+    function sealed(secret: Span[Nat8, S], totpKey: Span[Nat8, T], now: Int64): Option[String] is
+        if spanLength(secret) = 0 then
+            return Some(value => fromSpan(""));
+        end if;
+        case sealFernet(totpKey, secret, now) of
+            when Some(value as token: String) do
+                let text: String := encodeUnpadded(asSpan(&token));
+                destroyString(token);
+                return Some(value => text);
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- The secret of a sealed text, empty for an empty text; None when it
+    -- does not open.
+    generic [S: Region, T: Region]
+    function opened(text: Span[Nat8, S], totpKey: Span[Nat8, T]): Option[String] is
+        if spanLength(text) = 0 then
+            return Some(value => fromSpan(""));
+        end if;
+        case decodeUnpadded(text) of
+            when Some(value as token: String) do
+                let secret: Option[String] := openFernet(totpKey, asSpan(&token));
+                destroyString(token);
+                return secret;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [S: Region]
+    function accountOf(step: &[Step, S]): Span[Nat8, S] is
+        return asSpan(&(step->account));
+    end;
+
+    generic [S: Region]
+    function reqOf(step: &[Step, S]): Span[Nat8, S] is
+        return asSpan(&(step->req));
+    end;
+
+    generic [S: Region]
+    function amrOf(step: &[Step, S]): Span[Nat8, S] is
+        return asSpan(&(step->amr));
+    end;
+
+    generic [S: Region]
+    function secretOf(step: &[Step, S]): Span[Nat8, S] is
+        return asSpan(&(step->totpSecret));
+    end;
+
+    generic [S: Region]
+    function uriOf(step: &[Step, S]): Span[Nat8, S] is
+        return asSpan(&(step->totpUri));
+    end;
+
+    -- The number of live steps and whether key is one of them, after the
+    -- steps that ran out at now are gone.
+    record Census: Free is
+        live: Int64;
+        present: Bool;
+    end;
+
+    generic [R: Region, K: Region]
+    function census(db: &![Database[Writing], R], key: Span[Nat8, K], now: Int64): Either[DbError, Census] is
+        case execute(&~db, dropOld, withInt64(noValues(), now)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as dropped: Nat64) do
+                skip;
+        end case;
+        var cursor: Cursor := start(&~db, countLive, withText(noValues(), key));
+        var live: Int64 := 0;
+        var mine: Int64 := 0;
+        if advance(&!cursor) then
+            live := columnInt64(&cursor, 0);
+            mine := columnInt64(&cursor, 1);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => Census(live => live, present => mine > 0));
+        end case;
+    end;
+
+    -- The work of putStep inside its transaction.
+    generic [R: Region, K: Region, S: Region, E: Region]
+    function placed(db: &![Database[Writing], R], key: Span[Nat8, K], step: &[Step, S], secret: Span[Nat8, E],
+        now: Int64): Either[DbError, Bool] is
+        case census(&~db, key, now) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as counted: Census) do
+                if (not counted.present) and (counted.live >= mostSteps()) then
+                    return Right(right => false);
+                end if;
+        end case;
+        case execute(&~db, putRow, withInt64(withText(withText(withInt64(withInt64(withText(withText(withText(withText(noValues(),
+            key), accountOf(step)), reqOf(step)), amrOf(step)), flag(step->needPassword)), flag(step->needTotp)), secret),
+            uriOf(step)), now + stepSeconds())) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as changed: Nat64) do
+                return Right(right => true);
+        end case;
+    end;
+
+    generic [R: Region, K: Region, S: Region, T: Region]
+    function putStep(db: &![Database[Writing], R], key: Span[Nat8, K], step: &[Step, S], totpKey: Span[Nat8, T],
+        now: Int64): Either[DbError, Bool] is
+        case sealed(secretOf(step), totpKey, now) of
+            when None do
+                return Right(right => false);
+            when Some(value as secret: String) do
+                case begin(&~db) of
+                    when Left(left as error: DbError) do
+                        destroyString(secret);
+                        return Left(left => error);
+                    when Right(right as open: Transaction) do
+                        let result: Either[DbError, Bool] := placed(&~db, key, step, asSpan(&secret), now);
+                        destroyString(secret);
+                        case result of
+                            when Left(left as error: DbError) do
+                                rollback(&~db, open);
+                                return Left(left => error);
+                            when Right(right as done: Bool) do
+                                case commit(&~db, open) of
+                                    when Left(left as error: DbError) do
+                                        return Left(left => error);
+                                    when Right(right as ok: Unit) do
+                                        return Right(right => done);
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- The text of column i of the row cursor stands on.
+    generic [C: Region]
+    function textAt(cursor: &[Cursor, C], i: Int32): String is
+        return fromSpan(columnText(cursor, i));
+    end;
+
+    -- The step of the row cursor stands on, None when it has no row or its
+    -- secret does not open.
+    generic [C: Region, T: Region]
+    function firstStep(cursor: &[Cursor, C], hasRow: Bool, totpKey: Span[Nat8, T]): Option[Step] is
+        if not hasRow then
+            let none: Option[Step] := None();
+            return none;
+        end if;
+        let sealedText: String := textAt(cursor, 5);
+        let secret: Option[String] := opened(asSpan(&sealedText), totpKey);
+        destroyString(sealedText);
+        case secret of
+            when Some(value as plain: String) do
+                return Some(value => Step(account => textAt(cursor, 0), req => textAt(cursor, 1),
+                    amr => textAt(cursor, 2), needPassword => columnInt64(cursor, 3) /= 0,
+                    needTotp => columnInt64(cursor, 4) /= 0, totpSecret => plain, totpUri => textAt(cursor, 6)));
+            when None do
+                let none: Option[Step] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region, K: Region, T: Region]
+    function stepOf(db: &![Database[Writing], R], key: Span[Nat8, K], totpKey: Span[Nat8, T],
+        now: Int64): Either[DbError, Option[Step]] is
+        var cursor: Cursor := start(&~db, readRow, withInt64(withText(noValues(), key), now));
+        let hasRow: Bool := advance(&!cursor);
+        let found: Option[Step] := firstStep(&cursor, hasRow, totpKey);
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                case found of
+                    when Some(value as step: Step) do
+                        destroyStep(step);
+                    when None do
+                        skip;
+                end case;
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+
+    generic [R: Region, K: Region, S: Region, T: Region]
+    function updateStep(db: &![Database[Writing], R], key: Span[Nat8, K], step: &[Step, S], totpKey: Span[Nat8, T],
+        now: Int64): Either[DbError, Bool] is
+        case sealed(secretOf(step), totpKey, now) of
+            when None do
+                return Right(right => false);
+            when Some(value as secret: String) do
+                let result: Either[DbError, Nat64] := execute(&~db, changeRow, withInt64(withText(withText(withText(
+                    withInt64(withInt64(withText(withText(withText(noValues(), accountOf(step)), reqOf(step)), amrOf(step)),
+                        flag(step->needPassword)), flag(step->needTotp)), asSpan(&secret)), uriOf(step)), key), now));
+                destroyString(secret);
+                case result of
+                    when Left(left as error: DbError) do
+                        return Left(left => error);
+                    when Right(right as changed: Nat64) do
+                        return Right(right => changed > 0);
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, K: Region]
+    function dropStep(db: &![Database[Writing], R], key: Span[Nat8, K]): Option[DbError] is
+        case execute(&~db, dropRow, withText(noValues(), key)) of
+            when Right(right as changed: Nat64) do
+                return None();
+            when Left(left as error: DbError) do
+                return Some(value => error);
+        end case;
+    end;
+
+    generic [S: Region]
+    function renewKey(sid: Span[Nat8, S]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "renew:");
+        writeString(&!b, sid);
+        let text: String := finalize(b);
+        let key: String := tokenHash(asSpan(&text));
+        destroyString(text);
+        return key;
+    end;
+
+    generic [C: Region]
+    function stepForm(cookie: Span[Nat8, C]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "rambo login step form\u{0}");
+        writeString(&!b, cookie);
+        let text: String := finalize(b);
+        let digest: Option[String] := sha256(asSpan(&text));
+        destroyString(text);
+        case digest of
+            when Some(value as sum: String) do
+                let padded: String := encodeUrl(asSpan(&sum));
+                destroyString(sum);
+                let form: String := fromSpan(substring(asSpan(&padded), 0, 43));
+                destroyString(padded);
+                return form;
+            when None do
+                abort("libcrypto gave no SHA-256 for the step form token");
+        end case;
+    end;
+end module body.

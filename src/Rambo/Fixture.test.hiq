@@ -1,0 +1,540 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- What the earlier Go provider wrote is read here by the modules rambo is built on: the
+-- vault, the signing keys and their key set, the tokens, the password
+-- hashes and the sealed secrets of the second factor.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Buffer (
+    Buffer,
+    length as bufferLength
+);
+import Standard.Text (
+    equal,
+    contains
+);
+import Standard.Base64 (
+    decode,
+    decodeUnpadded
+);
+import Standard.Time (
+    wallNanos
+);
+import Standard.Otp (
+    OtpSha1,
+    totp
+);
+import Standard.Base32 (
+    decodeBase32
+);
+import Standard.Vault (
+    Vault,
+    VaultError,
+    openVault,
+    closeVault,
+    getSecret
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    closeDatabase,
+    noValues,
+    withText,
+    start,
+    advance,
+    columnText,
+    finish
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Wolly.Fernet (
+    openFernet
+);
+import Wolly.OpKey (
+    RingKey,
+    Verified,
+    destroyRing,
+    destroyVerified,
+    keySet,
+    publicJwk,
+    verify,
+    loadRing
+);
+import Wolly.Account (
+    SignIn,
+    WrongProof,
+    LockedOut,
+    Passed,
+    destroySignIn,
+    checkPassword,
+    signIn
+);
+import Standard.Buffer (
+    allocateEmpty,
+    insertBack,
+    nthRef
+);
+import Wolly.OpKey (
+    MlDsa,
+    activeKey,
+    signToken
+);
+import Wolly.OpToken (
+    IdClaims,
+    AccessClaims,
+    destroyIdClaims,
+    destroyAccessClaims,
+    idTokenPayload,
+    accessTokenPayload
+);
+import Wolly.Pow (
+    PowCheck,
+    powReason,
+    preparePow,
+    checkPuzzle
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Rambo.Fixture (
+    fixtureVault,
+    fixturePepper,
+    fixtureDatabase,
+    expected,
+    expectedNumber
+);
+
+module body Rambo.Fixture.Test is
+    function value(name: Span[Nat8, Static]): String is
+        case expected(name) of
+            when Some(value as found: String) do
+                return found;
+            when None do
+                abort("expected.json lacks a member");
+        end case;
+    end;
+
+    function nowSeconds(): Int64 is
+        case toInt64(wallNanos() / 1000000000) of
+            when Some(value as seconds: Int64) do
+                return seconds;
+            when None do
+                abort("the clock is out of range");
+        end case;
+    end;
+
+    function openFixtureVault(): Vault is
+        case openVault(fixtureVault(), fixturePepper(), "RAMBO_FERNET_KEY") of
+            when Right(right as vault: Vault) do
+                return vault;
+            when Left(left as error: VaultError) do
+                abort("the vault of the Go provider does not open");
+        end case;
+    end;
+
+    function openFixtureDatabase(): Database[Writing] is
+        case openSqlite(fixtureDatabase()) of
+            when Right(right as db: Database[Writing]) do
+                return db;
+            when Left(left as error: DbError) do
+                abort("the database of the Go provider does not open");
+        end case;
+    end;
+
+    -- The column column of the account id.
+    generic [R: Region, I: Region]
+    function accountColumn(db: &![Database[Writing], R], sql: Span[Nat8, Static], id: Span[Nat8, I]): String is
+        var cursor: Cursor := start(&~db, sql, withText(noValues(), id));
+        var found: String := fromSpan("");
+        if advance(&!cursor) then
+            destroyString(found);
+            found := fromSpan(columnText(&cursor, 0));
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyString(found);
+                abort("a column is not read");
+            when None do
+                return found;
+        end case;
+    end;
+
+    function testVaultSecrets(): Unit is
+        let vault: Vault := openFixtureVault();
+        case getSecret(&vault, "RAMBO_PASSWORD_PEPPER") of
+            when Right(right as pepper: String) do
+                let want: String := value("pepper");
+                assertTrue(equal(asSpan(&pepper), asSpan(&want)), "the pepper of the Go provider's vault is read");
+                destroyString(want);
+                destroyString(pepper);
+            when Left(left as error: VaultError) do
+                assertTrue(false, "the pepper is in the vault");
+        end case;
+        closeVault(vault);
+        return nil;
+    end;
+
+    function testKeySet(): Unit is
+        let vault: Vault := openFixtureVault();
+        case loadRing(&vault, "RAMBO_SIGNING_KEY_") of
+            when Right(right as ring: Buffer[RingKey]) do
+                assertTrue(bufferLength(&ring) = 2, "the two keys of ML-DSA-44; the RSA key stays out");
+                let keys: String := keySet(&ring);
+                let want: String := value("jwks");
+                assertTrue(everyKeyIn(&ring, asSpan(&want)), "every key is the Go provider's, byte for byte");
+                assertFalse(contains(asSpan(&keys), "\"kty\":\"RSA\""), "no RSA key is published");
+                assertTrue(contains(asSpan(&want), "\"kty\":\"RSA\""), "the control: the Go provider published one");
+                destroyString(want);
+                destroyString(keys);
+                let idToken: String := value("id_token");
+                let payload: String := value("id_payload");
+                case verify(asSpan(&idToken), &ring) of
+                    when Some(value as found: Verified) do
+                        assertTrue(equal(typOf(&found), "JWT"), "the ID token of the Go provider is a JWT");
+                        assertTrue(equal(payloadOf(&found), asSpan(&payload)), "its payload is the Go provider's");
+                        destroyVerified(found);
+                    when None do
+                        assertTrue(false, "the ID token of the Go provider verifies");
+                end case;
+                destroyString(payload);
+                destroyString(idToken);
+                let gitea: String := value("gitea_token");
+                case verify(asSpan(&gitea), &ring) of
+                    when Some(value as found: Verified) do
+                        assertTrue(false, "the RS256 token of the Go provider is refused");
+                        destroyVerified(found);
+                    when None do
+                        skip;
+                end case;
+                destroyString(gitea);
+                destroyRing(ring);
+            when Left(left as error: VaultError) do
+                assertTrue(false, "the ring of the Go provider is loaded");
+        end case;
+        closeVault(vault);
+        return nil;
+    end;
+
+    generic [V: Region]
+    function typOf(found: &[Verified, V]): Span[Nat8, V] is
+        return asSpan(&(found->typ));
+    end;
+
+    generic [V: Region]
+    function payloadOf(found: &[Verified, V]): Span[Nat8, V] is
+        return asSpan(&(found->payload));
+    end;
+
+    function pepperBytes(): String is
+        let text: String := value("pepper");
+        case decode(asSpan(&text)) of
+            when Some(value as raw: String) do
+                destroyString(text);
+                return raw;
+            when None do
+                destroyString(text);
+                abort("the pepper is no Base64");
+        end case;
+    end;
+
+    function testPasswordHash(): Unit is
+        var db: Database[Writing] := openFixtureDatabase();
+        let id: String := value("alice_id");
+        let hash: String := accountColumn(&!db, "SELECT password_hash FROM accounts WHERE id = ?", asSpan(&id));
+        let pepper: String := pepperBytes();
+        let password: String := value("alice_password");
+        assertTrue(checkPassword(asSpan(&password), asSpan(&hash), asSpan(&pepper)), "the Go provider's hash of the password holds");
+        assertFalse(checkPassword("correct horse battery stapler", asSpan(&hash), asSpan(&pepper)), "another password does not");
+        destroyString(password);
+        destroyString(pepper);
+        destroyString(hash);
+        destroyString(id);
+        closeDatabase(db);
+        return nil;
+    end;
+
+    function testSealedSecret(): Unit is
+        var db: Database[Writing] := openFixtureDatabase();
+        let id: String := value("alice_id");
+        let sealed: String := accountColumn(&!db, "SELECT totp_secret FROM accounts WHERE id = ?", asSpan(&id));
+        let key: String := value("totp_key");
+        let secret: String := value("alice_totp_secret");
+        case decodeUnpadded(asSpan(&sealed)) of
+            when Some(value as token: String) do
+                case openFernet(asSpan(&key), asSpan(&token)) of
+                    when Some(value as opened: String) do
+                        assertTrue(equal(asSpan(&opened), asSpan(&secret)), "the sealed secret of the Go provider opens");
+                        destroyString(opened);
+                    when None do
+                        assertTrue(false, "the sealed secret opens");
+                end case;
+                destroyString(token);
+            when None do
+                assertTrue(false, "the sealed secret is Base64");
+        end case;
+        destroyString(secret);
+        destroyString(key);
+        destroyString(sealed);
+        destroyString(id);
+        closeDatabase(db);
+        return nil;
+    end;
+
+    -- The code of the second factor of secret at now.
+    generic [S: Region]
+    function codeOf(secret: Span[Nat8, S], now: Int64): String is
+        case decodeBase32(secret) of
+            when Some(value as key: String) do
+                case totp(asSpan(&key), now, 30, 6, OtpSha1()) of
+                    when Some(value as code: String) do
+                        destroyString(key);
+                        return code;
+                    when None do
+                        destroyString(key);
+                        abort("no code");
+                end case;
+            when None do
+                abort("the secret is no base32");
+        end case;
+    end;
+
+    function testSignIn(): Unit is
+        var db: Database[Writing] := openFixtureDatabase();
+        let pepper: String := pepperBytes();
+        let key: String := value("totp_key");
+        let secret: String := value("alice_totp_secret");
+        let password: String := value("alice_password");
+        let now: Int64 := nowSeconds();
+        let code: String := codeOf(asSpan(&secret), now);
+        case signIn(&!db, "Alice@Example.com", asSpan(&password), asSpan(&code), asSpan(&pepper), asSpan(&key), now) of
+            when Right(right as outcome: SignIn) do
+                case outcome of
+                    when Passed(account: String, amr: String, mustChangePassword: Bool, needsTotp: Bool) do
+                        let id: String := value("alice_id");
+                        assertTrue(equal(asSpan(&account), asSpan(&id)), "Alice signs in with the Go provider's password and code");
+                        assertTrue(equal(asSpan(&amr), "pwd otp mfa"), "with password and second factor");
+                        assertFalse(mustChangePassword or needsTotp, "and owes nothing");
+                        destroyString(id);
+                        destroyString(account);
+                        destroyString(amr);
+                    when WrongProof do
+                        assertTrue(false, "Alice's proof holds");
+                    when LockedOut do
+                        assertTrue(false, "Alice is not locked");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "the sign-in reads the database");
+        end case;
+        case signIn(&!db, "alice@example.com", asSpan(&password), asSpan(&code), asSpan(&pepper), asSpan(&key), now) of
+            when Right(right as outcome: SignIn) do
+                case outcome of
+                    when WrongProof do
+                        skip;
+                    when LockedOut do
+                        assertTrue(false, "a code taken once is refused, not locked");
+                    when Passed(account: String, amr: String, mustChangePassword: Bool, needsTotp: Bool) do
+                        assertTrue(false, "a code taken once is refused");
+                        destroyString(account);
+                        destroyString(amr);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "the second sign-in reads the database");
+        end case;
+        destroyString(code);
+        let bob: String := value("bob_password");
+        case signIn(&!db, "bob@example.com", asSpan(&bob), "", asSpan(&pepper), asSpan(&key), now) of
+            when Right(right as outcome: SignIn) do
+                case outcome of
+                    when Passed(account: String, amr: String, mustChangePassword: Bool, needsTotp: Bool) do
+                        assertTrue(equal(asSpan(&amr), "pwd"), "Bob has only a password");
+                        assertTrue(mustChangePassword and needsTotp, "Bob owes a new password and a second factor");
+                        destroyString(account);
+                        destroyString(amr);
+                    when WrongProof do
+                        assertTrue(false, "Bob's one-time password holds");
+                    when LockedOut do
+                        assertTrue(false, "Bob is not locked");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "Bob's sign-in reads the database");
+        end case;
+        destroyString(bob);
+        case signIn(&!db, "carol@example.com", "carol has a long password", "", asSpan(&pepper), asSpan(&key), now) of
+            when Right(right as outcome: SignIn) do
+                case outcome of
+                    when LockedOut do
+                        skip;
+                    when WrongProof do
+                        assertTrue(false, "Carol's password holds");
+                    when Passed(account: String, amr: String, mustChangePassword: Bool, needsTotp: Bool) do
+                        assertTrue(false, "Carol is locked");
+                        destroyString(account);
+                        destroyString(amr);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "Carol's sign-in reads the database");
+        end case;
+        case signIn(&!db, "nobody@example.com", "whatever it is here", "", asSpan(&pepper), asSpan(&key), now) of
+            when Right(right as outcome: SignIn) do
+                case outcome of
+                    when WrongProof do
+                        skip;
+                    when LockedOut do
+                        assertTrue(false, "nobody is no account");
+                    when Passed(account: String, amr: String, mustChangePassword: Bool, needsTotp: Bool) do
+                        assertTrue(false, "nobody is no account");
+                        destroyString(account);
+                        destroyString(amr);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "an unknown sign-in reads the database");
+        end case;
+        destroyString(password);
+        destroyString(secret);
+        destroyString(key);
+        destroyString(pepper);
+        closeDatabase(db);
+        return nil;
+    end;
+
+    -- A puzzle powkit gave out with the key of the earlier Go provider and its answer.
+    function testGoPuzzle(): Unit is
+        let keyText: String := value("pow_key");
+        let token: String := value("pow_token");
+        let nonce: String := value("pow_nonce");
+        var expires: Int64 := 0;
+        case expectedNumber("pow_expires") of
+            when Some(value as n: Int64) do
+                expires := n;
+            when None do
+                assertTrue(false, "the end of the puzzle is known");
+        end case;
+        case decode(asSpan(&keyText)) of
+            when Some(value as key: String) do
+                case openTestDatabase() of
+                    when Right(right as opened: Database[Writing]) do
+                        var db: Database[Writing] := opened;
+                        case preparePow(&!db) of
+                            when Some(value as error: DbError) do
+                                assertTrue(false, "the table of spent puzzles");
+                            when None do
+                                skip;
+                        end case;
+                        case checkPuzzle(&!db, asSpan(&key), asSpan(&token), asSpan(&nonce), "request-1", 8, expires - 1) of
+                            when Right(right as check: PowCheck) do
+                                assertTrue(spanLength(powReason(check)) = 0, "powkit's puzzle and answer hold");
+                            when Left(left as error: DbError) do
+                                assertTrue(false, "the puzzle is checked");
+                        end case;
+                        closeDatabase(db);
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "a test database");
+                end case;
+                destroyString(key);
+            when None do
+                assertTrue(false, "the key of the puzzle is Base64");
+        end case;
+        destroyString(keyText);
+        destroyString(token);
+        destroyString(nonce);
+        return nil;
+    end;
+
+    function roles(): Buffer[String] is
+        var all: Buffer[String] := allocateEmpty();
+        insertBack(&!all, fromSpan("admin"));
+        insertBack(&!all, fromSpan("editor"));
+        return all;
+    end;
+
+    -- Whether the JWK of every key of ring stands in the key set want.
+    generic [K: Region, W: Region]
+    function everyKeyIn(ring: &[Buffer[RingKey], K], want: Span[Nat8, W]): Bool is
+        var i: Index := 0;
+        while i < bufferLength(ring) do
+            let jwk: String := publicJwk(nthRef(ring, i));
+            let there: Bool := contains(want, asSpan(&jwk));
+            destroyString(jwk);
+            if not there then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return bufferLength(ring) > 0;
+    end;
+
+    -- Signs payload with the active key of the ring and prints it with kind
+    -- for the token check of the Go provider.
+    generic [K: Region, P: Region]
+    function printSigned(ring: &[Buffer[RingKey], K], typ: Span[Nat8, Static], kind: Span[Nat8, Static],
+        payload: Span[Nat8, P]): Unit is
+        let found: Option[Index] := activeKey(ring, MlDsa());
+        case found of
+            when Some(value as i: Index) do
+                case signToken(nthRef(ring, i), typ, payload) of
+                    when Some(value as token: String) do
+                        print("GO-CHECK ");
+                        print(kind);
+                        print(" ");
+                        printLn(asSpan(&token));
+                        destroyString(token);
+                    when None do
+                        assertTrue(false, "a token is signed");
+                end case;
+            when None do
+                assertTrue(false, "the ring has the key");
+        end case;
+        return nil;
+    end;
+
+    -- Tokens as rambo makes them, signed with the keys of the earlier Go
+    -- provider, for the token check of that provider on the other side.
+    function testTokensForGo(): Unit is
+        let vault: Vault := openFixtureVault();
+        let subject: String := value("alice_id");
+        let now: Int64 := nowSeconds();
+        case loadRing(&vault, "RAMBO_SIGNING_KEY_") of
+            when Right(right as ring: Buffer[RingKey]) do
+                let id: IdClaims := IdClaims(issuer => fromSpan("https://auth.example.com"), subject => fromSpan(asSpan(&subject)),
+                    clientId => fromSpan("lucy"), issuedAt => now, expiry => now + 600, authTime => now,
+                    sessionId => fromSpan("sid1"), amr => fromSpan("pwd otp mfa"), nonce => fromSpan("n-0S6_WzA2Mj"),
+                    email => fromSpan("alice@example.com"), name => fromSpan(""), roles => roles());
+                let idPayload: String := idTokenPayload(&id);
+                destroyIdClaims(id);
+                printSigned(&ring, "JWT", "id", asSpan(&idPayload));
+                destroyString(idPayload);
+                var audience: Buffer[String] := allocateEmpty();
+                insertBack(&!audience, fromSpan("lucy"));
+                let access: AccessClaims := AccessClaims(issuer => fromSpan("https://auth.example.com"),
+                    subject => fromSpan(asSpan(&subject)), audience => audience, clientId => fromSpan("lucy"), issuedAt => now,
+                    expiry => now + 600, tokenId => fromSpan("jti1"), authTime => now, sessionId => fromSpan("sid1"),
+                    scope => fromSpan("openid email"), roles => roles());
+                let accessPayload: String := accessTokenPayload(&access);
+                destroyAccessClaims(access);
+                printSigned(&ring, "at+jwt", "access", asSpan(&accessPayload));
+                destroyString(accessPayload);
+                destroyRing(ring);
+            when Left(left as error: VaultError) do
+                assertTrue(false, "the ring of the Go provider is loaded");
+        end case;
+        destroyString(subject);
+        closeVault(vault);
+        return nil;
+    end;
+end module body.

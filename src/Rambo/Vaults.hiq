@@ -1,0 +1,545 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    nthRef,
+    removeLast,
+    destroyEmpty,
+    length as bufferLength
+);
+import Standard.Text (
+    equal,
+    startsWith
+);
+import Standard.Base64 (
+    encode
+);
+import Standard.Libcrypto (
+    randomBytes
+);
+import Standard.File (
+    FileLookup,
+    FileMissing,
+    FileUnreadable,
+    FileFound,
+    FileStatus,
+    statusOf
+);
+import Standard.Vault (
+    Vault,
+    VaultError,
+    EnvUnreadable,
+    KeyMissing,
+    KeyExists,
+    KeyInvalid,
+    PepperUnreadable,
+    PepperInvalid,
+    PepperExists,
+    NameInvalid,
+    NotFound,
+    Damaged,
+    CryptoFailed,
+    WriteFailed,
+    createPepper,
+    createKey,
+    openVault,
+    closeVault,
+    setSecret,
+    getSecret,
+    deleteSecret,
+    secretNames,
+    rotateKey,
+    rotatePepper,
+    describeVaultError
+);
+import Wolly.OpKey (
+    RingKey,
+    KeyFamily,
+    MlDsa,
+    Composite,
+    hasFamily,
+    loadRing,
+    saveRing,
+    rotate,
+    destroyRing
+);
+import Wolly.Fernet (
+    newFernetKey
+);
+import Rambo.Config (
+    Config
+);
+import Rambo.Context (
+    vaultKeyName,
+    signingPrefix
+);
+
+module body Rambo.Vaults is
+    function isNotFound(error: VaultError): Bool is
+        case error of
+            when NotFound do
+                return true;
+            when EnvUnreadable | KeyMissing | KeyExists | KeyInvalid | PepperUnreadable | PepperInvalid | PepperExists
+                | NameInvalid | Damaged | CryptoFailed | WriteFailed do
+                return false;
+            end case;
+        end;
+
+        function isKeyExists(error: VaultError): Bool is
+            case error of
+                when KeyExists do
+                    return true;
+                when EnvUnreadable | KeyMissing | NotFound | KeyInvalid | PepperUnreadable | PepperInvalid | PepperExists
+                    | NameInvalid | Damaged | CryptoFailed | WriteFailed do
+                    return false;
+                end case;
+            end;
+
+            -- prefix, the text of error, and nothing else.
+            function failed(prefix: Span[Nat8, Static], error: VaultError): String is
+                var b: StringBuilder := makeStringBuilder();
+                writeString(&!b, prefix);
+                let text: String := describeVaultError(error);
+                writeString(&!b, asSpan(&text));
+                destroyString(text);
+                return finalize(b);
+            end;
+
+            generic [P: Region]
+            function isThere(path: Span[Nat8, P]): Bool is
+                case statusOf(path) of
+                    when FileMissing do
+                        return false;
+                    when FileUnreadable do
+                        return true;
+                    when FileFound(status as found: FileStatus) do
+                        return true;
+                end case;
+            end;
+
+            generic [C: Region]
+            function envOf(config: &[Config, C]): Span[Nat8, C] is
+                return asSpan(&(config->vault));
+            end;
+
+            generic [C: Region]
+            function pepperPath(config: &[Config, C]): Span[Nat8, C] is
+                return asSpan(&(config->pepper));
+            end;
+
+            generic [C: Region]
+            function opened(config: &[Config, C]): Either[String, Vault] is
+                case openVault(envOf(config), pepperPath(config), vaultKeyName()) of
+                    when Left(left as error: VaultError) do
+                        return Left(left => failed("vaultsetup: ", error));
+                    when Right(right as vault: Vault) do
+                        return Right(right => vault);
+                end case;
+            end;
+
+            -- count random bytes in standard Base64.
+            function randomText(count: Index): Option[String] is
+                case randomBytes(count) of
+                    when Some(value as raw: String) do
+                        let text: String := encode(asSpan(&raw));
+                        destroyString(raw);
+                        return Some(value => text);
+                    when None do
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            end;
+
+            -- Stores made under name when name is not there; Right whether it
+            -- stored.
+            generic [V: Region]
+            function ensured(vault: &![Vault, V], name: Span[Nat8, Static], made: Option[String]): Either[String, Bool] is
+                case getSecret(&vault, name) of
+                    when Right(right as value: String) do
+                        destroyString(value);
+                        case made of
+                            when Some(value as text: String) do
+                                destroyString(text);
+                            when None do
+                                skip;
+                        end case;
+                        return Right(right => false);
+                    when Left(left as error: VaultError) do
+                        if not isNotFound(error) then
+                            case made of
+                                when Some(value as text: String) do
+                                    destroyString(text);
+                                when None do
+                                    skip;
+                            end case;
+                            return Left(left => failed("vault: ", error));
+                        end if;
+                end case;
+                case made of
+                    when None do
+                        var b: StringBuilder := makeStringBuilder();
+                        writeString(&!b, "vault ");
+                        writeString(&!b, name);
+                        writeString(&!b, ": no random bytes");
+                        return Left(left => finalize(b));
+                    when Some(value as text: String) do
+                        let stored: Either[VaultError, Unit] := setSecret(&~vault, name, asSpan(&text));
+                        destroyString(text);
+                        case stored of
+                            when Left(left as error: VaultError) do
+                                return Left(left => failed("vault: ", error));
+                            when Right(right as done: Unit) do
+                                return Right(right => true);
+                        end case;
+                end case;
+            end;
+
+            -- Makes the first key of family in ring; false when none could be
+            -- made.
+            generic [R: Region]
+            function madeFirst(ring: &![Buffer[RingKey], R], family: KeyFamily, now: Int64): Bool is
+                case rotate(&~ring, family, now) of
+                    when Some(value as kid: String) do
+                        destroyString(kid);
+                        return true;
+                    when None do
+                        return false;
+                end case;
+            end;
+
+            -- The secrets and the first signing key of each family, in vault.
+            generic [V: Region]
+            function filled(vault: &![Vault, V], now: Int64): Option[String] is
+                case ensured(&~vault, "RAMBO_PASSWORD_PEPPER", randomText(32)) of
+                    when Left(left as message: String) do
+                        return Some(value => message);
+                    when Right(right as done: Bool) do
+                        skip;
+                end case;
+                case ensured(&~vault, "RAMBO_TOTP_KEY", newFernetKey()) of
+                    when Left(left as message: String) do
+                        return Some(value => message);
+                    when Right(right as done: Bool) do
+                        skip;
+                end case;
+                case ensured(&~vault, "RAMBO_POW_KEY", randomText(32)) of
+                    when Left(left as message: String) do
+                        return Some(value => message);
+                    when Right(right as done: Bool) do
+                        skip;
+                end case;
+                case loadRing(&vault, signingPrefix()) of
+                    when Left(left as error: VaultError) do
+                        return Some(value => failed("vault: ", error));
+                    when Right(right as found: Buffer[RingKey]) do
+                        var ring: Buffer[RingKey] := found;
+                        -- A first key for each family that has none, as the earlier Go
+                        -- provider makes them; a ring with both is left as it is.
+                        let needsPure: Bool := not hasFamily(&ring, MlDsa());
+                        let needsComposite: Bool := not hasFamily(&ring, Composite());
+                        if (not needsPure) and (not needsComposite) then
+                            destroyRing(ring);
+                            let none: Option[String] := None();
+                            return none;
+                        end if;
+                        if needsPure and (not madeFirst(&!ring, MlDsa(), now)) then
+                            destroyRing(ring);
+                            return Some(value => fromSpan("vault: no signing key could be made"));
+                        end if;
+                        if needsComposite and (not madeFirst(&!ring, Composite(), now)) then
+                            destroyRing(ring);
+                            return Some(value => fromSpan("vault: no signing key could be made"));
+                        end if;
+                        let saved: Either[VaultError, Unit] := saveRing(&~vault, signingPrefix(), &ring);
+                        destroyRing(ring);
+                        case saved of
+                            when Left(left as error: VaultError) do
+                                return Some(value => failed("vault: ", error));
+                            when Right(right as done: Unit) do
+                                let none: Option[String] := None();
+                                return none;
+                        end case;
+                end case;
+            end;
+
+            generic [C: Region]
+            function initVault(config: &[Config, C], now: Int64): Either[String, String] is
+                var said: StringBuilder := makeStringBuilder();
+                var first: Bool := true;
+                if not isThere(pepperPath(config)) then
+                    case createPepper(pepperPath(config)) of
+                        when Left(left as error: VaultError) do
+                            let partial: String := finalize(said);
+                            destroyString(partial);
+                            return Left(left => failed("vaultsetup: pepper: ", error));
+                        when Right(right as done: Unit) do
+                            writeString(&!said, "pepper written to ");
+                            writeString(&!said, pepperPath(config));
+                            writeString(&!said, " -- back it up; without it nothing in the vault can be read");
+                            first := false;
+                    end case;
+                end if;
+                case createKey(envOf(config), pepperPath(config), vaultKeyName()) of
+                    when Left(left as error: VaultError) do
+                        if not isKeyExists(error) then
+                            let partial: String := finalize(said);
+                            destroyString(partial);
+                            return Left(left => failed("vaultsetup: init: ", error));
+                        end if;
+                    when Right(right as done: Unit) do
+                        if not first then
+                            writeByte(&!said, 10);
+                        end if;
+                        writeString(&!said, "vault key written to ");
+                        writeString(&!said, envOf(config));
+                        writeString(&!said, " (quantum)");
+                end case;
+                case opened(config) of
+                    when Left(left as message: String) do
+                        let partial: String := finalize(said);
+                        destroyString(partial);
+                        var b: StringBuilder := makeStringBuilder();
+                        writeString(&!b, "vault ");
+                        writeString(&!b, envOf(config));
+                        writeString(&!b, " exists but cannot be read with pepper ");
+                        writeString(&!b, pepperPath(config));
+                        destroyString(message);
+                        return Left(left => finalize(b));
+                    when Right(right as vault: Vault) do
+                        var v: Vault := vault;
+                        let problem: Option[String] := filled(&!v, now);
+                        closeVault(v);
+                        case problem of
+                            when Some(value as message: String) do
+                                let partial: String := finalize(said);
+                                destroyString(partial);
+                                return Left(left => message);
+                            when None do
+                                return Right(right => finalize(said));
+                        end case;
+                end case;
+            end;
+
+            -- Whether name may be set: A to Z first, then A to Z, 0 to 9 and _,
+            -- 64 at most.
+            generic [N: Region]
+            function isSettable(name: Span[Nat8, N]): Bool is
+                let n: Index := spanLength(name);
+                if (n = 0) or (n > 64) then
+                    return false;
+                end if;
+                if (name[0] < 'A') or (name[0] > 'Z') then
+                    return false;
+                end if;
+                var i: Index := 1;
+                while i < n do
+                    let c: Nat8 := name[i];
+                    if not (((c >= 'A') and (c <= 'Z')) or ((c >= '0') and (c <= '9')) or (c = '_')) then
+                        return false;
+                    end if;
+                    i := i + 1;
+                end while;
+                return true;
+            end;
+
+            generic [N: Region]
+            function nameProblem(name: Span[Nat8, N]): Option[String] is
+                if (not isSettable(name)) or equal(name, vaultKeyName()) then
+                    var b: StringBuilder := makeStringBuilder();
+                    writeString(&!b, "vaultsetup: \"");
+                    writeString(&!b, name);
+                    writeString(&!b, "\" is not a settable name (A-Z, 0-9, _)");
+                    return Some(value => finalize(b));
+                end if;
+                if startsWith(name, signingPrefix()) or equal(name, "RAMBO_PASSWORD_PEPPER") or equal(name, "RAMBO_TOTP_KEY")
+                    or startsWith(name, "RAMBO_POW_KEY") then
+                    var b: StringBuilder := makeStringBuilder();
+                    writeString(&!b, "vaultsetup: \"");
+                    writeString(&!b, name);
+                    writeString(&!b, "\" is managed by the program itself");
+                    return Some(value => finalize(b));
+                end if;
+                let none: Option[String] := None();
+                return none;
+            end;
+
+            generic [C: Region, N: Region, V: Region]
+            function setVaultSecret(config: &[Config, C], name: Span[Nat8, N], value: Span[Nat8, V]): Option[String] is
+                case nameProblem(name) of
+                    when Some(value as message: String) do
+                        return Some(value => message);
+                    when None do
+                        skip;
+                end case;
+                if spanLength(value) = 0 then
+                    return Some(value => fromSpan("vaultsetup: empty value"));
+                end if;
+                case opened(config) of
+                    when Left(left as message: String) do
+                        return Some(value => message);
+                    when Right(right as vault: Vault) do
+                        var v: Vault := vault;
+                        let stored: Either[VaultError, Unit] := setSecret(&!v, name, value);
+                        closeVault(v);
+                        case stored of
+                            when Left(left as error: VaultError) do
+                                return Some(value => failed("vaultsetup: ", error));
+                            when Right(right as done: Unit) do
+                                let none: Option[String] := None();
+                                return none;
+                        end case;
+                end case;
+            end;
+
+            generic [C: Region, N: Region]
+            function getVaultSecret(config: &[Config, C], name: Span[Nat8, N], toTerminal: Bool): Either[String, String] is
+                case opened(config) of
+                    when Left(left as message: String) do
+                        return Left(left => message);
+                    when Right(right as vault: Vault) do
+                        let found: Either[VaultError, String] := getSecret(&vault, name);
+                        closeVault(vault);
+                        case found of
+                            when Left(left as error: VaultError) do
+                                return Left(left => failed("vaultsetup: ", error));
+                            when Right(right as value: String) do
+                                if not toTerminal then
+                                    destroyString(value);
+                                    return Left(left => fromSpan("vaultsetup: output is not a terminal; refusing to print a secret"));
+                                end if;
+                                return Right(right => value);
+                        end case;
+                end case;
+            end;
+
+            generic [C: Region, N: Region]
+            function deleteVaultSecret(config: &[Config, C], name: Span[Nat8, N]): Option[String] is
+                case nameProblem(name) of
+                    when Some(value as message: String) do
+                        return Some(value => message);
+                    when None do
+                        skip;
+                end case;
+                case opened(config) of
+                    when Left(left as message: String) do
+                        return Some(value => message);
+                    when Right(right as vault: Vault) do
+                        var v: Vault := vault;
+                        let removed: Either[VaultError, Bool] := deleteSecret(&!v, name);
+                        closeVault(v);
+                        case removed of
+                            when Left(left as error: VaultError) do
+                                return Some(value => failed("vaultsetup: ", error));
+                            when Right(right as done: Bool) do
+                                let none: Option[String] := None();
+                                return none;
+                        end case;
+                end case;
+            end;
+
+            function freeNames(names: Buffer[String]): Unit is
+                var rest: Buffer[String] := names;
+                while bufferLength(&rest) > 0 do
+                    destroyString(removeLast(&!rest));
+                end while;
+                destroyEmpty(rest);
+                return nil;
+            end;
+
+            generic [C: Region]
+            function listVaultSecrets(config: &[Config, C]): Either[String, String] is
+                case opened(config) of
+                    when Left(left as message: String) do
+                        return Left(left => message);
+                    when Right(right as vault: Vault) do
+                        let found: Either[VaultError, Buffer[String]] := secretNames(&vault);
+                        closeVault(vault);
+                        case found of
+                            when Left(left as error: VaultError) do
+                                return Left(left => failed("vaultsetup: ", error));
+                            when Right(right as names: Buffer[String]) do
+                                if bufferLength(&names) = 0 then
+                                    freeNames(names);
+                                    return Right(right => fromSpan("(no secrets)"));
+                                end if;
+                                var b: StringBuilder := makeStringBuilder();
+                                var i: Index := 0;
+                                while i < bufferLength(&names) do
+                                    if i > 0 then
+                                        writeByte(&!b, 10);
+                                    end if;
+                                    writeString(&!b, "  ");
+                                    writeString(&!b, asSpan(nthRef(&names, i)));
+                                    i := i + 1;
+                                end while;
+                                freeNames(names);
+                                return Right(right => finalize(b));
+                        end case;
+                end case;
+            end;
+
+            generic [C: Region]
+            function rotateVaultKey(config: &[Config, C]): Either[String, String] is
+                case opened(config) of
+                    when Left(left as message: String) do
+                        return Left(left => message);
+                    when Right(right as vault: Vault) do
+                        var v: Vault := vault;
+                        let rotated: Either[VaultError, Index] := rotateKey(&!v);
+                        closeVault(v);
+                        case rotated of
+                            when Left(left as error: VaultError) do
+                                return Left(left => failed("vaultsetup: rotate-key: ", error));
+                            when Right(right as n: Index) do
+                                return Right(right => fromSpan("vault key rotated, all values re-encrypted"));
+                        end case;
+                end case;
+            end;
+
+            generic [C: Region]
+            function rotateVaultPepper(config: &[Config, C]): Either[String, String] is
+                if not isThere(pepperPath(config)) then
+                    var b: StringBuilder := makeStringBuilder();
+                    writeString(&!b, "vaultsetup: no pepper at ");
+                    writeString(&!b, pepperPath(config));
+                    writeString(&!b, " (run init first)");
+                    return Left(left => finalize(b));
+                end if;
+                case opened(config) of
+                    when Left(left as message: String) do
+                        return Left(left => message);
+                    when Right(right as vault: Vault) do
+                        var v: Vault := vault;
+                        let rotated: Either[VaultError, Index] := rotatePepper(&!v, pepperPath(config));
+                        closeVault(v);
+                        case rotated of
+                            when Left(left as error: VaultError) do
+                                return Left(left => failed("vaultsetup: rotate-pepper: ", error));
+                            when Right(right as n: Index) do
+                                var b: StringBuilder := makeStringBuilder();
+                                writeString(&!b, "pepper rotated, all values re-encrypted -- back up ");
+                                writeString(&!b, pepperPath(config));
+                                writeString(&!b, " again");
+                                return Right(right => finalize(b));
+                        end case;
+                end case;
+            end;
+        end module body.

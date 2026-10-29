@@ -1,0 +1,248 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+What the command line does to accounts, sessions, roles and signing keys,
+each step with its audit line.
+
+- An account is named by its ID or its e-mail address.
+- A root account is locked only when asked for with root, and never the
+  last one that is not locked; it is never deleted.
+- Locking an account, a new one-time password and the removal of its
+  second factor end its sessions and every sign-in of an app.
+- Every refusal is a Left with the text the command line prints after
+  rambo and a colon.
+
+    case addAccount(&!db, &!log, actor, "a@example.org", "A", pepper, now) of
+        when Right(right as added: Added) do
+            ...
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Database (
+    Database,
+    Writing
+);
+import Standard.Log (
+    Log
+);
+import Wolly.Account (
+    Account
+);
+import Rambo.Config (
+    Config
+);
+
+module Rambo.Admin is
+    """
+    Who runs the command line: the name of the user from the environment,
+    else its number, then the number, and the user doas or sudo name as
+    the one who asked, as in alice(uid 1000) via bob.
+    """
+    function actorName(): String
+        ensures length(&result) > 0;
+
+    """
+    Writes the audit line of a command: actor, action, target, result and
+    the time, and the field extra with value when extra is not empty.
+    """
+    generic [L: Region, A: Region, T: Region, V: Region]
+    function auditCommand(log: &![Log, L], actor: Span[Nat8, A], action: Span[Nat8, Static], target: Span[Nat8, T],
+        result: Span[Nat8, Static], extra: Span[Nat8, Static], value: Span[Nat8, V], now: Int64): Unit
+        requires now > 0;
+
+    """
+    The account ref names: by its ID when ref is one, else by its address.
+    Left accountkit's text when there is none.
+    No contract: the answer is the work of the database.
+    """
+    generic [D: Region, R: Region]
+    function resolve(db: &![Database[Writing], D], ref: Span[Nat8, R]): Either[String, Account];
+
+    """
+    A new account and its one-time password.
+    """
+    record Added: Linear is
+        id: String;
+        password: String;
+    end;
+
+    """
+    Frees added.
+    No contract: it only frees.
+    """
+    function destroyAdded(added: Added): Unit;
+
+    """
+    Makes the account of email with the display name name and gives it a
+    one-time password, hashed under pepper.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, A: Region, E: Region, N: Region, P: Region]
+    function addAccount(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], email: Span[Nat8, E],
+        name: Span[Nat8, N], pepper: Span[Nat8, P], now: Int64): Either[String, Added]
+        requires now > 0;
+
+    """
+    The table of the accounts as account list prints it, the root
+    accounts of config marked.
+    No contract: the answer is the work of the database.
+    """
+    generic [D: Region, C: Region]
+    function accountTable(db: &![Database[Writing], D], config: &[Config, C]): Either[String, String];
+
+    """
+    Locks the account ref and ends its sessions and the sign-ins of its
+    apps.  A root account only when root is true, and not the last
+    unlocked one.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, C: Region, A: Region, R: Region]
+    function lockAccount(db: &![Database[Writing], D], log: &![Log, L], config: &[Config, C], actor: Span[Nat8, A],
+        ref: Span[Nat8, R], root: Bool, now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    Lifts the lock of the account ref.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, A: Region, R: Region]
+    function unlockAccount(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    Gives the account ref a new one-time password, hashed under pepper, and
+    ends its sessions.  Right the password.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, A: Region, R: Region, P: Region]
+    function resetPassword(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        pepper: Span[Nat8, P], now: Int64): Either[String, String]
+        requires now > 0;
+
+    """
+    Removes the second factor of the account ref and ends its sessions.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, A: Region, R: Region]
+    function resetSecondFactor(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    Gives the account ref the address email.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, A: Region, R: Region, E: Region]
+    function setAccountEmail(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        email: Span[Nat8, E], now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    Gives the account ref the display name name.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, A: Region, R: Region, N: Region]
+    function setAccountName(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        name: Span[Nat8, N], now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    Deletes the account ref for good, with its sessions, codes, refresh
+    tokens and roles, in one transaction, and its passkeys.  Right its ID.
+    A root account of config is refused.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, C: Region, A: Region, R: Region]
+    function deleteAccount(db: &![Database[Writing], D], log: &![Log, L], config: &[Config, C], actor: Span[Nat8, A],
+        ref: Span[Nat8, R], now: Int64): Either[String, String]
+        requires now > 0;
+
+    """
+    The table of the passkeys as passkey list prints it, of the account ref
+    or of every account when ref is empty: credential, account, name, when
+    added and when last used, times in the time zone of the system.
+    No contract: the answer is the work of the database.
+    """
+    generic [D: Region, R: Region]
+    function passkeyTable(db: &![Database[Writing], D], ref: Span[Nat8, R]): Either[String, String];
+
+    """
+    Removes the passkey credential, whoever it belongs to.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, A: Region, C: Region]
+    function revokePasskey(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], credential: Span[Nat8, C],
+        now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    Removes every passkey of the account ref; Right how many it had.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, A: Region, R: Region]
+    function resetPasskeys(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        now: Int64): Either[String, Int64]
+        requires now > 0;
+
+    """
+    The table of the live sessions as session list prints it, of the
+    account ref or of everybody when ref is empty, times in the time zone
+    of the system.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, C: Region, R: Region]
+    function sessionTable(db: &![Database[Writing], D], config: &[Config, C], ref: Span[Nat8, R],
+        now: Int64): Either[String, String]
+        requires now > 0;
+
+    """
+    Ends the session sid and every sign-in that hangs off it.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, A: Region, S: Region]
+    function endSessionNamed(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], sid: Span[Nat8, S],
+        now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    What a grant did: the account and whether the role is new.
+    """
+    record RoleGiven: Linear is
+        account: String;
+        added: Bool;
+    end;
+
+    """
+    Gives the account ref the role role in the client client.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, A: Region, R: Region, C: Region, O: Region]
+    function grantRoleTo(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        client: Span[Nat8, C], role: Span[Nat8, O], now: Int64): Either[String, RoleGiven]
+        requires now > 0;
+
+    """
+    Takes the role role in the client client from the account ref.  Right
+    the account's ID.
+    No ensures: the answer is the work of the database.
+    """
+    generic [D: Region, L: Region, A: Region, R: Region, C: Region, O: Region]
+    function revokeRoleFrom(db: &![Database[Writing], D], log: &![Log, L], actor: Span[Nat8, A], ref: Span[Nat8, R],
+        client: Span[Nat8, C], role: Span[Nat8, O], now: Int64): Either[String, String]
+        requires now > 0;
+
+    """
+    The table of the roles as role list prints it, of the client client and
+    the account ref, each when not empty.
+    No contract: the answer is the work of the database.
+    """
+    generic [D: Region, C: Region, R: Region]
+    function roleTable(db: &![Database[Writing], D], client: Span[Nat8, C], ref: Span[Nat8, R]): Either[String, String];
+end module.

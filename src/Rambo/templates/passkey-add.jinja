@@ -1,0 +1,27 @@
+{#
+Part of rambo.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The making of a passkey after the password and the code held: passkey.js
+reads the data attributes, asks the authenticator for a new credential and
+sends its answer in the hidden fields with the name typed.
+-#}
+{% extends "templates/layout.jinja" %}
+{% block content %}
+<p class="lead">{{ _("PasskeyCreateHint") }}</p>
+<form method="post" action="/account/passkey/add" id="passkey-add" data-challenge="{{ challenge }}" data-party="{{ party }}"
+ data-user="{{ userId }}" data-user-name="{{ userName }}" data-display="{{ display }}" data-exclude="{{ exclude }}"
+ data-msg-working="{{ _("PasskeyWorking") }}" data-msg-unsupported="{{ _("PasskeyUnsupported") }}" data-msg-cancelled="{{ _("PasskeyCancelled") }}">
+<input type="hidden" name="csrf" value="{{ csrfAdd }}">
+<input type="hidden" name="clientData" value="">
+<input type="hidden" name="attestation" value="">
+<label>{{ _("AccountPasskeyLabel") }} <small>{{ _("AccountPasskeyLabelHint") }}</small>
+<input type="text" name="label" maxlength="64" autocomplete="off"></label>
+<button type="button" id="passkey-create">{{ _("PasskeyCreate") }}</button>
+<p id="passkey-status" role="status" aria-live="polite" hidden></p>
+</form>
+<p><a href="/account">{{ _("NavAccount") }}</a></p>
+<script src="/static/passkey.js"></script>
+{% endblock %}

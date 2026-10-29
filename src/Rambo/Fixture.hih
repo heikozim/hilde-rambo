@@ -1,0 +1,61 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The data set the earlier Go provider wrote for the tests, in testdata/gorambo: its vault,
+its pepper, its database and the values the tests compare against in
+expected.json.  The paths are relative to the root of the tree, where the
+tests run.
+"""
+import Standard.String (
+    String
+);
+
+module Rambo.Fixture is
+    """
+    The path of the vault of the data set.
+    """
+    function fixtureVault(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The path of the pepper of the data set.
+    """
+    function fixturePepper(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The path of the database of the data set.
+    """
+    function fixtureDatabase(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The string member name of expected.json.  None when the file cannot be
+    read or has no such member.
+    No contract: an Option read from a file.
+    """
+    generic [N: Region]
+    function expected(name: Span[Nat8, N]): Option[String];
+
+    """
+    The integer member name of expected.json, as expected reads it.
+    No contract: an Option read from a file.
+    """
+    generic [N: Region]
+    function expectedNumber(name: Span[Nat8, N]): Option[Int64];
+
+    """
+    A copy of the vault, the pepper and the database of the data set in the
+    temporary directory of the environment, under names that begin with prefix, and a
+    rambo.conf beside them that names the copy, the issuer of the data set
+    and then the lines of extra.  The path of that rambo.conf; None when
+    that directory is not named or a file cannot be read or written.
+    No contract: an Option over files.
+    """
+    generic [E: Region]
+    function fixtureCopy(prefix: Span[Nat8, Static], extra: Span[Nat8, E]): Option[String];
+end module.

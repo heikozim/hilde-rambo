@@ -1,0 +1,52 @@
+{#
+Part of rambo.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The portal: a tile for each app this person can start, the sign-ins held
+by apps, and the browser sessions.  A logo is a data URI the code checked;
+the addresses come as markup from the code, escaped there.
+-#}
+{% extends "templates/layout.jinja" %}
+{% block content %}
+{% if tiles %}<ul class="tiles">
+{% for tile in tiles %}<li><a class="tile" href="{{ tile.start }}">{% if tile.logo %}<img src="{{ tile.logo|safe }}" alt="" width="64" height="64">{% else %}<span class="initial" aria-hidden="true">{{ tile.initial }}</span>{% endif %}<span class="label">{{ tile.name }}</span></a></li>
+{% endfor %}</ul>{% else %}<p>{{ _("HomeNoApps") }}</p>{% endif %}
+
+<section>
+<h2>{{ _("HomeBound") }}</h2>
+<p class="muted">{{ _("HomeBoundHint") }}</p>
+{% if apps %}<div class="table-wrap">
+<table>
+<thead><tr><th>{{ _("AccountApp") }}</th><th>{{ _("AccountSince") }}</th><th>{{ _("AccountLastSeen") }}</th><th></th></tr></thead>
+<tbody>
+{% for app in apps %}<tr>
+<td data-label="{{ _("AccountApp") }}">{{ app.clientName }}{% if app.label %} ({{ app.label }}){% endif %}</td><td data-label="{{ _("AccountSince") }}"><span class="when">{{ app.created }}</span><br><code class="ip">{{ app.firstIp|safe }}</code>{% if app.hasFirstIp %} <span class="muted tag">{{ _("AccountAppServer") }}</span>{% endif %}</td><td data-label="{{ _("AccountLastSeen") }}"><span class="when">{{ app.lastUsed }}</span><br><code class="ip">{{ app.lastIp|safe }}</code>{% if app.hasLastIp %} <span class="muted tag">{{ _("AccountAppServer") }}</span>{% endif %}</td>
+<td class="actions">{% if app.start %}<a class="button small" href="{{ app.start }}">{{ _("BoundSwitch", arg=app.clientName) }}</a>{% endif %}<form method="post" action="/account/device/revoke">
+<input type="hidden" name="csrf" value="{{ csrfDeviceRevoke }}"><input type="hidden" name="id" value="{{ app.family }}">
+<button type="submit" class="small secondary">{{ _("BoundEnd") }}</button></form></td>
+</tr>{% endfor %}
+</tbody>
+</table>
+</div>
+<p class="muted">{{ _("AccountDeviceIpNote") }}</p>{% else %}<p>{{ _("HomeNoBound") }}</p>{% endif %}
+</section>
+
+<section>
+<h2>{{ _("AccountSessions") }}</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>{{ _("AccountBrowser") }}</th><th>{{ _("AccountSince") }}</th><th>{{ _("AccountLastSeen") }}</th><th></th></tr></thead>
+<tbody>
+{% for session in sessions %}<tr>
+<td data-label="{{ _("AccountBrowser") }}">{% if session.userAgent %}{{ session.userAgent }}{% else %}&ndash;{% endif %}</td><td data-label="{{ _("AccountSince") }}"><span class="when">{{ session.created }}</span><br><code class="ip">{{ session.firstIp|safe }}</code></td><td data-label="{{ _("AccountLastSeen") }}"><span class="when">{{ session.lastSeen }}</span><br><code class="ip">{{ session.lastIp|safe }}</code></td>
+<td>{% if session.current %}<em>{{ _("AccountThisSession") }}</em>{% else %}<form method="post" action="/account/session/end">
+<input type="hidden" name="csrf" value="{{ csrfSessionEnd }}"><input type="hidden" name="id" value="{{ session.id }}">
+<button type="submit" class="small">{{ _("AccountEnd") }}</button></form>{% endif %}</td>
+</tr>{% endfor %}
+</tbody>
+</table>
+</div>
+</section>
+{% endblock %}

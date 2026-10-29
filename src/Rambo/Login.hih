@@ -1,0 +1,159 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The sign-in pages of rambo: the login with its puzzle, the two steps that
+may follow it, the question before a logout, and the choice of language.
+
+- The puzzle is checked before anything costly: a form without its answer
+  never reaches the password hash.
+- Failed sign-ins slow down per address and account pair and per address,
+  3 and 20 of them free, then 1 second doubling to 15 minutes, forgotten
+  after a day; they make the next puzzle harder.
+- The ban of Hiawatha is asked for at the login.ban_after-th failure of an
+  address within login.ban_window, and at once for a puzzle answer no
+  browser on the page can send; never for a loopback address.
+- A login whose request is gone is restarted for its client instead of
+  ending on an error page.
+
+    let page: String := loginForm(&request, &!db, &world, &!log, now);
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Database (
+    Database,
+    Writing
+);
+import Standard.FcgiServer (
+    Request
+);
+import Standard.Log (
+    Log
+);
+import Rambo.Messages (
+    Key
+);
+import Rambo.Web (
+    World
+);
+
+module Rambo.Login is
+    """
+    The difficulty of the puzzle for the failures on record of an account
+    and of an address: 14 bits and one more per failure, at most 16 for
+    the account's and 18 for the address's, the larger of the two.
+    """
+    function powBits(account: Int64, address: Int64): Int64
+        requires (account >= 0) and (address >= 0)
+        ensures (result >= 14) and (result <= 18);
+
+    """
+    The page that says key went wrong, with status.
+    """
+    generic [Q: Region]
+    function failPage(request: &[Request, Q], status: Nat16, key: Key): String
+        requires (status >= 100) and (status <= 599)
+        ensures length(&result) > 0;
+
+    """
+    GET /login: the form of the request req, a direct login when there is
+    no req and no session, the portal when there is a session, the note of
+    a logout for logged_out.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function loginForm(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    POST /login: the puzzle, the throttle, the address, the password and
+    the code; then the session, or a step that is still owed.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function loginSubmit(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    POST /login/passkey: the throttle of the address, then a passkey with
+    the challenge of this login and the user verified; then the session, or
+    the new password when the account owes one.  The passkey names the
+    account.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function passkeySubmit(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    GET /login/password: the form of a new password of the step.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function passwordForm(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    POST /login/password: the new password of the step.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function passwordSubmit(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    GET /login/totp: the second factor to set up for the step; its secret is
+    made once and kept with the step.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function totpForm(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    POST /login/totp: the first code of the new second factor.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function totpSubmit(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    GET /login/logout: the question before a logout, or the note that
+    nobody is signed in.
+    """
+    generic [Q: Region, D: Region, W: Region]
+    function logoutForm(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    POST /lang: keeps de or en in a cookie for a year and goes back to the
+    local path of the form.
+    """
+    generic [Q: Region]
+    function setLanguage(request: &[Request, Q]): String
+        ensures length(&result) > 0;
+
+    """
+    A direct login at rambo that returns to the local path target, as a
+    redirect to its login page.
+    """
+    generic [Q: Region, D: Region, W: Region, T: Region]
+    function beginDirectAnswer(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        target: Span[Nat8, T], now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+end module.

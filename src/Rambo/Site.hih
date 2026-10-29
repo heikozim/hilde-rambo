@@ -1,0 +1,92 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The handler of rambo: one FastCGI request in, its answer out.  A worker of
+the server keeps the world of rambo open between its requests: the
+configuration, the secrets, the signing keys, the database and the
+answers of discovery and /jwks, made once.  It opens the world again when
+the configuration, the vault or the file of its key was replaced, and a
+minute after it opened it at the latest.  Once a minute a worker asks
+whether it is its turn to maintain, which the database decides once an
+hour.
+
+- The protocol endpoints: /.well-known/openid-configuration and /jwks for
+  GET, /authorize for GET and POST, /token for POST, /logout for GET and
+  POST.
+- The pages: / and /account for GET, /lang for POST, /login, /login/password
+  and /login/totp for GET and POST, /login/logout for GET, and the five
+  forms below /account for POST.
+- A head request is answered as a GET; an unknown path is a 404, a known one with
+  another method a 405 that names the allowed ones, as Go's ServeMux does.
+- When the world does not open, the answer is a 500 with a fixed text and
+  the reason goes to the system log; nothing internal reaches the browser.
+
+    let answer: String := handle(request);
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.FcgiServer (
+    Request,
+    Turn,
+    Served
+);
+
+module Rambo.Site is
+    """
+    The seconds of the wall clock, at least 1.
+    """
+    function nowSeconds(): Int64
+        ensures result > 0;
+
+    """
+    The answer of rambo to request at now with the configuration at
+    path.
+    """
+    generic [Q: Region, P: Region]
+    function respond(request: &[Request, Q], path: Span[Nat8, P], now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    The answer of rambo to request, with the configuration of
+    Rambo.Context.configPath at the time of the wall clock; the handler of
+    the FastCGI server.
+    """
+    function handle(request: Request): String
+        ensures length(&result) > 0;
+
+    """
+    What one worker of the server keeps between the requests it serves:
+    the path of the configuration and the world opened with it, when one
+    is open.
+    """
+    type Worker: Linear;
+
+    """
+    A worker for the configuration at path, with nothing open yet.
+    No contract: the worker is opaque and holds nothing yet that a condition could state.
+    """
+    generic [P: Region]
+    function makeWorker(path: Span[Nat8, P]): Worker;
+
+    """
+    Closes the database and the log of worker and drops the rest.
+    No contract: it closes the database and the log, whose result is I/O.
+    """
+    function closeWorker(worker: Worker): Unit;
+
+    """
+    The answer of rambo to the request of turn, with the world its
+    worker keeps, at the time of the wall clock; the handler of the
+    FastCGI server with a worker for each task.  The worker comes back
+    for the next request.
+    No contract: the answer is a field of a linear result.
+    """
+    function handleWith(turn: Turn[Worker]): Served[Worker];
+end module.

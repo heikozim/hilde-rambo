@@ -1,0 +1,628 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Text (
+    equal
+);
+import Standard.Time (
+    wallNanos
+);
+import Standard.Database (
+    Database,
+    Writing
+);
+import Standard.File (
+    FileStatus,
+    FileLookup,
+    FileFound,
+    FileMissing,
+    FileUnreadable,
+    statusOf
+);
+import Standard.FcgiServer (
+    Request,
+    Turn,
+    Served,
+    destroyRequest
+);
+import Standard.Log (
+    Log,
+    Entry,
+    Error,
+    Daemon,
+    makeEntry,
+    addText,
+    writeEntry,
+    logToSystem,
+    closeLog
+);
+import Wolly.Request (
+    requestMethod,
+    requestPath
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    finish
+);
+import Wolly.OpKey (
+    RingKey
+);
+import Wolly.OpBase (
+    OpSettings,
+    jsonOutput
+);
+import Wolly.OpToken (
+    discoveryDocument
+);
+import Wolly.Op (
+    discoveryEndpoint,
+    jwksEndpoint,
+    authorizeEndpoint,
+    logoutEndpoint
+);
+import Wolly.OpGrant (
+    tokenEndpoint
+);
+import Rambo.Config (
+    Config
+);
+import Rambo.Context (
+    Context,
+    Secrets,
+    Maintained,
+    closeContext,
+    configPath,
+    openContext,
+    maintain
+);
+import Rambo.Web (
+    World,
+    remoteAddr
+);
+import Rambo.Login (
+    loginForm,
+    loginSubmit,
+    passkeySubmit,
+    passwordForm,
+    passwordSubmit,
+    totpForm,
+    totpSubmit,
+    logoutForm,
+    setLanguage
+);
+import Rambo.Portal (
+    home,
+    account,
+    accountPassword,
+    accountTotpBegin,
+    accountTotpConfirm,
+    accountEndSession,
+    accountRevokeDevice,
+    accountPasskeyBegin,
+    accountPasskeyAdd,
+    accountPasskeyRename,
+    accountPasskeyRemove
+);
+
+module body Rambo.Site is
+    function nowSeconds(): Int64 is
+        case toInt64(wallNanos() / 1000000000) of
+            when Some(value as seconds: Int64) do
+                if seconds > 0 then
+                    return seconds;
+                end if;
+                return 1;
+            when None do
+                return 1;
+        end case;
+    end;
+
+    function orEmpty(found: Option[String]): String is
+        case found of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- A fixed text with status, as Go's http.Error writes it.
+    function plain(status: Nat16, text: Span[Nat8, Static], allow: Span[Nat8, Static]): String is
+        var response: Response := addHeader(makeResponse(status, "text/plain; charset=utf-8"), "X-Content-Type-Options",
+            "nosniff");
+        if spanLength(allow) > 0 then
+            response := addHeader(response, "Allow", allow);
+        end if;
+        return finish(response, text);
+    end;
+
+    -- Writes why the world of a request did not open to the system log.
+    function logFailure(message: String): Unit is
+        var log: Log := logToSystem("rambo", Daemon(), Error());
+        let entry: Entry := addText(makeEntry(Error(), "request failed"), "error", asSpan(&message));
+        let written: Bool := writeEntry(&!log, entry);
+        let closed: Bool := closeLog(log);
+        destroyString(message);
+        return nil;
+    end;
+
+    -- The methods the route of path allows, as an Allow header names them;
+    -- empty for a path that is no route.
+    generic [P: Region]
+    function routeOf(path: Span[Nat8, P]): Span[Nat8, Static] is
+        if equal(path, "/.well-known/openid-configuration") or equal(path, "/jwks") or equal(path, "/")
+            or equal(path, "/account") or equal(path, "/login/logout") then
+            return "GET, HEAD";
+        else if equal(path, "/authorize") or equal(path, "/logout") or equal(path, "/login")
+            or equal(path, "/login/password") or equal(path, "/login/totp") then
+            return "GET, HEAD, POST";
+        else if equal(path, "/token") or equal(path, "/lang") or equal(path, "/account/password")
+            or equal(path, "/account/totp") or equal(path, "/account/totp/confirm")
+            or equal(path, "/account/session/end") or equal(path, "/account/device/revoke")
+            or equal(path, "/login/passkey") or equal(path, "/account/passkey") or equal(path, "/account/passkey/add")
+            or equal(path, "/account/passkey/rename") or equal(path, "/account/passkey/remove") then
+            return "POST";
+        end if;
+        return "";
+    end;
+
+    generic [W: Region]
+    function settingsOf(world: &[World, W]): &[OpSettings, W] is
+        return &(world->settings);
+    end;
+
+    generic [W: Region]
+    function ringOf(world: &[World, W]): &[Buffer[RingKey], W] is
+        return &(world->ring);
+    end;
+
+    -- The answer of the route of path for verb, a head request as a GET.
+    generic [Q: Region, D: Region, W: Region, L: Region, P: Region, V: Region]
+    function routed(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        path: Span[Nat8, P], verb: Span[Nat8, V], now: Int64): String is
+        let get: Bool := equal(verb, "GET") or equal(verb, "HEAD");
+        let post: Bool := equal(verb, "POST");
+        if get then
+            if equal(path, "/.well-known/openid-configuration") then
+                return discoveryEndpoint(&~db, settingsOf(world));
+            else if equal(path, "/jwks") then
+                return jwksEndpoint(ringOf(world));
+            else if equal(path, "/") then
+                return home(request, &~db, world, &~log, now);
+            else if equal(path, "/account") then
+                return account(request, &~db, world, &~log, now);
+            else if equal(path, "/login") then
+                return loginForm(request, &~db, world, &~log, now);
+            else if equal(path, "/login/password") then
+                return passwordForm(request, &~db, world, &~log, now);
+            else if equal(path, "/login/totp") then
+                return totpForm(request, &~db, world, &~log, now);
+            else if equal(path, "/login/logout") then
+                return logoutForm(request, &~db, world, now);
+            end if;
+        end if;
+        if post then
+            if equal(path, "/token") then
+                let ip: String := remoteAddr(request);
+                let out: String := tokenEndpoint(request, &~db, settingsOf(world), ringOf(world), &~log, asSpan(&ip), now);
+                destroyString(ip);
+                return out;
+            else if equal(path, "/lang") then
+                return setLanguage(request);
+            else if equal(path, "/login") then
+                return loginSubmit(request, &~db, world, &~log, now);
+            else if equal(path, "/login/password") then
+                return passwordSubmit(request, &~db, world, &~log, now);
+            else if equal(path, "/login/totp") then
+                return totpSubmit(request, &~db, world, &~log, now);
+            else if equal(path, "/account/password") then
+                return accountPassword(request, &~db, world, &~log, now);
+            else if equal(path, "/account/totp") then
+                return accountTotpBegin(request, &~db, world, &~log, now);
+            else if equal(path, "/account/totp/confirm") then
+                return accountTotpConfirm(request, &~db, world, &~log, now);
+            else if equal(path, "/account/session/end") then
+                return accountEndSession(request, &~db, world, &~log, now);
+            else if equal(path, "/account/device/revoke") then
+                return accountRevokeDevice(request, &~db, world, &~log, now);
+            else if equal(path, "/login/passkey") then
+                return passkeySubmit(request, &~db, world, &~log, now);
+            else if equal(path, "/account/passkey") then
+                return accountPasskeyBegin(request, &~db, world, &~log, now);
+            else if equal(path, "/account/passkey/add") then
+                return accountPasskeyAdd(request, &~db, world, &~log, now);
+            else if equal(path, "/account/passkey/rename") then
+                return accountPasskeyRename(request, &~db, world, &~log, now);
+            else if equal(path, "/account/passkey/remove") then
+                return accountPasskeyRemove(request, &~db, world, &~log, now);
+            end if;
+        end if;
+        if get or post then
+            if equal(path, "/authorize") then
+                let ip: String := remoteAddr(request);
+                let out: String := authorizeEndpoint(request, &~db, settingsOf(world), &~log, asSpan(&ip), now);
+                destroyString(ip);
+                return out;
+            else if equal(path, "/logout") then
+                return logoutEndpoint(request, &~db, settingsOf(world), ringOf(world), &~log, now);
+            end if;
+        end if;
+        let allow: Span[Nat8, Static] := routeOf(path);
+        if spanLength(allow) = 0 then
+            return plain(404, "404 page not found\n", "");
+        end if;
+        return plain(405, "Method Not Allowed\n", allow);
+    end;
+
+    -- A context and the answer made with it.
+    record Answered: Linear is
+        context: Context;
+        answer: String;
+    end;
+
+    -- The answer of the route of request, made with context.
+    generic [Q: Region]
+    function answeredWith(request: &[Request, Q], context: Context, now: Int64): Answered is
+        let { config: Config, db as connection: Database[Writing], settings: OpSettings, ring: Buffer[RingKey],
+            secrets: Secrets, log as written: Log } := context;
+        var db: Database[Writing] := connection;
+        var log: Log := written;
+        let world: World := World(config => config, settings => settings, ring => ring, secrets => secrets);
+        let target: String := orEmpty(requestPath(request));
+        let verb: String := orEmpty(requestMethod(request));
+        var out: String := fromSpan("");
+        destroyString(out);
+        if length(&target) = 0 then
+            out := plain(404, "404 page not found\n", "");
+        else
+            out := routed(request, &!db, &world, &!log, asSpan(&target), asSpan(&verb), now);
+        end if;
+        destroyString(target);
+        destroyString(verb);
+        let { config as c: Config, settings as s: OpSettings, ring as r: Buffer[RingKey], secrets as k: Secrets } := world;
+        return Answered(context => Context(config => c, db => db, settings => s, ring => r, secrets => k, log => log),
+            answer => out);
+    end;
+
+    -- A context after maintain, and whether it maintained, so that its
+    -- keys may have changed.
+    record Upkept: Linear is
+        context: Context;
+        done: Bool;
+    end;
+
+    -- Maintains with context when the last round lies an hour back,
+    -- and writes a failure to the system log.
+    function maintainedContext(context: Context, now: Int64): Upkept is
+        let { context as after: Context, outcome: Either[String, Bool] } := maintain(context, now);
+        case outcome of
+            when Left(left as message: String) do
+                logFailure(message);
+                return Upkept(context => after, done => false);
+            when Right(right as done: Bool) do
+                return Upkept(context => after, done => done);
+        end case;
+    end;
+
+    generic [Q: Region, P: Region]
+    function respond(request: &[Request, Q], path: Span[Nat8, P], now: Int64): String is
+        case openContext(path, now) of
+            when Left(left as message: String) do
+                logFailure(message);
+                return plain(500, "RAMBO: internal error\n", "");
+            when Right(right as opened: Context) do
+                let { context as after: Context, done: Bool } := maintainedContext(opened, now);
+                let { context as used: Context, answer: String } := answeredWith(request, after, now);
+                closeContext(used);
+                return answer;
+        end case;
+    end;
+
+    function handle(request: Request): String is
+        let path: String := configPath();
+        let out: String := respond(&request, asSpan(&path), nowSeconds());
+        destroyString(path);
+        destroyRequest(request);
+        return out;
+    end;
+
+    ---
+    --- A worker of the server
+    ---
+
+    -- A worker opens its world again this many seconds after it opened
+    -- it, so that a file changed in place is read within a minute.
+    constant reopenAfter: Int64 := 60;
+    -- A worker asks this often whether it is its turn to maintain.
+    constant checkEvery: Int64 := 60;
+
+    -- What lstat says of one file the world was opened from; found false
+    -- when it could not be looked at.  A file replaced by a rename has
+    -- another inode, one written in place mostly another size.
+    record FileStamp: Free is
+        found: Bool;
+        device: Nat64;
+        inode: Nat64;
+        size: Nat64;
+    end;
+
+    -- The stamps of the configuration, the vault and the file of its key.
+    record Stamp: Free is
+        config: FileStamp;
+        vault: FileStamp;
+        pepper: FileStamp;
+    end;
+
+    -- What a worker opened: the context, the stamp of its files, when it
+    -- was opened, when the worker last asked for maintenance and last
+    -- looked at the files, and the answers of /jwks and discovery made of
+    -- it.
+    record Held: Linear is
+        context: Context;
+        stamp: Stamp;
+        opened: Int64;
+        checked: Int64;
+        looked: Int64;
+        jwks: String;
+        discovery: String;
+    end;
+
+    record Worker: Linear is
+        path: String;
+        held: Option[Held];
+    end;
+
+    generic [P: Region]
+    function makeWorker(path: Span[Nat8, P]): Worker is
+        let none: Option[Held] := None();
+        return Worker(path => fromSpan(path), held => none);
+    end;
+
+    function closeHeld(held: Held): Unit is
+        let { context: Context, stamp: Stamp, opened: Int64, checked: Int64, looked: Int64, jwks: String,
+            discovery: String } := held;
+        closeContext(context);
+        destroyString(jwks);
+        destroyString(discovery);
+        return nil;
+    end;
+
+    function closeWorker(worker: Worker): Unit is
+        let { path: String, held: Option[Held] } := worker;
+        destroyString(path);
+        case held of
+            when Some(value as open: Held) do
+                closeHeld(open);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [P: Region]
+    function fileStamp(path: Span[Nat8, P]): FileStamp is
+        case statusOf(path) of
+            when FileFound(status: FileStatus) do
+                return FileStamp(found => true, device => status.device, inode => status.inode, size => status.size);
+            when FileMissing do
+                return FileStamp(found => false, device => 0, inode => 0, size => 0);
+            when FileUnreadable do
+                return FileStamp(found => false, device => 0, inode => 0, size => 0);
+        end case;
+    end;
+
+    function sameFile(left: FileStamp, right: FileStamp): Bool is
+        return (left.found = right.found) and (left.device = right.device) and (left.inode = right.inode)
+            and (left.size = right.size);
+    end;
+
+    function sameStamp(left: Stamp, right: Stamp): Bool is
+        return sameFile(left.config, right.config) and sameFile(left.vault, right.vault)
+            and sameFile(left.pepper, right.pepper);
+    end;
+
+    generic [H: Region]
+    function contextOf(held: &[Held, H]): &[Context, H] is
+        return &(held->context);
+    end;
+
+    generic [C: Region]
+    function configOf(context: &[Context, C]): &[Config, C] is
+        return &(context->config);
+    end;
+
+    generic [C: Region]
+    function contextRing(context: &[Context, C]): &[Buffer[RingKey], C] is
+        return &(context->ring);
+    end;
+
+    generic [C: Region]
+    function contextSettings(context: &[Context, C]): &[OpSettings, C] is
+        return &(context->settings);
+    end;
+
+    -- The stamp of the files of config, path the configuration itself.
+    generic [P: Region, C: Region]
+    function stampOf(path: Span[Nat8, P], config: &[Config, C]): Stamp is
+        return Stamp(config => fileStamp(path), vault => fileStamp(asSpan(&(config->vault))),
+            pepper => fileStamp(asSpan(&(config->pepper))));
+    end;
+
+    generic [H: Region]
+    function heldStamp(held: &[Held, H]): Stamp is
+        return held->stamp;
+    end;
+
+    generic [H: Region]
+    function heldOpened(held: &[Held, H]): Int64 is
+        return held->opened;
+    end;
+
+    generic [H: Region]
+    function heldLooked(held: &[Held, H]): Int64 is
+        return held->looked;
+    end;
+
+    -- Whether held may still serve at now: opened less than reopenAfter
+    -- ago, and its files not replaced since.  The files are looked at once
+    -- a second, not at every request, so a replaced file is seen within a
+    -- second.
+    generic [P: Region, H: Region]
+    function current(path: Span[Nat8, P], held: &[Held, H], now: Int64): Bool is
+        let opened: Int64 := heldOpened(held);
+        if (now < opened) or ((now - opened) >= reopenAfter) then
+            return false;
+        end if;
+        if heldLooked(held) = now then
+            return true;
+        end if;
+        return sameStamp(heldStamp(held), stampOf(path, configOf(contextOf(held))));
+    end;
+
+    -- held, looked at at now.
+    function lookedAt(held: Held, now: Int64): Held is
+        let { context: Context, stamp: Stamp, opened: Int64, checked: Int64, looked: Int64, jwks: String,
+            discovery: String } := held;
+        return Held(context => context, stamp => stamp, opened => opened, checked => checked, looked => now, jwks => jwks,
+            discovery => discovery);
+    end;
+
+    generic [S: Region]
+    function issuerOf(settings: &[OpSettings, S]): Span[Nat8, S] is
+        return asSpan(&(settings->issuer));
+    end;
+
+    -- The answer of discovery for context.
+    generic [C: Region]
+    function discoveryOf(context: &[Context, C]): String is
+        let document: String := discoveryDocument(issuerOf(contextSettings(context)));
+        let output: String := jsonOutput(200, "application/json", asSpan(&document), "public, max-age=300");
+        destroyString(document);
+        return output;
+    end;
+
+    -- The world at path opened for a worker at now, maintained when it is
+    -- its turn; Left the text that says what failed.
+    generic [P: Region]
+    function openHeld(path: Span[Nat8, P], now: Int64): Either[String, Held] is
+        case openContext(path, now) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as opened: Context) do
+                let { context: Context, done: Bool } := maintainedContext(opened, now);
+                let stamp: Stamp := stampOf(path, configOf(&context));
+                let jwks: String := jwksEndpoint(contextRing(&context));
+                let discovery: String := discoveryOf(&context);
+                return Right(right => Held(context => context, stamp => stamp, opened => now, checked => now, looked => now, jwks => jwks,
+                    discovery => discovery));
+        end case;
+    end;
+
+    -- held and the answer made with it.
+    record HeldAnswer: Linear is
+        held: Held;
+        answer: String;
+    end;
+
+    -- The answer of rambo to request with what held keeps.  Discovery and
+    -- /jwks are answered from the answers made when held was opened.
+    generic [Q: Region]
+    function servedHeld(request: &[Request, Q], held: Held, now: Int64): HeldAnswer is
+        let { context: Context, stamp: Stamp, opened: Int64, checked: Int64, looked: Int64, jwks: String,
+            discovery: String } := held;
+        var world: Context := context;
+        var keys: String := jwks;
+        var asked: Int64 := checked;
+        if (now < checked) or ((now - checked) >= checkEvery) then
+            let { context as after: Context, done: Bool } := maintainedContext(world, now);
+            world := after;
+            asked := now;
+            if done then
+                destroyString(keys);
+                keys := jwksEndpoint(contextRing(&world));
+            end if;
+        end if;
+        let target: String := orEmpty(requestPath(request));
+        let verb: String := orEmpty(requestMethod(request));
+        let get: Bool := equal(asSpan(&verb), "GET") or equal(asSpan(&verb), "HEAD");
+        var out: String := fromSpan("");
+        destroyString(out);
+        if get and equal(asSpan(&target), "/jwks") then
+            out := fromSpan(asSpan(&keys));
+        else if get and equal(asSpan(&target), "/.well-known/openid-configuration") then
+            out := fromSpan(asSpan(&discovery));
+        else
+            let { context as used: Context, answer: String } := answeredWith(request, world, now);
+            world := used;
+            out := answer;
+        end if;
+        destroyString(target);
+        destroyString(verb);
+        return HeldAnswer(held => Held(context => world, stamp => stamp, opened => opened, checked => asked, looked => looked, jwks => keys,
+            discovery => discovery), answer => out);
+    end;
+
+    -- What held is still good for at now: itself when it is current, else
+    -- nothing, closed.
+    generic [P: Region]
+    function kept(path: Span[Nat8, P], held: Option[Held], now: Int64): Option[Held] is
+        case held of
+            when Some(value as open: Held) do
+                if current(path, &open, now) then
+                    let some: Option[Held] := Some(value => lookedAt(open, now));
+                    return some;
+                end if;
+                closeHeld(open);
+                let none: Option[Held] := None();
+                return none;
+            when None do
+                let none: Option[Held] := None();
+                return none;
+        end case;
+    end;
+
+    function handleWith(turn: Turn[Worker]): Served[Worker] is
+        let { state as worker: Worker, request: Request } := turn;
+        let { path: String, held: Option[Held] } := worker;
+        let now: Int64 := nowSeconds();
+        let open: Option[Held] := kept(asSpan(&path), held, now);
+        case open of
+            when Some(value as ready: Held) do
+                let result: HeldAnswer := servedHeld(&request, ready, now);
+                destroyRequest(request);
+                let { held as used: Held, answer: String } := result;
+                let some: Option[Held] := Some(value => used);
+                return Served(state => Worker(path => path, held => some), answer => answer);
+            when None do
+                case openHeld(asSpan(&path), now) of
+                    when Left(left as message: String) do
+                        logFailure(message);
+                        destroyRequest(request);
+                        let none: Option[Held] := None();
+                        return Served(state => Worker(path => path, held => none),
+                            answer => plain(500, "RAMBO: internal error\n", ""));
+                    when Right(right as fresh: Held) do
+                        let result: HeldAnswer := servedHeld(&request, fresh, now);
+                        destroyRequest(request);
+                        let { held as used: Held, answer: String } := result;
+                        let some: Option[Held] := Some(value => used);
+                        return Served(state => Worker(path => path, held => some), answer => answer);
+                end case;
+        end case;
+    end;
+end module body.

@@ -1,0 +1,257 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The pages and their helpers.  The cases of the language and of the local
+-- paths are those the earlier Go provider tests its own with.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack
+);
+import Standard.Text (
+    equal,
+    contains
+);
+import Rambo.Pages (
+    Frame,
+    MessagePage,
+    LoginPage,
+    StepPage,
+    AccountPage,
+    ConfirmPage,
+    HomePage,
+    Tile,
+    AppRow,
+    SessionRow,
+    PasskeyRow,
+    PasskeyAddPage,
+    destroyMessagePage,
+    destroyLoginPage,
+    destroyStepPage,
+    destroyAccountPage,
+    destroyConfirmPage,
+    destroyHomePage,
+    destroyPasskeyAddPage,
+    renderMessage,
+    renderLogout,
+    renderLogin,
+    renderTotp,
+    renderAccount,
+    renderConfirm,
+    renderHome,
+    renderPasskeyAdd,
+    whenText,
+    ipHtml,
+    initialOf,
+    groupSecret,
+    localPath,
+    languageOf
+);
+
+module body Rambo.Pages.Test is
+    function langIs(header: Span[Nat8, Static], want: Span[Nat8, Static]): Bool is
+        return equal(languageOf("", header), want);
+    end;
+
+    function testLanguage(): Unit is
+        assertTrue(langIs("", "en"), "nothing");
+        assertTrue(langIs("de", "de"), "de");
+        assertTrue(langIs("de-CH, en;q=0.5", "de"), "a region tag");
+        assertTrue(langIs("en-US,en;q=0.9,de;q=0.8", "en"), "en first");
+        assertTrue(langIs("fr, de;q=0.3", "de"), "an unknown first");
+        assertTrue(langIs("de;q=0, en;q=0.1", "en"), "q=0 is not this");
+        assertTrue(langIs("de;q=0", "en"), "only q=0");
+        assertTrue(langIs("de;q=abc, en", "en"), "a q that is no number");
+        assertTrue(langIs("de;q=7, en;q=0.2", "en"), "a q above 1");
+        assertTrue(langIs("fr, it", "en"), "none known");
+        assertTrue(langIs("x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,de", "en"), "beyond 16 tags");
+        assertTrue(equal(languageOf("de", "en"), "de"), "the cookie first");
+        assertTrue(equal(languageOf("xx", "de"), "de"), "a cookie that is no language");
+        return nil;
+    end;
+
+    function pathIs(p: Span[Nat8, Static], want: Span[Nat8, Static]): Bool is
+        let found: String := localPath(p);
+        let same: Bool := equal(asSpan(&found), want);
+        destroyString(found);
+        return same;
+    end;
+
+    function testLocalPath(): Unit is
+        assertTrue(pathIs("/login?req=abc", "/login?req=abc"), "a login");
+        assertTrue(pathIs("/account", "/account"), "the account");
+        assertTrue(pathIs("/", "/"), "the root");
+        assertTrue(pathIs("//evil.example", "/"), "another host");
+        assertTrue(pathIs("//evil.example/login", "/"), "another host with a path");
+        assertTrue(pathIs("/\\evil.example", "/"), "a backslash");
+        assertTrue(pathIs("https://evil.example/", "/"), "a URL");
+        assertTrue(pathIs("evil.example", "/"), "no slash");
+        assertTrue(pathIs("", "/"), "empty");
+        assertTrue(pathIs("/login\r\nSet-Cookie: x=", "/"), "a line break");
+        assertTrue(pathIs("/login\u{0}", "/"), "a zero byte");
+        assertTrue(pathIs("/login\u{7f}", "/"), "a delete");
+        return nil;
+    end;
+
+    function textIs(found: String, want: Span[Nat8, Static]): Bool is
+        let same: Bool := equal(asSpan(&found), want);
+        destroyString(found);
+        return same;
+    end;
+
+    function testShown(): Unit is
+        assertTrue(textIs(whenText(1761141900), "2025-10-22 14:05"), "a time in UTC");
+        assertTrue(textIs(whenText(0), "\u{2013}"), "no time");
+        assertTrue(textIs(ipHtml("2001:db8::1"), "2001:<wbr>db8:<wbr>:<wbr>1"), "IPv6 may break");
+        assertTrue(textIs(ipHtml("192.0.2.1"), "192.0.2.1"), "IPv4 does not");
+        assertTrue(textIs(ipHtml(""), "\u{2013}"), "no address");
+        assertTrue(textIs(ipHtml("<x>"), "&lt;x&gt;"), "escaped");
+        assertTrue(textIs(initialOf("  lucy"), "L"), "a capital");
+        assertTrue(textIs(initialOf("\u{e4}rger"), "\u{e4}"), "a letter of two bytes");
+        assertTrue(textIs(initialOf(""), "?"), "no name");
+        assertTrue(textIs(groupSecret("JBSWY3DPEHPK3PXP===="), "JBSW Y3DP EHPK 3PXP"), "blocks of four");
+        return nil;
+    end;
+
+    function frame(title: Span[Nat8, Static], error: Span[Nat8, Static], nav: Span[Nat8, Static]): Frame is
+        return Frame(title => fromSpan(title), error => fromSpan(error), info => fromSpan(""), back => fromSpan("/login?req=r1"),
+            card => true, nav => fromSpan(nav), version => fromSpan("v1.0.0"), csrfLogout => fromSpan("tok-logout"));
+    end;
+
+    generic [R: Region]
+    function has(html: &[String, R], part: Span[Nat8, Static]): Bool is
+        return contains(asSpan(html), part);
+    end;
+
+    function testLoginPage(): Unit is
+        let page: LoginPage := LoginPage(lang => fromSpan("de"), frame => frame("Anmelden", "<b>falsch</b>", ""),
+            req => fromSpan("r1"), client => fromSpan("Lucy & Co"), reauth => false, email => fromSpan("\"a\"@x.de"),
+            pow => fromSpan("1.id.14.99.YQ.mac"), powBits => 14, powTimeout => 120000, powBatch => 256,
+            passkey => fromSpan("ch-1"), party => fromSpan("auth.example.org"));
+        let html: String := renderLogin(&page);
+        assertTrue(has(&html, "data-challenge=\"ch-1\""), "the challenge of the passkey");
+        assertTrue(has(&html, "data-party=\"auth.example.org\""), "its relying party");
+        assertTrue(has(&html, "action=\"/login/passkey\""), "where the passkey goes");
+        assertTrue(has(&html, "<script src=\"/static/passkey.js\"></script>"), "the script of the passkey");
+        assertTrue(has(&html, "<html lang=\"de\">"), "the language");
+        assertTrue(has(&html, "<title>Anmelden &middot; RAMBO</title>"), "the title");
+        assertTrue(has(&html, "&lt;b&gt;falsch&lt;/b&gt;"), "the error escaped");
+        assertTrue(has(&html, "Lucy &amp; Co"), "the client escaped");
+        assertTrue(has(&html, "value=\"&#34;a&#34;@x.de\""), "the address escaped in its attribute");
+        assertTrue(has(&html, "data-pow-bits=\"14\""), "the bits");
+        assertTrue(has(&html, "data-pow-timeout=\"120000\""), "the time limit");
+        assertTrue(has(&html, "<main class=\"signin\">"), "a card");
+        assertTrue(has(&html, "aria-pressed=\"true\" disabled=\"\">&#x1F1E9;"), "de pressed");
+        assertFalse(has(&html, "<nav"), "no menu");
+        assertTrue(has(&html, "RAMBO v1.0.0"), "the version");
+        destroyString(html);
+        destroyLoginPage(page);
+        return nil;
+    end;
+
+    function testOtherPages(): Unit is
+        let message: MessagePage := MessagePage(lang => fromSpan("en"), frame => frame("Signed out", "", ""));
+        let html: String := renderMessage(&message);
+        assertTrue(has(&html, "<h1>Signed out</h1>"), "a message");
+        destroyString(html);
+        let logout: String := renderLogout(&message);
+        assertTrue(has(&logout, "name=\"csrf\" value=\"tok-logout\""), "the logout token");
+        destroyString(logout);
+        destroyMessagePage(message);
+        let step: StepPage := StepPage(lang => fromSpan("en"), frame => frame("Second factor", "", ""), req => fromSpan("r1"),
+            step => fromSpan("form-1"), qr => fromSpan("data:image/png;base64,AAAA"), secret => fromSpan("JBSW Y3DP"));
+        let totp: String := renderTotp(&step);
+        assertTrue(has(&totp, "<img src=\"data:image/png;base64,AAAA\""), "the QR code");
+        assertTrue(has(&totp, "<code>JBSW Y3DP</code>"), "the secret");
+        assertTrue(has(&totp, "name=\"step\" value=\"form-1\""), "the step token");
+        assertTrue(has(&totp, "autocomplete=\"one-time-code\""), "the code field");
+        destroyString(totp);
+        destroyStepPage(step);
+        var keys: Buffer[PasskeyRow] := allocateEmpty();
+        insertBack(&!keys, PasskeyRow(credential => fromSpan("cred-1"), label => fromSpan("Laptop & Co"),
+            created => whenText(1761141900), lastUsed => fromSpan("")));
+        insertBack(&!keys, PasskeyRow(credential => fromSpan("cred-2"), label => fromSpan("Phone"),
+            created => whenText(1761141900), lastUsed => whenText(1761141900)));
+        let account: AccountPage := AccountPage(lang => fromSpan("en"), frame => frame("Your account", "", "account"),
+            name => fromSpan(""), email => fromSpan("a@example.org"), id => fromSpan("abcdefghijklmnopqrstuvwxya"),
+            csrfPassword => fromSpan("tok-pw"), csrfTotp => fromSpan("tok-totp"), passkeys => keys,
+            csrfPasskey => fromSpan("tok-pk"), csrfPasskeyRename => fromSpan("tok-ren"), csrfPasskeyRemove => fromSpan("tok-rem"));
+        let page: String := renderAccount(&account);
+        assertTrue(has(&page, "value=\"Laptop &amp; Co\""), "the name of a passkey escaped");
+        assertTrue(has(&page, "value=\"cred-1\""), "its credential");
+        assertTrue(has(&page, "<td data-label=\"Last used\">never</td>"), "never used");
+        assertTrue(has(&page, "<span class=\"when\">2025-10-22 14:05</span>"), "a time of use");
+        assertTrue(has(&page, "value=\"tok-rem\""), "the token of the removal");
+        assertTrue(has(&page, "action=\"/account/passkey\""), "the form of a new passkey");
+        let adding: PasskeyAddPage := PasskeyAddPage(lang => fromSpan("de"), frame => frame("Passkey", "", "account"),
+            challenge => fromSpan("ch-2"), party => fromSpan("auth.example.org"), userId => fromSpan("dXNlcg"),
+            userName => fromSpan("a@example.org"), display => fromSpan("<A>"), exclude => fromSpan("cred-1 cred-2"),
+            csrfAdd => fromSpan("tok-add"));
+        let made: String := renderPasskeyAdd(&adding);
+        assertTrue(has(&made, "data-challenge=\"ch-2\""), "the challenge of a new passkey");
+        assertTrue(has(&made, "data-display=\"&lt;A&gt;\""), "the name shown escaped");
+        assertTrue(has(&made, "data-exclude=\"cred-1 cred-2\""), "the passkeys it has");
+        assertTrue(has(&made, "value=\"tok-add\""), "the token of the registration");
+        destroyString(made);
+        destroyPasskeyAddPage(adding);
+        assertTrue(has(&page, "<dd>&ndash;</dd>"), "no name");
+        assertTrue(has(&page, "<a href=\"/account\" aria-current=\"page\">"), "the open entry");
+        assertTrue(has(&page, "value=\"tok-pw\""), "the password token");
+        destroyString(page);
+        destroyAccountPage(account);
+        let confirm: ConfirmPage := ConfirmPage(lang => fromSpan("en"), frame => frame("Please confirm", "", "home"),
+            kind => fromSpan("device"), id => fromSpan("fam1"), label => fromSpan("Lucy (cli)"), created => whenText(1761141900),
+            firstIp => ipHtml("2001:db8::1"), appFirstIp => true, lastSeen => whenText(0), lastIp => ipHtml(""),
+            appLastIp => false, action => fromSpan("/account/device/revoke"), csrfConfirm => fromSpan("tok-c"));
+        let asked: String := renderConfirm(&confirm);
+        assertTrue(has(&asked, "<code class=\"ip\">2001:<wbr>db8:<wbr>:<wbr>1</code>"), "the address as markup");
+        assertTrue(has(&asked, "action=\"/account/device/revoke\""), "where it goes");
+        destroyString(asked);
+        destroyConfirmPage(confirm);
+        return nil;
+    end;
+
+    function testHome(): Unit is
+        var tiles: Buffer[Tile] := allocateEmpty();
+        insertBack(&!tiles, Tile(name => fromSpan("Lucy"), initial => initialOf("Lucy"), logo => fromSpan(""),
+            start => fromSpan("https://lucy.example/login?iss=x")));
+        var apps: Buffer[AppRow] := allocateEmpty();
+        insertBack(&!apps, AppRow(clientName => fromSpan("Board"), label => fromSpan("cli"), created => whenText(1761141900),
+            firstIp => ipHtml("192.0.2.11"), hasFirstIp => true, lastUsed => whenText(1761141900), lastIp => ipHtml("192.0.2.11"),
+            hasLastIp => true, start => fromSpan("https://board.example/"), family => fromSpan("fam-1")));
+        var sessions: Buffer[SessionRow] := allocateEmpty();
+        insertBack(&!sessions, SessionRow(userAgent => fromSpan("Firefox"), created => whenText(1761141900),
+            firstIp => ipHtml("192.0.2.12"), lastSeen => whenText(1761141900), lastIp => ipHtml("192.0.2.12"), id => fromSpan("s1"),
+            current => true));
+        insertBack(&!sessions, SessionRow(userAgent => fromSpan(""), created => whenText(1761141900),
+            firstIp => ipHtml("192.0.2.13"), lastSeen => whenText(1761141900), lastIp => ipHtml("192.0.2.13"), id => fromSpan("s2"),
+            current => false));
+        let home: HomePage := HomePage(lang => fromSpan("de"), frame => frame("Ihre Apps", "", "home"), tiles => tiles,
+            apps => apps, sessions => sessions, csrfSessionEnd => fromSpan("tok-s"), csrfDeviceRevoke => fromSpan("tok-d"));
+        let html: String := renderHome(&home);
+        assertTrue(has(&html, "<span class=\"initial\" aria-hidden=\"true\">L</span><span class=\"label\">Lucy</span>"), "a tile");
+        assertTrue(has(&html, "href=\"https://lucy.example/login?iss=x\""), "its start");
+        assertTrue(has(&html, "Board (cli)"), "an app");
+        assertTrue(has(&html, "Zu Board"), "the switch, with the name put in");
+        assertTrue(has(&html, "value=\"fam-1\""), "its family");
+        assertTrue(has(&html, "<em>"), "this session");
+        assertTrue(has(&html, "value=\"s2\""), "the other session");
+        assertTrue(has(&html, "<td data-label=\"Browser\">&ndash;</td>"), "no browser named");
+        destroyString(html);
+        destroyHomePage(home);
+        return nil;
+    end;
+end module body.

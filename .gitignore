@@ -1,0 +1,5 @@
+_run/
+.DS_Store
+._*
+testdata/gorambo/.rambo.env.lock
+*.sec

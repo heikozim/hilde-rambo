@@ -1,0 +1,5 @@
+# Files of a Hilde tree (HILDE_OVERLAY) that replace those of the image's
+# standard library, one path a line, until the image holds a Hilde with them.
+# The worker loop and the stack of its tasks, -O2 and the Argon2 memory need
+# Hilde's runtime and compiler as well: an image built from the same Hilde
+# tree (RAMBO_IMAGE) as the overlay.

@@ -1,0 +1,1158 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    nthRef,
+    length as bufferLength,
+    destroyEmpty
+);
+import Standard.Text (
+    equal,
+    substring,
+    indexOfByte,
+    formatInt
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Standard.Platform (
+    systemName
+);
+import Wolly.OpUrl (
+    QueryPair,
+    destroyPairs,
+    setPair
+);
+import Wolly.OpBase (
+    valueOf
+);
+import Wolly.Account (
+    isAccountId
+);
+
+module body Rambo.Config is
+    constant second: Int64 := 1000000000;
+    constant minute: Int64 := 60000000000;
+    constant hour: Int64 := 3600000000000;
+
+    function destroyConfig(config: Config): Unit is
+        let { issuer: String, listen: String, httpAddr: String, socketDir: String, socketGroup: String, etcDir: String,
+            varDir: String, db: String, vault: String, pepper: String, sessionIdle: Int64, sessionMax: Int64,
+            banAfter: Int64, banWindow: Int64, banSeconds: Int64, rootAccounts: Buffer[String],
+            tokenAlg: String, path: String } := config;
+        destroyString(tokenAlg);
+        destroyString(issuer);
+        destroyString(listen);
+        destroyString(httpAddr);
+        destroyString(socketDir);
+        destroyString(socketGroup);
+        destroyString(etcDir);
+        destroyString(varDir);
+        destroyString(db);
+        destroyString(vault);
+        destroyString(pepper);
+        destroyStrings(rootAccounts);
+        destroyString(path);
+        return nil;
+    end;
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var rest: Buffer[String] := strings;
+        while bufferLength(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    --- Where things live
+
+    generic [S: Region]
+    function systemDirectories(system: Span[Nat8, S]): Span[Nat8, Static] is
+        if equal(system, "openbsd") then
+            return "/etc/rambo:/var/rambo:/var/run/rambo";
+        end if;
+        if equal(system, "darwin") then
+            return "/usr/local/etc/rambo:/usr/local/var/rambo:/usr/local/var/run/rambo";
+        end if;
+        return "/etc/rambo:/var/lib/rambo:/run/rambo";
+    end;
+
+    -- The nth directory of systemDirectories, counted from 0.
+    generic [S: Region]
+    function directory(system: Span[Nat8, S], nth: Int64): Span[Nat8, Static] is
+        let all: Span[Nat8, Static] := systemDirectories(system);
+        var start: Index := 0;
+        var count: Int64 := 0;
+        var i: Index := 0;
+        while i < spanLength(all) do
+            if all[i] = ':' then
+                if count = nth then
+                    return substring(all, start, i);
+                end if;
+                count := count + 1;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return substring(all, start, spanLength(all));
+    end;
+
+    -- base, a slash and name.
+    generic [B: Region, N: Region]
+    function joined(base: Span[Nat8, B], name: Span[Nat8, N]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, base);
+        writeByte(&!b, '/');
+        writeString(&!b, name);
+        return finalize(b);
+    end;
+
+    function defaultConfigPath(): String is
+        case environmentValue("RAMBO_CONFIG") of
+            when Some(value as given: String) do
+                if length(&given) > 0 then
+                    return given;
+                end if;
+                destroyString(given);
+            when None do
+                skip;
+        end case;
+        return joined(directory(systemName(), 0), "rambo.conf");
+    end;
+
+    --- Reading the file
+
+    generic [P: Region, S: Region]
+    function loadConfig(path: Span[Nat8, P], system: Span[Nat8, S]): Either[String, Config] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let read: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case read of
+                    when Some(value as text: String) do
+                        let result: Either[String, Config] := readConfig(asSpan(&text), path, system);
+                        destroyString(text);
+                        return result;
+                    when None do
+                        return Left(left => cannotOpen(path));
+                end case;
+            when None do
+                return Left(left => cannotOpen(path));
+        end case;
+    end;
+
+    generic [P: Region]
+    function cannotOpen(path: Span[Nat8, P]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "configkit: open ");
+        writeString(&!b, path);
+        writeString(&!b, ": the file cannot be read");
+        return finalize(b);
+    end;
+
+    function isBlank(c: Nat8): Bool is
+        return (c = ' ') or ((c >= 9) and (c <= 13));
+    end;
+
+    -- The first position from start on, before stop, that holds no blank.
+    generic [T: Region]
+    function skipFront(text: Span[Nat8, T], start: Index, stop: Index): Index is
+        var i: Index := start;
+        while i < stop do
+            if not isBlank(text[i]) then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return stop;
+    end;
+
+    -- The end of text between start and stop with the blanks at its end
+    -- left out.
+    generic [T: Region]
+    function skipBack(text: Span[Nat8, T], start: Index, stop: Index): Index is
+        var i: Index := stop;
+        while i > start do
+            if not isBlank(text[i - 1]) then
+                return i;
+            end if;
+            i := i - 1;
+        end while;
+        return start;
+    end;
+
+    -- The position of the next line feed from start on, or the length.
+    generic [T: Region]
+    function lineEnd(text: Span[Nat8, T], start: Index): Index is
+        var i: Index := start;
+        while i < spanLength(text) do
+            if text[i] = 10 then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(text);
+    end;
+
+    -- The position of the first = from start on, before stop, or stop.
+    generic [T: Region]
+    function equalsAt(text: Span[Nat8, T], start: Index, stop: Index): Index is
+        var i: Index := start;
+        while i < stop do
+            if text[i] = '=' then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return stop;
+    end;
+
+    -- Whether the part of text from start to stop ends in a backslash.
+    generic [T: Region]
+    function endsInBackslash(text: Span[Nat8, T], start: Index, stop: Index): Bool is
+        if stop > start then
+            return text[stop - 1] = '\\';
+        end if;
+        return false;
+    end;
+
+    generic [T: Region]
+    function appended(old: String, part: Span[Nat8, T]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, asSpan(&old));
+        writeString(&!b, part);
+        destroyString(old);
+        return finalize(b);
+    end;
+
+    -- The pairs of the file text, read line by line.
+    generic [T: Region]
+    function readPairs(text: Span[Nat8, T]): Buffer[QueryPair] is
+        var pairs: Buffer[QueryPair] := allocateEmpty();
+        var accum: String := fromSpan("");
+        var continuing: Bool := false;
+        var keyStart: Index := 0;
+        var keyStop: Index := 0;
+        var pos: Index := 0;
+        while pos < spanLength(text) do
+            let stop: Index := lineEnd(text, pos);
+            let a: Index := skipFront(text, pos, stop);
+            let b: Index := skipBack(text, a, stop);
+            if continuing then
+                if endsInBackslash(text, a, b) then
+                    accum := appended(accum, substring(text, a, b - 1));
+                else
+                    accum := appended(accum, substring(text, a, b));
+                    setPair(&!pairs, substring(text, keyStart, keyStop), asSpan(&accum));
+                    destroyString(accum);
+                    accum := fromSpan("");
+                    continuing := false;
+                end if;
+            else
+                if (b > a) and (text[a] /= '#') then
+                    let eq: Index := equalsAt(text, a, b);
+                    if eq < b then
+                        keyStart := a;
+                        keyStop := skipBack(text, a, eq);
+                        let va: Index := skipFront(text, eq + 1, b);
+                        if endsInBackslash(text, va, b) then
+                            accum := appended(accum, substring(text, va, b - 1));
+                            continuing := true;
+                        else
+                            setPair(&!pairs, substring(text, keyStart, keyStop), substring(text, va, b));
+                        end if;
+                    end if;
+                end if;
+            end if;
+            pos := stop + 1;
+        end while;
+        if continuing then
+            setPair(&!pairs, substring(text, keyStart, keyStop), asSpan(&accum));
+        end if;
+        destroyString(accum);
+        return pairs;
+    end;
+
+    --- Checking
+
+    constant knownKeys: Span[Nat8, Static] := "issuer listen http_addr socket_dir socket_group etc_dir var_dir db vault pepper session_idle session_max root_accounts login.ban_after login.ban_window login.ban_seconds token_alg";
+
+    -- The error of token_alg, or None.  The algorithm a client that names
+    -- none is signed with: ML-DSA-44, also when the key is left out, or the
+    -- composite ML-DSA-44-Ed25519; any other value is refused.
+    generic [P: Region]
+    function tokenAlgProblem(pairs: &[Buffer[QueryPair], P]): Option[String] is
+        let alg: String := textOf(pairs, "token_alg", "ML-DSA-44");
+        if equal(asSpan(&alg), "ML-DSA-44") or equal(asSpan(&alg), "ML-DSA-44-Ed25519") then
+            destroyString(alg);
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let detail: String := around("token_alg ", asSpan(&alg), ": one of ML-DSA-44, ML-DSA-44-Ed25519");
+        destroyString(alg);
+        return Some(value => detail);
+    end;
+
+    -- Whether key is one of the words of knownKeys.
+    generic [K: Region]
+    function isKnown(key: Span[Nat8, K]): Bool is
+        let keys: Span[Nat8, Static] := knownKeys;
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= spanLength(keys) do
+            var atEnd: Bool := i = spanLength(keys);
+            if not atEnd then
+                atEnd := keys[i] = ' ';
+            end if;
+            if atEnd then
+                if equal(substring(keys, start, i), key) then
+                    return true;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The first key of pairs that is not known, or None.
+    generic [P: Region]
+    function firstUnknown(pairs: &[Buffer[QueryPair], P]): Option[String] is
+        var i: Index := 0;
+        while i < bufferLength(pairs) do
+            let pair: &[QueryPair, P] := nthRef(pairs, i);
+            if not isKnown(asSpan(&(pair->name))) then
+                return Some(value => fromSpan(asSpan(&(pair->name))));
+            end if;
+            i := i + 1;
+        end while;
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    -- text in double quotes as Go's %q writes printable ASCII: a quote and
+    -- a backslash escaped, a control byte as \t, \n, \r or \x and two hex
+    -- digits.
+    generic [T: Region]
+    function quoted(text: Span[Nat8, T]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeByte(&!b, '"');
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let c: Nat8 := text[i];
+            if (c = '"') or (c = '\\') then
+                writeByte(&!b, '\\');
+                writeByte(&!b, c);
+            else
+                if c = 9 then
+                    writeString(&!b, "\\t");
+                else
+                    if c = 10 then
+                        writeString(&!b, "\\n");
+                    else
+                        if c = 13 then
+                            writeString(&!b, "\\r");
+                        else
+                            if (c < 32) or (c = 127) then
+                                writeString(&!b, "\\x");
+                                writeByte(&!b, hexDigit(c / 16));
+                                writeByte(&!b, hexDigit(rem(c, 16)));
+                            else
+                                writeByte(&!b, c);
+                            end if;
+                        end if;
+                    end if;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        writeByte(&!b, '"');
+        return finalize(b);
+    end;
+
+    function hexDigit(n: Nat8): Nat8 is
+        if n < 10 then
+            return '0' + n;
+        end if;
+        return 'a' + (n - 10);
+    end;
+
+    -- config, the path, a colon and detail, which is used up.
+    generic [P: Region]
+    function failure(path: Span[Nat8, P], detail: String): Either[String, Config] is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "config ");
+        writeString(&!b, path);
+        writeString(&!b, ": ");
+        writeString(&!b, asSpan(&detail));
+        destroyString(detail);
+        return Left(left => finalize(b));
+    end;
+
+    -- first, then the text quoted, then last.
+    generic [T: Region]
+    function around(first: Span[Nat8, Static], text: Span[Nat8, T], last: Span[Nat8, Static]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, first);
+        let q: String := quoted(text);
+        writeString(&!b, asSpan(&q));
+        destroyString(q);
+        writeString(&!b, last);
+        return finalize(b);
+    end;
+
+    -- first, the number n, then last.
+    function aroundNumber(first: Span[Nat8, Static], n: Int64, last: Span[Nat8, Static]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, first);
+        let digits: String := formatInt(n);
+        writeString(&!b, asSpan(&digits));
+        destroyString(digits);
+        writeString(&!b, last);
+        return finalize(b);
+    end;
+
+    -- The words of the duration error of Go for text.
+    generic [T: Region]
+    function durationError(key: Span[Nat8, Static], text: Span[Nat8, T]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, key);
+        writeString(&!b, ": time: invalid duration ");
+        let q: String := quoted(text);
+        writeString(&!b, asSpan(&q));
+        destroyString(q);
+        return finalize(b);
+    end;
+
+    --- Durations
+
+    -- Whether unit is the micro sign or the Greek mu in UTF-8, then s.
+    generic [U: Region]
+    function isMicro(unit: Span[Nat8, U]): Bool is
+        if spanLength(unit) /= 3 then
+            return false;
+        end if;
+        if unit[2] /= 's' then
+            return false;
+        end if;
+        return ((unit[0] = 194) and (unit[1] = 181)) or ((unit[0] = 206) and (unit[1] = 188));
+    end;
+
+    -- The factor of unit in nanoseconds, or 0 for no unit.
+    generic [U: Region]
+    function unitFactor(unit: Span[Nat8, U]): Int64 is
+        if equal(unit, "ns") then
+            return 1;
+        end if;
+        if equal(unit, "us") or isMicro(unit) then
+            return 1000;
+        end if;
+        if equal(unit, "ms") then
+            return 1000000;
+        end if;
+        if equal(unit, "s") then
+            return second;
+        end if;
+        if equal(unit, "m") then
+            return minute;
+        end if;
+        if equal(unit, "h") then
+            return hour;
+        end if;
+        return 0;
+    end;
+
+    function isDigit(c: Nat8): Bool is
+        return (c >= '0') and (c <= '9');
+    end;
+
+    function digitOf(c: Nat8): Int64 is
+        case toInt64(c - '0') of
+            when Some(value as d: Int64) do
+                return d;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    constant largest: Int64 := 9223372036854775807;
+
+    generic [T: Region]
+    function goDuration(text: Span[Nat8, T]): Option[Int64] is
+        let none: Option[Int64] := None();
+        let n: Index := spanLength(text);
+        var i: Index := 0;
+        var negative: Bool := false;
+        if n > 0 then
+            if (text[0] = '-') or (text[0] = '+') then
+                negative := text[0] = '-';
+                i := 1;
+            end if;
+        end if;
+        if equal(substring(text, i, n), "0") then
+            return Some(value => (0 : Int64));
+        end if;
+        if i = n then
+            return none;
+        end if;
+        var total: Int64 := 0;
+        while i < n do
+            var whole: Int64 := 0;
+            var digits: Int64 := 0;
+            var tooLarge: Bool := false;
+            while (i < n) and isDigitAt(text, i) do
+                if whole > ((largest - digitOf(text[i])) / 10) then
+                    tooLarge := true;
+                else
+                    whole := (whole * 10) + digitOf(text[i]);
+                end if;
+                digits := digits + 1;
+                i := i + 1;
+            end while;
+            var fraction: Int64 := 0;
+            var scale: Int64 := 1;
+            if (i < n) and isByteAt(text, i, '.') then
+                i := i + 1;
+                while (i < n) and isDigitAt(text, i) do
+                    if scale < 100000000000000000 then
+                        fraction := (fraction * 10) + digitOf(text[i]);
+                        scale := scale * 10;
+                    end if;
+                    digits := digits + 1;
+                    i := i + 1;
+                end while;
+            end if;
+            if (digits = 0) or tooLarge then
+                return none;
+            end if;
+            let unitStart: Index := i;
+            while (i < n) and isUnitByteAt(text, i) do
+                i := i + 1;
+            end while;
+            let factor: Int64 := unitFactor(substring(text, unitStart, i));
+            if factor = 0 then
+                return none;
+            end if;
+            if whole > (largest / factor) then
+                return none;
+            end if;
+            let part: Int64 := (whole * factor) + scaled(fraction, factor, scale);
+            if (part < 0) or (total > (largest - part)) then
+                return none;
+            end if;
+            total := total + part;
+        end while;
+        if negative then
+            return Some(value => 0 - total);
+        end if;
+        return Some(value => total);
+    end;
+
+    -- fraction over scale, times factor, in whole nanoseconds.
+    function scaled(fraction: Int64, factor: Int64, scale: Int64): Int64 is
+        if fraction = 0 then
+            return 0;
+        end if;
+        if factor >= scale then
+            return fraction * (factor / scale);
+        end if;
+        return fraction / (scale / factor);
+    end;
+
+    generic [T: Region]
+    function isDigitAt(text: Span[Nat8, T], i: Index): Bool is
+        if i < spanLength(text) then
+            return isDigit(text[i]);
+        end if;
+        return false;
+    end;
+
+    generic [T: Region]
+    function isByteAt(text: Span[Nat8, T], i: Index, c: Nat8): Bool is
+        if i < spanLength(text) then
+            return text[i] = c;
+        end if;
+        return false;
+    end;
+
+    -- Whether the byte at i can be part of a unit: neither a digit nor a
+    -- dot.
+    generic [T: Region]
+    function isUnitByteAt(text: Span[Nat8, T], i: Index): Bool is
+        if i < spanLength(text) then
+            return not (isDigit(text[i]) or (text[i] = '.'));
+        end if;
+        return false;
+    end;
+
+    -- ns as Go's Duration.String writes it, such as 2h0m0s, 15m0s or 1.5s.
+    function goDurationText(ns: Int64): String is
+        var b: StringBuilder := makeStringBuilder();
+        if ns = 0 then
+            writeString(&!b, "0s");
+            return finalize(b);
+        end if;
+        var u: Int64 := ns;
+        if ns < 0 then
+            writeByte(&!b, '-');
+            u := 0 - ns;
+        end if;
+        if u < second then
+            if u < 1000 then
+                writeDecimal(&!b, u, 1);
+                writeString(&!b, "ns");
+            else
+                if u < 1000000 then
+                    writeDecimal(&!b, u, 1000);
+                    writeByte(&!b, 194);
+                    writeByte(&!b, 181);
+                    writeByte(&!b, 's');
+                else
+                    writeDecimal(&!b, u, 1000000);
+                    writeString(&!b, "ms");
+                end if;
+            end if;
+            return finalize(b);
+        end if;
+        let hours: Int64 := u / hour;
+        let minutes: Int64 := rem(u, hour) / minute;
+        let rest: Int64 := rem(u, minute);
+        if hours > 0 then
+            writeNumber(&!b, hours);
+            writeByte(&!b, 'h');
+        end if;
+        if (hours > 0) or (minutes > 0) then
+            writeNumber(&!b, minutes);
+            writeByte(&!b, 'm');
+        end if;
+        writeDecimal(&!b, rest, second);
+        writeByte(&!b, 's');
+        return finalize(b);
+    end;
+
+    generic [R: Region]
+    function writeNumber(b: &![StringBuilder, R], n: Int64): Unit is
+        let digits: String := formatInt(n);
+        writeString(&~b, asSpan(&digits));
+        destroyString(digits);
+        return nil;
+    end;
+
+    -- value over unit with the fraction written out and its trailing zeros
+    -- left off.
+    generic [R: Region]
+    function writeDecimal(b: &![StringBuilder, R], value: Int64, unit: Int64): Unit is
+        writeNumber(&~b, value / unit);
+        var fraction: Int64 := rem(value, unit);
+        if fraction = 0 then
+            return nil;
+        end if;
+        writeByte(&~b, '.');
+        var place: Int64 := unit / 10;
+        while (place > 0) and (fraction > 0) do
+            let digit: Int64 := fraction / place;
+            writeNumber(&~b, digit);
+            fraction := fraction - (digit * place);
+            place := place / 10;
+        end while;
+        return nil;
+    end;
+
+    --- Values
+
+    -- The duration of key in pairs, or fallback when it is not given.
+    -- Left the error of Go when it does not read.
+    generic [P: Region]
+    function durationOf(pairs: &[Buffer[QueryPair], P], key: Span[Nat8, Static], fallback: Int64): Either[String, Int64] is
+        let text: String := valueOf(pairs, key);
+        if length(&text) = 0 then
+            destroyString(text);
+            return Right(right => fallback);
+        end if;
+        case goDuration(asSpan(&text)) of
+            when Some(value as ns: Int64) do
+                destroyString(text);
+                return Right(right => ns);
+            when None do
+                let message: String := durationError(key, asSpan(&text));
+                destroyString(text);
+                return Left(left => message);
+        end case;
+    end;
+
+    -- The whole number of key in pairs, or fallback when it is not given,
+    -- as Go's strconv.Atoi reads it.
+    generic [P: Region]
+    function numberOf(pairs: &[Buffer[QueryPair], P], key: Span[Nat8, Static], fallback: Int64): Either[String, Int64] is
+        let text: String := valueOf(pairs, key);
+        if length(&text) = 0 then
+            destroyString(text);
+            return Right(right => fallback);
+        end if;
+        case goInteger(asSpan(&text)) of
+            when Some(value as n: Int64) do
+                destroyString(text);
+                return Right(right => n);
+            when None do
+                var b: StringBuilder := makeStringBuilder();
+                writeString(&!b, key);
+                writeString(&!b, ": ");
+                let q: String := quoted(asSpan(&text));
+                writeString(&!b, asSpan(&q));
+                destroyString(q);
+                writeString(&!b, " is not a whole number");
+                destroyString(text);
+                return Left(left => finalize(b));
+        end case;
+    end;
+
+    -- A decimal number with an optional sign, both signs read.
+    generic [T: Region]
+    function goInteger(text: Span[Nat8, T]): Option[Int64] is
+        let none: Option[Int64] := None();
+        let n: Index := spanLength(text);
+        var i: Index := 0;
+        var negative: Bool := false;
+        if n > 0 then
+            if (text[0] = '-') or (text[0] = '+') then
+                negative := text[0] = '-';
+                i := 1;
+            end if;
+        end if;
+        if i = n then
+            return none;
+        end if;
+        -- The value is gathered below zero, where the smallest Int64 fits.
+        let smallest: Int64 := (0 - largest) - 1;
+        var value: Int64 := 0;
+        while i < n do
+            if not isDigit(text[i]) then
+                return none;
+            end if;
+            let d: Int64 := digitOf(text[i]);
+            if value < ((smallest + d) / 10) then
+                return none;
+            end if;
+            value := (value * 10) - d;
+            i := i + 1;
+        end while;
+        if negative then
+            return Some(value => value);
+        end if;
+        if value = smallest then
+            return none;
+        end if;
+        return Some(value => 0 - value);
+    end;
+
+    -- The value of key in pairs, or fallback when it is empty.
+    generic [P: Region, F: Region]
+    function textOf(pairs: &[Buffer[QueryPair], P], key: Span[Nat8, Static], fallback: Span[Nat8, F]): String is
+        let text: String := valueOf(pairs, key);
+        if length(&text) = 0 then
+            destroyString(text);
+            return fromSpan(fallback);
+        end if;
+        return text;
+    end;
+
+    -- The value of key in pairs, or the path base, slash, name when it is
+    -- empty.
+    generic [P: Region, B: Region]
+    function pathOf(pairs: &[Buffer[QueryPair], P], key: Span[Nat8, Static], base: Span[Nat8, B],
+        name: Span[Nat8, Static]): String is
+        let text: String := valueOf(pairs, key);
+        if length(&text) = 0 then
+            destroyString(text);
+            return joined(base, name);
+        end if;
+        return text;
+    end;
+
+    -- The words of text, split at blanks and commas.
+    generic [T: Region]
+    function words(text: Span[Nat8, T]): Buffer[String] is
+        var found: Buffer[String] := allocateEmpty();
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= spanLength(text) do
+            var cut: Bool := i = spanLength(text);
+            if not cut then
+                cut := isBlank(text[i]) or (text[i] = ',');
+            end if;
+            if cut then
+                if i > start then
+                    insertBack(&!found, fromSpan(substring(text, start, i)));
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return found;
+    end;
+
+    generic [T: Region, P: Region, S: Region]
+    function readConfig(text: Span[Nat8, T], path: Span[Nat8, P], system: Span[Nat8, S]): Either[String, Config] is
+        let pairs: Buffer[QueryPair] := readPairs(text);
+        case firstUnknown(&pairs) of
+            when Some(value as key: String) do
+                destroyPairs(pairs);
+                let detail: String := around("unknown key ", asSpan(&key), "");
+                destroyString(key);
+                return failure(path, detail);
+            when None do
+                skip;
+        end case;
+        case tokenAlgProblem(&pairs) of
+            when Some(value as detail: String) do
+                destroyPairs(pairs);
+                return failure(path, detail);
+            when None do
+                skip;
+        end case;
+        let numbers: Either[String, Numbers] := numbersOf(&pairs);
+        case numbers of
+            when Left(left as detail: String) do
+                destroyPairs(pairs);
+                return failure(path, detail);
+            when Right(right as found: Numbers) do
+                let etc: Span[Nat8, Static] := directory(system, 0);
+                let data: Span[Nat8, Static] := directory(system, 1);
+                let rootText: String := valueOf(&pairs, "root_accounts");
+                let roots: Buffer[String] := words(asSpan(&rootText));
+                destroyString(rootText);
+                let config: Config := Config(issuer => valueOf(&pairs, "issuer"), listen => textOf(&pairs, "listen", "fcgi"),
+                    httpAddr => textOf(&pairs, "http_addr", "127.0.0.1:8480"),
+                    socketDir => textOf(&pairs, "socket_dir", directory(system, 2)),
+                    socketGroup => textOf(&pairs, "socket_group", "www"), etcDir => textOf(&pairs, "etc_dir", etc),
+                    varDir => textOf(&pairs, "var_dir", data), db => pathOf(&pairs, "db", data, "rambo.db"),
+                    vault => pathOf(&pairs, "vault", etc, ".rambo.env"),
+                    pepper => pathOf(&pairs, "pepper", data, ".rambo_pepper"), sessionIdle => found.idle / second,
+                    sessionMax => found.max / second, banAfter => found.banAfter, banWindow => found.window / second,
+                    banSeconds => found.banSeconds, rootAccounts => roots,
+                    tokenAlg => textOf(&pairs, "token_alg", "ML-DSA-44"), path => fromSpan(path));
+                destroyPairs(pairs);
+                case problemOf(&config, found) of
+                    when Some(value as detail: String) do
+                        destroyConfig(config);
+                        return failure(path, detail);
+                    when None do
+                        return Right(right => config);
+                end case;
+        end case;
+    end;
+
+    -- The numbers of the file, durations in nanoseconds.
+    record Numbers: Free is
+        idle: Int64;
+        max: Int64;
+        banAfter: Int64;
+        banSeconds: Int64;
+        window: Int64;
+    end;
+
+    -- The numbers of pairs in the order Go reads them, or the error of the
+    -- first that does not read.
+    generic [P: Region]
+    function numbersOf(pairs: &[Buffer[QueryPair], P]): Either[String, Numbers] is
+        var idle: Int64 := 0;
+        case durationOf(pairs, "session_idle", 2 * hour) of
+            when Left(left as e: String) do
+                return Left(left => e);
+            when Right(right as v: Int64) do
+                idle := v;
+        end case;
+        var max: Int64 := 0;
+        case durationOf(pairs, "session_max", 12 * hour) of
+            when Left(left as e: String) do
+                return Left(left => e);
+            when Right(right as v: Int64) do
+                max := v;
+        end case;
+        var after: Int64 := 0;
+        case numberOf(pairs, "login.ban_after", 3) of
+            when Left(left as e: String) do
+                return Left(left => e);
+            when Right(right as v: Int64) do
+                after := v;
+        end case;
+        var seconds: Int64 := 0;
+        case numberOf(pairs, "login.ban_seconds", 900) of
+            when Left(left as e: String) do
+                return Left(left => e);
+            when Right(right as v: Int64) do
+                seconds := v;
+        end case;
+        var window: Int64 := 0;
+        case durationOf(pairs, "login.ban_window", 15 * minute) of
+            when Left(left as e: String) do
+                return Left(left => e);
+            when Right(right as v: Int64) do
+                window := v;
+        end case;
+        return Right(right => Numbers(idle => idle, max => max, banAfter => after, banSeconds => seconds, window => window));
+    end;
+
+    -- What is wrong with config, in the order Go checks it, or None.
+    generic [C: Region]
+    function problemOf(config: &[Config, C], found: Numbers): Option[String] is
+        if not issuerHolds(asSpan(&(config->issuer))) then
+            return Some(value => around("issuer ", asSpan(&(config->issuer)), " must be https://host without path"));
+        end if;
+        let listen: Span[Nat8, C] := asSpan(&(config->listen));
+        if equal(listen, "http") then
+            if not isLoopback(asSpan(&(config->httpAddr))) then
+                return Some(value => around("http_addr ", asSpan(&(config->httpAddr)), ": http mode listens on loopback only"));
+            end if;
+        else
+            if not equal(listen, "fcgi") then
+                return Some(value => around("listen ", listen, ": fcgi or http"));
+            end if;
+        end if;
+        case pathProblem("socket_dir ", asSpan(&(config->socketDir))) of
+            when Some(value as p: String) do
+                return Some(value => p);
+            when None do
+                skip;
+        end case;
+        case pathProblem("etc_dir ", asSpan(&(config->etcDir))) of
+            when Some(value as p: String) do
+                return Some(value => p);
+            when None do
+                skip;
+        end case;
+        case pathProblem("var_dir ", asSpan(&(config->varDir))) of
+            when Some(value as p: String) do
+                return Some(value => p);
+            when None do
+                skip;
+        end case;
+        case pathProblem("db ", asSpan(&(config->db))) of
+            when Some(value as p: String) do
+                return Some(value => p);
+            when None do
+                skip;
+        end case;
+        case pathProblem("vault ", asSpan(&(config->vault))) of
+            when Some(value as p: String) do
+                return Some(value => p);
+            when None do
+                skip;
+        end case;
+        case pathProblem("pepper ", asSpan(&(config->pepper))) of
+            when Some(value as p: String) do
+                return Some(value => p);
+            when None do
+                skip;
+        end case;
+        if (found.idle <= 0) or (found.max <= 0) or (found.idle > found.max) or (found.max > (168 * hour)) then
+            var b: StringBuilder := makeStringBuilder();
+            writeString(&!b, "session_idle ");
+            let idle: String := goDurationText(found.idle);
+            writeString(&!b, asSpan(&idle));
+            destroyString(idle);
+            writeString(&!b, " / session_max ");
+            let max: String := goDurationText(found.max);
+            writeString(&!b, asSpan(&max));
+            destroyString(max);
+            writeString(&!b, ": both positive, idle <= max <= 168h");
+            return Some(value => finalize(b));
+        end if;
+        if (found.banAfter /= 0) and ((found.banAfter < 3) or (found.banAfter > 100)) then
+            return Some(value => aroundNumber("login.ban_after ", found.banAfter, ": 0 (off) or 3 to 100"));
+        end if;
+        if (found.banAfter > 0) and ((found.window < minute) or (found.window > (24 * hour))) then
+            var b: StringBuilder := makeStringBuilder();
+            writeString(&!b, "login.ban_window ");
+            let window: String := goDurationText(found.window);
+            writeString(&!b, asSpan(&window));
+            destroyString(window);
+            writeString(&!b, ": 1m to 24h");
+            return Some(value => finalize(b));
+        end if;
+        if (found.banAfter > 0) and ((found.banSeconds < 60) or (found.banSeconds > 3600)) then
+            return Some(value => aroundNumber("login.ban_seconds ", found.banSeconds, ": 60 to 3600 (the cap BanByCGI sets)"));
+        end if;
+        return rootProblem(&(config->rootAccounts));
+    end;
+
+    generic [P: Region]
+    function pathProblem(name: Span[Nat8, Static], path: Span[Nat8, P]): Option[String] is
+        if isCleanAbsolute(path) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        return Some(value => around(name, path, " must be an absolute, clean path"));
+    end;
+
+    generic [R: Region]
+    function rootProblem(roots: &[Buffer[String], R]): Option[String] is
+        if bufferLength(roots) = 1 then
+            return Some(value => fromSpan("root_accounts needs at least two account IDs (or none while setting up)"));
+        end if;
+        var i: Index := 0;
+        while i < bufferLength(roots) do
+            let id: Span[Nat8, R] := asSpan(nthRef(roots, i));
+            if not isAccountId(id) then
+                return Some(value => around("root_accounts: ", id, " is not an account ID (see `rambo account list`)"));
+            end if;
+            var j: Index := 0;
+            while j < i do
+                if equal(asSpan(nthRef(roots, j)), id) then
+                    return Some(value => around("root_accounts: ", id, " named twice"));
+                end if;
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    -- Whether issuer is https:// and a host, with no path and no query.
+    generic [I: Region]
+    function issuerHolds(issuer: Span[Nat8, I]): Bool is
+        let scheme: Span[Nat8, Static] := "https://";
+        if spanLength(issuer) <= spanLength(scheme) then
+            return false;
+        end if;
+        if not equal(substring(issuer, 0, spanLength(scheme)), scheme) then
+            return false;
+        end if;
+        var i: Index := spanLength(scheme);
+        while i < spanLength(issuer) do
+            let c: Nat8 := issuer[i];
+            if (c = '/') or (c = '?') or (c = '#') or (c <= ' ') or (c = 127) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether addr is host:port with a loopback host, as Go's
+    -- net.SplitHostPort splits it.
+    generic [A: Region]
+    function isLoopback(addr: Span[Nat8, A]): Bool is
+        let n: Index := spanLength(addr);
+        if n = 0 then
+            return false;
+        end if;
+        if addr[0] = '[' then
+            case indexOfByte(addr, ']') of
+                when Some(value as close: Index) do
+                    if (close + 1) >= n then
+                        return false;
+                    end if;
+                    if addr[close + 1] /= ':' then
+                        return false;
+                    end if;
+                    if hasByte(substring(addr, close + 2, n), ':') then
+                        return false;
+                    end if;
+                    return equal(substring(addr, 1, close), "::1") or equal(substring(addr, 1, close), "127.0.0.1")
+                        or equal(substring(addr, 1, close), "localhost");
+                when None do
+                    return false;
+            end case;
+        end if;
+        var colon: Index := n;
+        var count: Int64 := 0;
+        var i: Index := 0;
+        while i < n do
+            if addr[i] = ':' then
+                colon := i;
+                count := count + 1;
+            end if;
+            i := i + 1;
+        end while;
+        if count /= 1 then
+            return false;
+        end if;
+        let host: Span[Nat8, A] := substring(addr, 0, colon);
+        return equal(host, "127.0.0.1") or equal(host, "localhost");
+    end;
+
+    generic [T: Region]
+    function hasByte(text: Span[Nat8, T], c: Nat8): Bool is
+        case indexOfByte(text, c) of
+            when Some(value as at: Index) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [T: Region]
+    function isCleanAbsolute(text: Span[Nat8, T]): Bool is
+        let n: Index := spanLength(text);
+        if n = 0 then
+            return false;
+        end if;
+        if text[0] /= '/' then
+            return false;
+        end if;
+        if n = 1 then
+            return true;
+        end if;
+        if text[n - 1] = '/' then
+            return false;
+        end if;
+        var start: Index := 1;
+        var i: Index := 1;
+        while i <= n do
+            var cut: Bool := i = n;
+            if not cut then
+                cut := text[i] = '/';
+            end if;
+            if cut then
+                let part: Span[Nat8, T] := substring(text, start, i);
+                if (spanLength(part) = 0) or equal(part, ".") or equal(part, "..") then
+                    return false;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [C: Region, I: Region]
+    function isRoot(config: &[Config, C], id: Span[Nat8, I]): Bool is
+        var i: Index := 0;
+        while i < bufferLength(&(config->rootAccounts)) do
+            if equal(asSpan(nthRef(&(config->rootAccounts), i)), id) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+end module body.

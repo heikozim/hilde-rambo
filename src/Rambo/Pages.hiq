@@ -1,0 +1,735 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    removeLast,
+    destroyEmpty,
+    length as bufferLength
+);
+import Standard.Text (
+    equal,
+    trim,
+    toLower,
+    substring,
+    formatInt
+);
+import Standard.Calendar (
+    Instant,
+    Civil,
+    civilAt
+);
+import Standard.Template (
+    Render
+);
+import Standard.I18n (
+    Catalog
+);
+import Wolly.OpBase (
+    htmlEscape
+);
+import Rambo.Messages (
+    Key,
+    AccountApp,
+    AccountAppServer,
+    AccountBrowser,
+    AccountCode,
+    AccountDeviceIpNote,
+    AccountEmail,
+    AccountEnd,
+    AccountId,
+    AccountLastSeen,
+    AccountName,
+    AccountOldPassword,
+    AccountPasskeyAdd,
+    AccountPasskeyAddHint,
+    AccountPasskeyCreated,
+    AccountPasskeyLabel,
+    AccountPasskeyLabelHint,
+    AccountPasskeyLastUsed,
+    AccountPasskeyName,
+    AccountPasskeyNever,
+    AccountPasskeyNone,
+    AccountPasskeyRemove,
+    AccountPasskeyRename,
+    AccountPasskeys,
+    AccountPasskeysHint,
+    AccountPassword,
+    AccountPasswordHint,
+    AccountPasswordSubmit,
+    AccountReauthHint,
+    AccountSessions,
+    AccountSince,
+    AccountThisSession,
+    AccountTotp,
+    AccountTotpHint,
+    AccountTotpSubmit,
+    BoundEnd,
+    BoundSwitch,
+    CommonCancel,
+    ConfirmDevice,
+    ConfirmEndSession,
+    ConfirmRevokeDevice,
+    ConfirmSession,
+    ErrBanned,
+    ErrBusy,
+    ErrCode,
+    ErrCsrf,
+    ErrForm,
+    ErrInvalid,
+    ErrLocked,
+    ErrMismatch,
+    ErrNotFound,
+    ErrPasskey,
+    ErrPasskeyAdd,
+    ErrPasskeyGone,
+    ErrPasskeyKnown,
+    ErrPasskeyLabel,
+    ErrPasskeyMany,
+    ErrPow,
+    ErrPowHarder,
+    ErrReauth,
+    ErrRenewal,
+    ErrRequest,
+    ErrSession,
+    ErrTemporary,
+    ErrThrottled,
+    ErrWeak,
+    FooterAcronym,
+    FooterAuthor,
+    FooterCopyright,
+    HomeBound,
+    HomeBoundHint,
+    HomeNoApps,
+    HomeNoBound,
+    InfoDoneDevice,
+    InfoDonePassword,
+    InfoDoneSession,
+    InfoDoneTotp,
+    InfoLoggedOut,
+    InfoNotSignedIn,
+    InfoPasskeyAdded,
+    InfoPasskeyRemoved,
+    InfoPasskeyRenamed,
+    InfoRestarted,
+    LangDe,
+    LangDeShort,
+    LangEn,
+    LangEnShort,
+    LangLabel,
+    LoginCode,
+    LoginCodeHint,
+    LoginEmail,
+    LoginFor,
+    LoginPasskey,
+    LoginPasskeyOr,
+    LoginPassword,
+    LoginReauth,
+    LoginSubmit,
+    LogoutLead,
+    LogoutSubmit,
+    MessageContinue,
+    NavAccount,
+    NavHome,
+    NavLabel,
+    PasskeyCancelled,
+    PasskeyCreate,
+    PasskeyCreateHint,
+    PasskeyUnsupported,
+    PasskeyWorking,
+    PasswordAgain,
+    PasswordLead,
+    PasswordNew,
+    PasswordRule,
+    PasswordSubmit,
+    PowDone,
+    PowNoscript,
+    PowTimeout,
+    PowUnsupported,
+    PowWorking,
+    RenewLead,
+    TitleAccount,
+    TitleConfirm,
+    TitleError,
+    TitleHome,
+    TitleLoggedOut,
+    TitleLogin,
+    TitleLogout,
+    TitlePasskeyAdd,
+    TitlePassword,
+    TitleTotp,
+    TitleTotpRenew,
+    TotpCode,
+    TotpLead,
+    TotpManual,
+    TotpQrAlt,
+    TotpSubmit,
+    messages
+);
+
+module body Rambo.Pages is
+    function destroyFrame(frame: Frame): Unit is
+        let { title: String, error: String, info: String, back: String, card: Bool, nav: String, version: String,
+            csrfLogout: String } := frame;
+        destroyString(title);
+        destroyString(error);
+        destroyString(info);
+        destroyString(back);
+        destroyString(nav);
+        destroyString(version);
+        destroyString(csrfLogout);
+        return nil;
+    end;
+
+    function destroyMessagePage(page: MessagePage): Unit is
+        let { lang: String, frame: Frame } := page;
+        destroyString(lang);
+        destroyFrame(frame);
+        return nil;
+    end;
+
+    generic [P: Region]
+    function renderMessage(page: &[MessagePage, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/message.jinja", page, out);
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function renderLogout(page: &[MessagePage, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/logout.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function destroyLoginPage(page: LoginPage): Unit is
+        let { lang: String, frame: Frame, req: String, client: String, reauth: Bool, email: String, pow: String,
+            powBits: Int64, powTimeout: Int64, powBatch: Int64, passkey: String, party: String } := page;
+        destroyString(passkey);
+        destroyString(party);
+        destroyString(lang);
+        destroyFrame(frame);
+        destroyString(req);
+        destroyString(client);
+        destroyString(email);
+        destroyString(pow);
+        return nil;
+    end;
+
+    generic [P: Region]
+    function renderLogin(page: &[LoginPage, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/login.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function destroyStepPage(page: StepPage): Unit is
+        let { lang: String, frame: Frame, req: String, step: String, qr: String, secret: String } := page;
+        destroyString(lang);
+        destroyFrame(frame);
+        destroyString(req);
+        destroyString(step);
+        destroyString(qr);
+        destroyString(secret);
+        return nil;
+    end;
+
+    generic [P: Region]
+    function renderPassword(page: &[StepPage, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/password.jinja", page, out);
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function renderTotp(page: &[StepPage, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/totp.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function destroyRenewPage(page: RenewPage): Unit is
+        let { lang: String, frame: Frame, qr: String, secret: String, csrfConfirm: String } := page;
+        destroyString(lang);
+        destroyFrame(frame);
+        destroyString(qr);
+        destroyString(secret);
+        destroyString(csrfConfirm);
+        return nil;
+    end;
+
+    generic [P: Region]
+    function renderRenew(page: &[RenewPage, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/renew.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function destroyAccountPage(page: AccountPage): Unit is
+        let { lang: String, frame: Frame, name: String, email: String, id: String, csrfPassword: String,
+            csrfTotp: String, passkeys: Buffer[PasskeyRow], csrfPasskey: String, csrfPasskeyRename: String,
+            csrfPasskeyRemove: String } := page;
+        destroyPasskeyRows(passkeys);
+        destroyString(csrfPasskey);
+        destroyString(csrfPasskeyRename);
+        destroyString(csrfPasskeyRemove);
+        destroyString(lang);
+        destroyFrame(frame);
+        destroyString(name);
+        destroyString(email);
+        destroyString(id);
+        destroyString(csrfPassword);
+        destroyString(csrfTotp);
+        return nil;
+    end;
+
+    generic [P: Region]
+    function renderAccount(page: &[AccountPage, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/account.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function destroyPasskeyRows(rows: Buffer[PasskeyRow]): Unit is
+        var rest: Buffer[PasskeyRow] := rows;
+        while bufferLength(&rest) > 0 do
+            let { credential: String, label: String, created: String, lastUsed: String } := removeLast(&!rest);
+            destroyString(credential);
+            destroyString(label);
+            destroyString(created);
+            destroyString(lastUsed);
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyPasskeyAddPage(page: PasskeyAddPage): Unit is
+        let { lang: String, frame: Frame, challenge: String, party: String, userId: String, userName: String,
+            display: String, exclude: String, csrfAdd: String } := page;
+        destroyString(lang);
+        destroyFrame(frame);
+        destroyString(challenge);
+        destroyString(party);
+        destroyString(userId);
+        destroyString(userName);
+        destroyString(display);
+        destroyString(exclude);
+        destroyString(csrfAdd);
+        return nil;
+    end;
+
+    generic [P: Region]
+    function renderPasskeyAdd(page: &[PasskeyAddPage, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/passkey-add.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function destroyConfirmPage(page: ConfirmPage): Unit is
+        let { lang: String, frame: Frame, kind: String, id: String, label: String, created: String, firstIp: String,
+            appFirstIp: Bool, lastSeen: String, lastIp: String, appLastIp: Bool, action: String,
+            csrfConfirm: String } := page;
+        destroyString(lang);
+        destroyFrame(frame);
+        destroyString(kind);
+        destroyString(id);
+        destroyString(label);
+        destroyString(created);
+        destroyString(firstIp);
+        destroyString(lastSeen);
+        destroyString(lastIp);
+        destroyString(action);
+        destroyString(csrfConfirm);
+        return nil;
+    end;
+
+    generic [P: Region]
+    function renderConfirm(page: &[ConfirmPage, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/confirm.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function destroyTiles(tiles: Buffer[Tile]): Unit is
+        var rest: Buffer[Tile] := tiles;
+        while bufferLength(&rest) > 0 do
+            let { name: String, initial: String, logo: String, start: String } := removeLast(&!rest);
+            destroyString(name);
+            destroyString(initial);
+            destroyString(logo);
+            destroyString(start);
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyApps(apps: Buffer[AppRow]): Unit is
+        var rest: Buffer[AppRow] := apps;
+        while bufferLength(&rest) > 0 do
+            let { clientName: String, label: String, created: String, firstIp: String, hasFirstIp: Bool, lastUsed: String,
+                lastIp: String, hasLastIp: Bool, start: String, family: String } := removeLast(&!rest);
+            destroyString(clientName);
+            destroyString(label);
+            destroyString(created);
+            destroyString(firstIp);
+            destroyString(lastUsed);
+            destroyString(lastIp);
+            destroyString(start);
+            destroyString(family);
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroySessionRows(sessions: Buffer[SessionRow]): Unit is
+        var rest: Buffer[SessionRow] := sessions;
+        while bufferLength(&rest) > 0 do
+            let { userAgent: String, created: String, firstIp: String, lastSeen: String, lastIp: String, id: String,
+                current: Bool } := removeLast(&!rest);
+            destroyString(userAgent);
+            destroyString(created);
+            destroyString(firstIp);
+            destroyString(lastSeen);
+            destroyString(lastIp);
+            destroyString(id);
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyHomePage(page: HomePage): Unit is
+        let { lang: String, frame: Frame, tiles: Buffer[Tile], apps: Buffer[AppRow], sessions: Buffer[SessionRow],
+            csrfSessionEnd: String, csrfDeviceRevoke: String } := page;
+        destroyString(lang);
+        destroyFrame(frame);
+        destroyTiles(tiles);
+        destroyApps(apps);
+        destroySessionRows(sessions);
+        destroyString(csrfSessionEnd);
+        destroyString(csrfDeviceRevoke);
+        return nil;
+    end;
+
+    generic [P: Region]
+    function renderHome(page: &[HomePage, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/home.jinja", page, out);
+        return finalize(out);
+    end;
+
+    --- What the pages show
+
+    constant dash: Span[Nat8, Static] := "\u{2013}";
+
+    -- n in two digits, a zero in front below 10.
+    generic [R: Region]
+    function writeTwo(b: &![StringBuilder, R], n: Nat8): Unit is
+        writeByte(&~b, '0' + (n / 10));
+        writeByte(&~b, '0' + rem(n, 10));
+        return nil;
+    end;
+
+    function whenText(seconds: Int64): String is
+        if seconds <= 0 then
+            return fromSpan(dash);
+        end if;
+        case civilAt(Instant(seconds => seconds, nanos => 0), 0) of
+            when Some(value as civil: Civil) do
+                var b: StringBuilder := makeStringBuilder();
+                let year: String := formatInt(widen(civil.year));
+                writeString(&!b, asSpan(&year));
+                destroyString(year);
+                writeByte(&!b, '-');
+                writeTwo(&!b, civil.month);
+                writeByte(&!b, '-');
+                writeTwo(&!b, civil.day);
+                writeByte(&!b, ' ');
+                writeTwo(&!b, civil.hour);
+                writeByte(&!b, ':');
+                writeTwo(&!b, civil.minute);
+                return finalize(b);
+            when None do
+                return fromSpan(dash);
+        end case;
+    end;
+
+    function widen(year: Int32): Int64 is
+        case toInt64(year) of
+            when Some(value as y: Int64) do
+                return y;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [A: Region]
+    function ipHtml(addr: Span[Nat8, A]): String is
+        if spanLength(addr) = 0 then
+            return fromSpan(dash);
+        end if;
+        let escaped: String := htmlEscape(addr);
+        var b: StringBuilder := makeStringBuilder();
+        borrow e: &[String, E] := &escaped do
+            let text: Span[Nat8, E] := asSpan(e);
+            var i: Index := 0;
+            while i < spanLength(text) do
+                writeByte(&!b, text[i]);
+                if text[i] = ':' then
+                    writeString(&!b, "<wbr>");
+                end if;
+                i := i + 1;
+            end while;
+        end borrow;
+        destroyString(escaped);
+        return finalize(b);
+    end;
+
+    -- The bytes of the UTF-8 sequence that starts with c, 0 for a byte that
+    -- starts none.
+    function sequenceLength(c: Nat8): Index is
+        if c < 128 then
+            return 1;
+        else if (c >= 194) and (c <= 223) then
+            return 2;
+        else if (c >= 224) and (c <= 239) then
+            return 3;
+        else if (c >= 240) and (c <= 244) then
+            return 4;
+        end if;
+        return 0;
+    end;
+
+    generic [N: Region]
+    function initialOf(name: Span[Nat8, N]): String is
+        let t: Span[Nat8, N] := trim(name);
+        if spanLength(t) = 0 then
+            return fromSpan("?");
+        end if;
+        let n: Index := sequenceLength(t[0]);
+        if (n = 0) or (n > spanLength(t)) then
+            return fromSpan("?");
+        end if;
+        var i: Index := 1;
+        while i < n do
+            if (t[i] < 128) or (t[i] > 191) then
+                return fromSpan("?");
+            end if;
+            i := i + 1;
+        end while;
+        if n = 1 then
+            var b: StringBuilder := makeStringBuilder();
+            if (t[0] >= 'a') and (t[0] <= 'z') then
+                writeByte(&!b, t[0] - 32);
+            else
+                writeByte(&!b, t[0]);
+            end if;
+            return finalize(b);
+        end if;
+        return fromSpan(substring(t, 0, n));
+    end;
+
+    -- The length of secret without the = at its end.
+    generic [S: Region]
+    function withoutPadding(secret: Span[Nat8, S]): Index is
+        var stop: Index := spanLength(secret);
+        while stop > 0 do
+            if secret[stop - 1] /= '=' then
+                return stop;
+            end if;
+            stop := stop - 1;
+        end while;
+        return 0;
+    end;
+
+    generic [S: Region]
+    function groupSecret(secret: Span[Nat8, S]): String is
+        let stop: Index := withoutPadding(secret);
+        var b: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < stop do
+            if (i > 0) and (rem(i, 4) = 0) then
+                writeByte(&!b, ' ');
+            end if;
+            writeByte(&!b, secret[i]);
+            i := i + 1;
+        end while;
+        return finalize(b);
+    end;
+
+    generic [P: Region]
+    function localPath(p: Span[Nat8, P]): String is
+        let n: Index := spanLength(p);
+        if (n = 0) or (n > 512) then
+            return fromSpan("/");
+        end if;
+        if p[0] /= '/' then
+            return fromSpan("/");
+        end if;
+        if n > 1 then
+            if (p[1] = '/') or (p[1] = '\\') then
+                return fromSpan("/");
+            end if;
+        end if;
+        var i: Index := 0;
+        while i < n do
+            if (p[i] < ' ') or (p[i] = 127) then
+                return fromSpan("/");
+            end if;
+            i := i + 1;
+        end while;
+        return fromSpan(p);
+    end;
+
+    --- The language
+
+    -- q of a tag in thousandths, read as a decimal of at most three places
+    -- from 0 to 1; -1 for anything else.
+    generic [T: Region]
+    function quality(text: Span[Nat8, T]): Int64 is
+        let n: Index := spanLength(text);
+        if n = 0 then
+            return -1;
+        end if;
+        var whole: Int64 := -1;
+        var i: Index := 0;
+        if (text[0] >= '0') and (text[0] <= '9') then
+            whole := digitOf(text[0]);
+            i := 1;
+        else if text[0] = '.' then
+            whole := 0;
+        else
+            return -1;
+        end if;
+        var thousandths: Int64 := whole * 1000;
+        if i < n then
+            if text[i] /= '.' then
+                return -1;
+            end if;
+            i := i + 1;
+            var place: Int64 := 100;
+            var digits: Int64 := 0;
+            while i < n do
+                if (text[i] < '0') or (text[i] > '9') then
+                    return -1;
+                end if;
+                thousandths := thousandths + (digitOf(text[i]) * place);
+                place := place / 10;
+                digits := digits + 1;
+                i := i + 1;
+            end while;
+            if (digits = 0) and (whole < 0) then
+                return -1;
+            end if;
+        end if;
+        if thousandths > 1000 then
+            return -1;
+        end if;
+        return thousandths;
+    end;
+
+    function digitOf(c: Nat8): Int64 is
+        case toInt64(c - '0') of
+            when Some(value as d: Int64) do
+                return d;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The position of the first c in text from start on, or the length.
+    generic [T: Region]
+    function find(text: Span[Nat8, T], start: Index, c: Nat8): Index is
+        var i: Index := start;
+        while i < spanLength(text) do
+            if text[i] = c then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(text);
+    end;
+
+    -- The language of one part of the header, de, en or empty, and its q
+    -- in thousandths, -1 when the part does not count.
+    record Choice: Free is
+        lang: Span[Nat8, Static];
+        q: Int64;
+    end;
+
+    generic [T: Region]
+    function choiceOf(part: Span[Nat8, T]): Choice is
+        let none: Choice := Choice(lang => "", q => -1);
+        let p: Span[Nat8, T] := trim(part);
+        let semicolon: Index := find(p, 0, ';');
+        let tag: Span[Nat8, T] := trim(substring(p, 0, semicolon));
+        let dashAt: Index := find(tag, 0, '-');
+        let primary: String := toLower(substring(tag, 0, dashAt));
+        var lang: Span[Nat8, Static] := "";
+        if equal(asSpan(&primary), "de") then
+            lang := "de";
+        else if equal(asSpan(&primary), "en") then
+            lang := "en";
+        end if;
+        destroyString(primary);
+        if spanLength(lang) = 0 then
+            return none;
+        end if;
+        var q: Int64 := 1000;
+        if semicolon < spanLength(p) then
+            let params: Span[Nat8, T] := trim(substring(p, semicolon + 1, spanLength(p)));
+            let equalsAt: Index := find(params, 0, '=');
+            if equalsAt < spanLength(params) then
+                if equal(trim(substring(params, 0, equalsAt)), "q") then
+                    q := quality(trim(substring(params, equalsAt + 1, spanLength(params))));
+                    if q < 0 then
+                        return none;
+                    end if;
+                end if;
+            end if;
+        end if;
+        return Choice(lang => lang, q => q);
+    end;
+
+    generic [C: Region, H: Region]
+    function languageOf(cookie: Span[Nat8, C], header: Span[Nat8, H]): Span[Nat8, Static] is
+        if equal(cookie, "de") then
+            return "de";
+        end if;
+        if equal(cookie, "en") then
+            return "en";
+        end if;
+        let h: Span[Nat8, H] := substring(header, 0, 512);
+        var best: Span[Nat8, Static] := "en";
+        var bestQ: Int64 := -1;
+        var start: Index := 0;
+        var tags: Int64 := 0;
+        while (start <= spanLength(h)) and (tags < 16) do
+            let stop: Index := find(h, start, ',');
+            let choice: Choice := choiceOf(substring(h, start, stop));
+            if (choice.q > 0) and (choice.q > bestQ) then
+                best := choice.lang;
+                bestQ := choice.q;
+            end if;
+            tags := tags + 1;
+            start := stop + 1;
+        end while;
+        return best;
+    end;
+end module body.

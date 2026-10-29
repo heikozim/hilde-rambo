@@ -1,0 +1,134 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The sign-ins that have proven the password but still owe something before
+a session may exist: a new password after a one-time password, or a second
+factor when none is set up yet.  Also the renewal of a second factor that a
+signed-in person has started on the account page.
+
+- A step is kept in the table rambo_steps under the SHA-256 of its token,
+  never under the token the browser holds.
+- A step lives 600 seconds from when it is made; a change does not make it
+  live longer.
+- At most 1024 steps live at once: a step exists only after a right
+  password, so more means a burst of stolen passwords, and a refusal is
+  better than growth.
+- The secret of a second factor being set up is kept sealed under the key
+  of the second factors, and it never goes back to the browser in a form.
+
+    case stepOf(&!db, tokenHash(asSpan(&token)), totpKey, now) of
+        when Right(right as found: Option[Step]) do
+            ...
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Rambo.Steps is
+    """
+    The seconds a step lives: 600.
+    """
+    function stepSeconds(): Int64
+        ensures result = 600;
+
+    """
+    The most steps that live at once: 1024.
+    """
+    function mostSteps(): Int64
+        ensures result = 1024;
+
+    """
+    A step: the account, the login request it belongs to, the methods proven
+    so far as amr writes them, what it still owes, and the secret of a second
+    factor being set up with its otpauth URI, both empty when there is none.
+    A renewal has an empty request.
+    """
+    record Step: Linear is
+        account: String;
+        req: String;
+        amr: String;
+        needPassword: Bool;
+        needTotp: Bool;
+        totpSecret: String;
+        totpUri: String;
+    end;
+
+    """
+    Frees step.
+    No contract: it only frees.
+    """
+    function destroyStep(step: Step): Unit;
+
+    """
+    Makes the table rambo_steps, when it is not there.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareSteps(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    Keeps step under key, the SHA-256 of a token in hex, at now, after the
+    steps that ran out are gone.  A step under key is replaced.  Right false
+    when 1024 steps live already, or the secret does not seal under totpKey.
+    No ensures: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region, S: Region, T: Region]
+    function putStep(db: &![Database[Writing], R], key: Span[Nat8, K], step: &[Step, S], totpKey: Span[Nat8, T],
+        now: Int64): Either[DbError, Bool]
+        requires now > 0;
+
+    """
+    The step under key that lives at now.  Right None when there is none, it
+    ran out, or its secret does not open under totpKey.
+    No ensures: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region, T: Region]
+    function stepOf(db: &![Database[Writing], R], key: Span[Nat8, K], totpKey: Span[Nat8, T],
+        now: Int64): Either[DbError, Option[Step]]
+        requires now > 0;
+
+    """
+    Changes the step under key to step, without making it live longer.
+    Right false when no step under key lives at now.
+    No ensures: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region, S: Region, T: Region]
+    function updateStep(db: &![Database[Writing], R], key: Span[Nat8, K], step: &[Step, S], totpKey: Span[Nat8, T],
+        now: Int64): Either[DbError, Bool]
+        requires now > 0;
+
+    """
+    Removes the step under key.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region]
+    function dropStep(db: &![Database[Writing], R], key: Span[Nat8, K]): Option[DbError];
+
+    """
+    The key of the renewal of the second factor started in the session sid:
+    the SHA-256 in hex of renew, a colon and sid.
+    """
+    generic [S: Region]
+    function renewKey(sid: Span[Nat8, S]): String
+        ensures (length(&result) = 64) or (length(&result) = 0);
+
+    """
+    The form token of a step whose cookie holds cookie: the SHA-256 of a
+    fixed text, a zero byte and cookie, in base64url without padding.  A
+    form posted without the cookie cannot carry it.  Stops the programme
+    when libcrypto gives no digest, so that no empty token can pass.
+    """
+    generic [C: Region]
+    function stepForm(cookie: Span[Nat8, C]): String
+        ensures length(&result) = 43;
+end module.

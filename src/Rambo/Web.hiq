@@ -1,0 +1,319 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    nthRef,
+    length as bufferLength
+);
+import Standard.Text (
+    equal,
+    startsWith,
+    formatInt
+);
+import Standard.Calendar (
+    Instant,
+    Civil,
+    civilAt
+);
+import Standard.FcgiServer (
+    Request,
+    requestParam
+);
+import Standard.I18n (
+    Arguments,
+    makeArguments,
+    addText as addArgument,
+    destroyArguments,
+    translate,
+    noCount
+);
+import Standard.Log (
+    Log,
+    Entry,
+    Info,
+    makeEntry,
+    addText,
+    writeEntry
+);
+import Wolly.Request (
+    requestMethod,
+    requestPath,
+    cookie
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    addNumberHeader,
+    finish
+);
+import Wolly.Ban (
+    withBan
+);
+import Wolly.OpUrl (
+    queryEscape
+);
+import Rambo.Messages (
+    Key,
+    messages
+);
+import Wolly.OpKey (
+    RingKey
+);
+import Wolly.OpBase (
+    OpSettings
+);
+import Rambo.Config (
+    Config
+);
+import Rambo.Context (
+    Secrets
+);
+import Rambo.Pages (
+    Frame,
+    languageOf
+);
+
+module body Rambo.Web is
+    generic [W: Region]
+    function issuerOf(world: &[World, W]): Span[Nat8, W] is
+        return asSpan(&(world->config.issuer));
+    end;
+
+    generic [W: Region]
+    function pepperOf(world: &[World, W]): Span[Nat8, W] is
+        return asSpan(&(world->secrets.pepper));
+    end;
+
+    generic [W: Region]
+    function totpKeyOf(world: &[World, W]): Span[Nat8, W] is
+        return asSpan(&(world->secrets.totpKey));
+    end;
+
+    generic [W: Region]
+    function powKeyOf(world: &[World, W]): Span[Nat8, W] is
+        return asSpan(&(world->secrets.powKey));
+    end;
+
+    function pagePolicy(): Span[Nat8, Static] is
+        return "default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'";
+    end;
+
+    function version(): Span[Nat8, Static] is
+        return "v0.2.0";
+    end;
+
+    function langCookie(): Span[Nat8, Static] is
+        return "__Host-rambo-lang";
+    end;
+
+    -- The value of the CGI parameter name, empty when there is none.
+    generic [Q: Region]
+    function param(request: &[Request, Q], name: Span[Nat8, Static]): String is
+        case requestParam(request, name) of
+            when Some(value as found: String) do
+                return found;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [Q: Region]
+    function remoteAddr(request: &[Request, Q]): String is
+        return param(request, "REMOTE_ADDR");
+    end;
+
+    generic [Q: Region]
+    function langOf(request: &[Request, Q]): Span[Nat8, Static] is
+        let chosen: String := orEmpty(cookie(request, langCookie()));
+        let header: String := param(request, "HTTP_ACCEPT_LANGUAGE");
+        let lang: Span[Nat8, Static] := languageOf(asSpan(&chosen), asSpan(&header));
+        destroyString(chosen);
+        destroyString(header);
+        return lang;
+    end;
+
+    function orEmpty(found: Option[String]): String is
+        case found of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [L: Region]
+    function say(lang: Span[Nat8, L], key: Key): String is
+        let arguments: Arguments := makeArguments();
+        let text: String := translate(messages(), lang, key, noCount(), &arguments);
+        destroyArguments(arguments);
+        return text;
+    end;
+
+    generic [L: Region, A: Region]
+    function sayWith(lang: Span[Nat8, L], key: Key, arg: Span[Nat8, A]): String is
+        var arguments: Arguments := makeArguments();
+        addArgument(&!arguments, "arg", arg);
+        let text: String := translate(messages(), lang, key, noCount(), &arguments);
+        destroyArguments(arguments);
+        return text;
+    end;
+
+    generic [Q: Region, E: Region]
+    function backOf(request: &[Request, Q], req: Span[Nat8, E]): String is
+        let verb: String := orEmpty(requestMethod(request));
+        let isGet: Bool := equal(asSpan(&verb), "GET");
+        destroyString(verb);
+        if isGet then
+            let uri: String := param(request, "REQUEST_URI");
+            if length(&uri) > 0 then
+                return uri;
+            end if;
+            destroyString(uri);
+            return fromSpan("/");
+        end if;
+        let path: String := orEmpty(requestPath(request));
+        if startsWith(asSpan(&path), "/account") then
+            destroyString(path);
+            return fromSpan("/account");
+        end if;
+        if startsWith(asSpan(&path), "/login") and (spanLength(req) > 0) then
+            var b: StringBuilder := makeStringBuilder();
+            writeString(&!b, asSpan(&path));
+            writeString(&!b, "?req=");
+            let escaped: String := queryEscape(req);
+            writeString(&!b, asSpan(&escaped));
+            destroyString(escaped);
+            destroyString(path);
+            return finalize(b);
+        end if;
+        destroyString(path);
+        return fromSpan("/");
+    end;
+
+    generic [Q: Region, L: Region, E: Region]
+    function frameOf(request: &[Request, Q], lang: Span[Nat8, L], title: Key, error: String, info: String,
+        nav: Span[Nat8, Static], csrfLogout: String, card: Bool, req: Span[Nat8, E]): Frame is
+        return Frame(title => say(lang, title), error => error, info => info, back => backOf(request, req), card => card,
+            nav => fromSpan(nav), version => fromSpan(version()), csrfLogout => csrfLogout);
+    end;
+
+    -- response with the security headers of a page.
+    function guarded(response: Response): Response is
+        return addHeader(addHeader(addHeader(addHeader(addHeader(addHeader(response, "Content-Security-Policy", pagePolicy()),
+            "Permissions-Policy", "camera=(), microphone=(), geolocation=()"), "X-Content-Type-Options", "nosniff"),
+            "X-Frame-Options", "SAMEORIGIN"), "Referrer-Policy", "same-origin"), "Cache-Control", "no-store");
+    end;
+
+    -- response with a Set-Cookie header for each of cookies.
+    generic [C: Region]
+    function withCookies(response: Response, cookies: &[Buffer[String], C]): Response is
+        var out: Response := response;
+        var i: Index := 0;
+        while i < bufferLength(cookies) do
+            out := addHeader(out, "Set-Cookie", asSpan(nthRef(cookies, i)));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    generic [H: Region, C: Region]
+    function pageAnswer(status: Nat16, html: Span[Nat8, H], cookies: &[Buffer[String], C], ban: Int64): String is
+        var response: Response := withCookies(guarded(makeResponse(status, "text/html; charset=utf-8")), cookies);
+        if ban > 0 then
+            response := withBan(response, ban);
+        end if;
+        return finish(response, html);
+    end;
+
+    generic [L: Region, C: Region]
+    function redirectAnswer(status: Nat16, location: Span[Nat8, L], cookies: &[Buffer[String], C]): String is
+        let response: Response := withCookies(addHeader(guarded(makeResponse(status, "text/plain; charset=utf-8")),
+            "Location", location), cookies);
+        return finish(response, "");
+    end;
+
+    function noCookies(): Buffer[String] is
+        return allocateEmpty();
+    end;
+
+    -- n in two digits.
+    generic [R: Region]
+    function writeTwo(b: &![StringBuilder, R], n: Nat8): Unit is
+        writeByte(&~b, '0' + (n / 10));
+        writeByte(&~b, '0' + rem(n, 10));
+        return nil;
+    end;
+
+    -- seconds as RFC 3339 in UTC, such as 2026-10-22T14:05:09Z.
+    function rfc3339(seconds: Int64): String is
+        case civilAt(Instant(seconds => seconds, nanos => 0), 0) of
+            when Some(value as civil: Civil) do
+                var b: StringBuilder := makeStringBuilder();
+                case toInt64(civil.year) of
+                    when Some(value as year: Int64) do
+                        let digits: String := formatInt(year);
+                        writeString(&!b, asSpan(&digits));
+                        destroyString(digits);
+                    when None do
+                        skip;
+                end case;
+                writeByte(&!b, '-');
+                writeTwo(&!b, civil.month);
+                writeByte(&!b, '-');
+                writeTwo(&!b, civil.day);
+                writeByte(&!b, 'T');
+                writeTwo(&!b, civil.hour);
+                writeByte(&!b, ':');
+                writeTwo(&!b, civil.minute);
+                writeByte(&!b, ':');
+                writeTwo(&!b, civil.second);
+                writeByte(&!b, 'Z');
+                return finalize(b);
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [L: Region, A: Region, T: Region, R: Region, V: Region, D: Region]
+    function auditLine(log: &![Log, L], actor: Span[Nat8, A], action: Span[Nat8, Static], target: Span[Nat8, T],
+        failed: Bool, reason: Span[Nat8, R], extra: Span[Nat8, Static], value: Span[Nat8, V], addr: Span[Nat8, D],
+        now: Int64): Unit is
+        var result: Span[Nat8, Static] := "ok";
+        if failed then
+            result := "failed";
+        end if;
+        let at: String := rfc3339(now);
+        var entry: Entry := addText(addText(addText(addText(addText(makeEntry(Info(), "audit"), "actor", actor), "action",
+            action), "target", target), "result", result), "at", asSpan(&at));
+        destroyString(at);
+        if spanLength(reason) > 0 then
+            entry := addText(entry, "reason", reason);
+        end if;
+        if spanLength(extra) > 0 then
+            entry := addText(entry, extra, value);
+        end if;
+        entry := addText(entry, "addr", addr);
+        let written: Bool := writeEntry(&~log, entry);
+        return nil;
+    end;
+end module body.

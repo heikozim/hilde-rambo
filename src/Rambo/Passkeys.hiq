@@ -1,0 +1,400 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The keys, their counters and the challenges are Wolly.Passkey's; this
+-- module keeps only what a person sees of a passkey, in a table of its own
+-- under the credential ID.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length,
+    nthByte
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    destroyEmpty,
+    nthRef,
+    length as bufferLength
+);
+import Standard.Text (
+    trim,
+    equal
+);
+import Standard.Libcrypto (
+    sha256
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    noValues,
+    withInt64,
+    withText,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    finish
+);
+import Wolly.Passkey (
+    PasskeyEntry,
+    destroyPasskeyEntries,
+    preparePasskeys,
+    listPasskeys,
+    passkeyOwner,
+    passkeyCount,
+    removePasskey,
+    removePasskeys,
+    relyingPartyId,
+    Refusal,
+    BadName,
+    PasskeyMalformed,
+    PasskeyWrongType,
+    WrongChallenge,
+    WrongOrigin,
+    WrongParty,
+    NotVerified,
+    Attested,
+    BadKey,
+    Known,
+    Unknown,
+    BadSignature,
+    PasskeyReplayed,
+    PasskeyTooMany
+);
+
+module body Rambo.Passkeys is
+    constant makeTable: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS rambo_passkeys (credential TEXT PRIMARY KEY, account TEXT NOT NULL, label TEXT NOT NULL, last_used INTEGER NOT NULL) STRICT";
+    constant putLabel: Span[Nat8, Static] := "INSERT INTO rambo_passkeys (credential, account, label, last_used) VALUES (?, ?, ?, 0) ON CONFLICT (credential) DO UPDATE SET account = excluded.account, label = excluded.label, last_used = 0";
+    constant markUsed: Span[Nat8, Static] := "UPDATE rambo_passkeys SET last_used = ? WHERE credential = ?";
+    constant setLabel: Span[Nat8, Static] := "UPDATE rambo_passkeys SET label = ? WHERE credential = ? AND account = ?";
+    constant putRenamed: Span[Nat8, Static] := "INSERT INTO rambo_passkeys (credential, account, label, last_used) VALUES (?, ?, ?, 0) ON CONFLICT (credential) DO NOTHING";
+    constant dropOne: Span[Nat8, Static] := "DELETE FROM rambo_passkeys WHERE credential = ? AND account = ?";
+    constant dropAll: Span[Nat8, Static] := "DELETE FROM rambo_passkeys WHERE account = ?";
+    constant rowOf: Span[Nat8, Static] := "SELECT label, last_used FROM rambo_passkeys WHERE credential = ? AND account = ?";
+
+    function mostLabel(): Index is
+        return 64;
+    end;
+
+    function destroyPasskeyViews(views: Buffer[PasskeyView]): Unit is
+        var all: Buffer[PasskeyView] := views;
+        while bufferLength(&all) > 0 do
+            let { credential: String, label: String, createdAt: Int64, lastUsed: Int64 } := removeLast(&!all);
+            destroyString(credential);
+            destroyString(label);
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function preparePasskeyTables(db: &![Database[Writing], R]): Option[DbError] is
+        case preparePasskeys(&~db) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case execute(&~db, makeTable, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as made: Nat64) do
+                return None();
+        end case;
+    end;
+
+    generic [I: Region]
+    function partyOf(issuer: Span[Nat8, I]): String is
+        let origin: String := originOf(issuer);
+        let party: String := relyingPartyId(asSpan(&origin));
+        destroyString(origin);
+        return party;
+    end;
+
+    generic [I: Region]
+    function originOf(issuer: Span[Nat8, I]): String is
+        var host: Index := 0;
+        var i: Index := 0;
+        while (i + 2) < spanLength(issuer) do
+            if ((issuer[i] = ':') and (issuer[i + 1] = '/')) and (issuer[i + 2] = '/') then
+                if host = 0 then
+                    host := i + 3;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        var b: StringBuilder := makeStringBuilder();
+        var j: Index := 0;
+        var going: Bool := true;
+        while going and (j < spanLength(issuer)) do
+            if (j >= host) and ((host > 0) and (issuer[j] = '/')) then
+                going := false;
+            else
+                writeByte(&!b, issuer[j]);
+                j := j + 1;
+            end if;
+        end while;
+        return finalize(b);
+    end;
+
+    function hexDigit(n: Nat8): Nat8 is
+        if n < 10 then
+            return n + '0';
+        end if;
+        return (n - 10) + 'a';
+    end;
+
+    generic [Q: Region]
+    function loginBound(req: Span[Nat8, Q]): String is
+        case sha256(req) of
+            when Some(value as hash: String) do
+                var b: StringBuilder := makeStringBuilder();
+                var i: Index := 0;
+                while i < length(&hash) do
+                    let byte: Nat8 := nthByte(&hash, i);
+                    writeByte(&!b, hexDigit(byte / 16));
+                    writeByte(&!b, hexDigit(byte - ((byte / 16) * 16)));
+                    i := i + 1;
+                end while;
+                destroyString(hash);
+                return finalize(b);
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [L: Region]
+    function cleanLabel(typed: Span[Nat8, L]): Option[String] is
+        let text: Span[Nat8, L] := trim(typed);
+        if spanLength(text) = 0 then
+            return Some(value => fromSpan("Passkey"));
+        end if;
+        if spanLength(text) > mostLabel() then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if (text[i] < 32) or (text[i] = 127) then
+                let none: Option[String] := None();
+                return none;
+            end if;
+            i := i + 1;
+        end while;
+        return Some(value => fromSpan(text));
+    end;
+
+    function failure(result: Either[DbError, Nat64]): Option[DbError] is
+        case result of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as changed: Nat64) do
+                return None();
+        end case;
+    end;
+
+    generic [R: Region, C: Region, A: Region, L: Region]
+    function keepLabel(db: &![Database[Writing], R], credential: Span[Nat8, C], account: Span[Nat8, A],
+        label: Span[Nat8, L]): Option[DbError] is
+        return failure(execute(&~db, putLabel, withText(withText(withText(noValues(), credential), account), label)));
+    end;
+
+    generic [R: Region, C: Region]
+    function touchPasskey(db: &![Database[Writing], R], credential: Span[Nat8, C], now: Int64): Option[DbError] is
+        return failure(execute(&~db, markUsed, withText(withInt64(noValues(), now), credential)));
+    end;
+
+    -- Whether account has the passkey credential in Wolly's table.
+    generic [R: Region, A: Region, C: Region]
+    function owns(db: &![Database[Writing], R], account: Span[Nat8, A], credential: Span[Nat8, C]): Either[DbError, Bool] is
+        case passkeyOwner(&~db, credential) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as owner: String) do
+                        let same: Bool := equal(asSpan(&owner), account);
+                        destroyString(owner);
+                        return Right(right => same);
+                    when None do
+                        return Right(right => false);
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, A: Region, C: Region, L: Region]
+    function renamePasskey(db: &![Database[Writing], R], account: Span[Nat8, A], credential: Span[Nat8, C],
+        label: Span[Nat8, L]): Either[DbError, Bool] is
+        case owns(&~db, account, credential) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as mine: Bool) do
+                if not mine then
+                    return Right(right => false);
+                end if;
+        end case;
+        -- A passkey registered before its row was kept gets one now.
+        case execute(&~db, putRenamed, withText(withText(withText(noValues(), credential), account), label)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as put: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, setLabel, withText(withText(withText(noValues(), label), credential), account)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as changed: Nat64) do
+                let done: Bool := changed > 0;
+                return Right(right => done);
+        end case;
+    end;
+
+    generic [R: Region, A: Region, C: Region]
+    function forgetPasskey(db: &![Database[Writing], R], account: Span[Nat8, A],
+        credential: Span[Nat8, C]): Either[DbError, Bool] is
+        case removePasskey(&~db, account, credential) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as there: Bool) do
+                case execute(&~db, dropOne, withText(withText(noValues(), credential), account)) of
+                    when Left(left as error: DbError) do
+                        return Left(left => error);
+                    when Right(right as dropped: Nat64) do
+                        return Right(right => there);
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, A: Region]
+    function forgetPasskeys(db: &![Database[Writing], R], account: Span[Nat8, A]): Either[DbError, Int64] is
+        var held: Int64 := 0;
+        case passkeyCount(&~db, account) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as n: Int64) do
+                held := n;
+        end case;
+        case removePasskeys(&~db, account) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as there: Bool) do
+                skip;
+        end case;
+        case execute(&~db, dropAll, withText(noValues(), account)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as dropped: Nat64) do
+                return Right(right => held);
+        end case;
+    end;
+
+    generic [R: Region, C: Region]
+    function ownerOf(db: &![Database[Writing], R], credential: Span[Nat8, C]): Either[DbError, Option[String]] is
+        return passkeyOwner(&~db, credential);
+    end;
+
+    -- The view of the passkey credential of account made at made, with the
+    -- name and the last use of its row.
+    generic [R: Region, C: Region, A: Region]
+    function viewOf(db: &![Database[Writing], R], credential: Span[Nat8, C], account: Span[Nat8, A],
+        made: Int64): Either[DbError, PasskeyView] is
+        var cursor: Cursor := start(&~db, rowOf, withText(withText(noValues(), credential), account));
+        var label: String := fromSpan("Passkey");
+        var used: Int64 := 0;
+        if advance(&!cursor) then
+            destroyString(label);
+            label := fromSpan(columnText(&cursor, 0));
+            used := columnInt64(&cursor, 1);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyString(label);
+                return Left(left => error);
+            when None do
+                return Right(right => PasskeyView(credential => fromSpan(credential), label => label, createdAt => made,
+                    lastUsed => used));
+        end case;
+    end;
+
+    generic [R: Region, A: Region, E: Region]
+    function viewsOf(db: &![Database[Writing], R], account: Span[Nat8, A],
+        entries: &[Buffer[PasskeyEntry], E]): Either[DbError, Buffer[PasskeyView]] is
+        var all: Buffer[PasskeyView] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(entries) do
+            let entry: &[PasskeyEntry, E] := nthRef(entries, i);
+            case viewOf(&~db, asSpan(&(entry->credential)), account, entry->createdAt) of
+                when Left(left as error: DbError) do
+                    destroyPasskeyViews(all);
+                    return Left(left => error);
+                when Right(right as view: PasskeyView) do
+                    insertBack(&!all, view);
+            end case;
+            i := i + 1;
+        end while;
+        return Right(right => all);
+    end;
+
+    generic [R: Region, A: Region]
+    function passkeysOf(db: &![Database[Writing], R], account: Span[Nat8, A]): Either[DbError, Buffer[PasskeyView]] is
+        case listPasskeys(&~db, account) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as entries: Buffer[PasskeyEntry]) do
+                let views: Either[DbError, Buffer[PasskeyView]] := viewsOf(&~db, account, &entries);
+                destroyPasskeyEntries(entries);
+                return views;
+        end case;
+    end;
+
+    function refusalWord(refusal: Refusal): Span[Nat8, Static] is
+        case refusal of
+            when BadName do
+                return "bad_name";
+            when PasskeyMalformed do
+                return "malformed";
+            when PasskeyWrongType do
+                return "wrong_type";
+            when WrongChallenge do
+                return "challenge";
+            when WrongOrigin do
+                return "origin";
+            when WrongParty do
+                return "party";
+            when NotVerified do
+                return "not_verified";
+            when Attested do
+                return "attested";
+            when BadKey do
+                return "bad_key";
+            when Known do
+                return "known";
+            when Unknown do
+                return "unknown";
+            when BadSignature do
+                return "signature";
+            when PasskeyReplayed do
+                return "replayed";
+            when PasskeyTooMany do
+                return "too_many";
+        end case;
+    end;
+end module body.

@@ -1,0 +1,21 @@
+# The modules of Wolly that rambo adds or changes, one
+# name a line.  The gate formats, checks and tests them with rambo's own.
+OpKey
+Fernet
+Account
+OpUrl
+OpRandom
+OpClient
+OpStore
+OpToken
+OpBase
+OpGrant
+Op
+Pow
+Backoff
+Strikes
+DevServer
+Totp
+Passkey
+Role
+Server

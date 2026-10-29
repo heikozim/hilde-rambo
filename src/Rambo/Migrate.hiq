@@ -1,0 +1,395 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Every statement is a constant: the column lists are those rambo reads,
+-- each asked for no row, so that a missing column fails before any row is
+-- touched.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    nthRef,
+    length as bufferLength
+);
+import Standard.Text (
+    formatInt
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Transaction,
+    begin,
+    commit,
+    rollback,
+    noValues,
+    withInt64,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    finish,
+    describe
+);
+import Standard.Log (
+    Log
+);
+import Wolly.OpKey (
+    RingKey,
+    algorithmOf
+);
+import Wolly.OpBase (
+    OpSettings
+);
+import Wolly.OpClient (
+    rsaClients
+);
+import Rambo.Config (
+    Config
+);
+import Rambo.Context (
+    Context,
+    Secrets,
+    closeContext,
+    openContext
+);
+
+module body Rambo.Migrate is
+    constant probeAccounts: Span[Nat8, Static] := "SELECT id, email, name, password_hash, must_change_password, totp_secret, totp_last_code, totp_last_at, locked, locked_at, created_at, updated_at FROM accounts LIMIT 0";
+    constant probeClients: Span[Nat8, Static] := "SELECT id, name, kind, secret_hash, redirect_uris, logout_uris, audience, idle_seconds, max_seconds, refresh_seconds, disabled, created_at, updated_at, initiate_login_uri, logo, id_token_alg, lax_auth, sign_alg FROM op_clients LIMIT 0";
+    constant probeSessions: Span[Nat8, Static] := "SELECT id, token_hash, subject, auth_time, amr, created_at, last_seen, ended_at, ended_reason, user_agent, first_ip, last_ip FROM op_sessions LIMIT 0";
+    constant probeRequests: Span[Nat8, Static] := "SELECT id, flow_hash, params, created_at, expires_at FROM op_requests LIMIT 0";
+    constant probeCodes: Span[Nat8, Static] := "SELECT hash, client_id, subject, session_id, redirect_uri, challenge, scope, nonce, auth_time, amr, expires_at, used_at, family FROM op_codes LIMIT 0";
+    constant probeRefresh: Span[Nat8, Static] := "SELECT hash, id, family, client_id, subject, session_id, device, scope, auth_time, amr, family_created, created_at, expires_at, used_at, revoked_at, first_ip, last_ip FROM op_refresh LIMIT 0";
+    constant probeRoles: Span[Nat8, Static] := "SELECT client_id, subject, role, created_at FROM op_roles LIMIT 0";
+    constant probeSpent: Span[Nat8, Static] := "SELECT id, until FROM pow_spent LIMIT 0";
+    constant versionAccounts: Span[Nat8, Static] := "SELECT coalesce(max(version), 0) FROM accountkit_schema";
+    constant versionProvider: Span[Nat8, Static] := "SELECT coalesce(max(version), 0) FROM oidcop_schema";
+    constant versionPow: Span[Nat8, Static] := "SELECT coalesce(max(version), 0) FROM powkit_schema";
+    constant countAccounts: Span[Nat8, Static] := "SELECT count(*) FROM accounts";
+    constant countClients: Span[Nat8, Static] := "SELECT count(*) FROM op_clients";
+    constant countRoles: Span[Nat8, Static] := "SELECT count(*) FROM op_roles";
+    constant countSessions: Span[Nat8, Static] := "SELECT count(*) FROM op_sessions WHERE ended_at = 0";
+    constant keepMigration: Span[Nat8, Static] := "INSERT INTO rambo_meta (name, value) VALUES ('migrated', ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value";
+
+    -- The one number sql gives; Left the text of the database.
+    generic [D: Region]
+    function number(db: &![Database[Writing], D], sql: Span[Nat8, Static]): Either[String, Int64] is
+        var cursor: Cursor := start(&~db, sql, noValues());
+        var n: Int64 := 0;
+        if advance(&!cursor) then
+            n := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => fromSpan(describe(error)));
+            when None do
+                return Right(right => n);
+        end case;
+    end;
+
+    -- None when the columns of probe are there, else why not for table.
+    generic [D: Region]
+    function probed(db: &![Database[Writing], D], table: Span[Nat8, Static], probe: Span[Nat8, Static]): Option[String] is
+        case number(&~db, probe) of
+            when Right(right as n: Int64) do
+                let none: Option[String] := None();
+                return none;
+            when Left(left as message: String) do
+                var b: StringBuilder := makeStringBuilder();
+                writeString(&!b, "migrate: the table ");
+                writeString(&!b, table);
+                writeString(&!b, " lacks a column rambo reads: ");
+                writeString(&!b, asSpan(&message));
+                destroyString(message);
+                return Some(value => finalize(b));
+        end case;
+    end;
+
+    -- The schema version of a part of the earlier Go provider, 0 when it has no table.
+    generic [D: Region]
+    function versionOf(db: &![Database[Writing], D], sql: Span[Nat8, Static]): Int64 is
+        case number(&~db, sql) of
+            when Right(right as n: Int64) do
+                return n;
+            when Left(left as message: String) do
+                destroyString(message);
+                return 0;
+        end case;
+    end;
+
+    function digits(n: Int64): String is
+        return formatInt(n);
+    end;
+
+    -- None when the version of part is at most known, else the refusal.
+    function tooNew(part: Span[Nat8, Static], version: Int64, known: Int64): Option[String] is
+        if version <= known then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "migrate: the Go provider's schema of ");
+        writeString(&!b, part);
+        writeString(&!b, " is at version ");
+        let v: String := digits(version);
+        writeString(&!b, asSpan(&v));
+        destroyString(v);
+        writeString(&!b, "; rambo knows ");
+        let k: String := digits(known);
+        writeString(&!b, asSpan(&k));
+        destroyString(k);
+        return Some(value => finalize(b));
+    end;
+
+    generic [R: Region]
+    function writeLine(b: &![StringBuilder, R], label: Span[Nat8, Static], n: Int64): Unit is
+        writeString(&~b, label);
+        let text: String := digits(n);
+        writeString(&~b, asSpan(&text));
+        destroyString(text);
+        writeByte(&~b, 10);
+        return nil;
+    end;
+
+    generic [R: Region, K: Region]
+    function writeKeys(b: &![StringBuilder, R], ring: &[Buffer[RingKey], K]): Unit is
+        var i: Index := 0;
+        while i < bufferLength(ring) do
+            let key: &[RingKey, K] := nthRef(ring, i);
+            writeString(&~b, "  ");
+            writeString(&~b, asSpan(&(key->kid)));
+            writeString(&~b, " (");
+            writeString(&~b, algorithmOf(key->family));
+            if key->retired > 0 then
+                writeString(&~b, ", retired");
+            end if;
+            writeString(&~b, ")\n");
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The checks and the report of an opened world.
+    generic [D: Region, K: Region]
+    function checked(db: &![Database[Writing], D], ring: &[Buffer[RingKey], K], now: Int64): Either[String, String] is
+        let accountVersion: Int64 := versionOf(&~db, versionAccounts);
+        let providerVersion: Int64 := versionOf(&~db, versionProvider);
+        let powVersion: Int64 := versionOf(&~db, versionPow);
+        case tooNew("accountkit", accountVersion, 1) of
+            when Some(value as message: String) do
+                return Left(left => message);
+            when None do
+                skip;
+        end case;
+        case tooNew("oidcop", providerVersion, 7) of
+            when Some(value as message: String) do
+                return Left(left => message);
+            when None do
+                skip;
+        end case;
+        if providerVersion = 6 then
+            case raisedToSeven(&~db) of
+                when Some(value as message: String) do
+                    return Left(left => message);
+                when None do
+                    skip;
+            end case;
+        end if;
+        case tooNew("powkit", powVersion, 1) of
+            when Some(value as message: String) do
+                return Left(left => message);
+            when None do
+                skip;
+        end case;
+        case probedAll(&~db) of
+            when Some(value as message: String) do
+                return Left(left => message);
+            when None do
+                skip;
+        end case;
+        case execute(&~db, keepMigration, withInt64(noValues(), now)) of
+            when Left(left as error: DbError) do
+                return Left(left => fromSpan(describe(error)));
+            when Right(right as changed: Nat64) do
+                skip;
+        end case;
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "taken over from the Go provider: accountkit ");
+        let a: String := digits(accountVersion);
+        writeString(&!b, asSpan(&a));
+        destroyString(a);
+        writeString(&!b, ", oidcop ");
+        let o: String := digits(providerVersion);
+        writeString(&!b, asSpan(&o));
+        destroyString(o);
+        if providerVersion = 6 then
+            writeString(&!b, " (raised to 7: the column sign_alg of the Go provider)");
+        end if;
+        writeString(&!b, ", powkit ");
+        let p: String := digits(powVersion);
+        writeString(&!b, asSpan(&p));
+        destroyString(p);
+        writeByte(&!b, 10);
+        writeLine(&!b, "accounts       ", counted(&~db, countAccounts));
+        writeLine(&!b, "clients        ", counted(&~db, countClients));
+        writeLine(&!b, "roles          ", counted(&~db, countRoles));
+        writeLine(&!b, "live sessions  ", counted(&~db, countSessions));
+        let marked: Int64 := markedRs256(&~db);
+        if marked > 0 then
+            writeLine(&!b, "clients the Go provider marked RS256, now ML-DSA-44: ", marked);
+        end if;
+        case toInt64(bufferLength(ring)) of
+            when Some(value as n: Int64) do
+                writeLine(&!b, "signing keys   ", n);
+            when None do
+                skip;
+        end case;
+        writeKeys(&!b, ring);
+        writeString(&!b, "\nThe vault and the database are used as they are; nothing was copied. Tokens are signed\nwith ML-DSA-44 or ML-DSA-44-Ed25519, as each client names it or token_alg; RSA keys of\nthe Go provider stay in the vault, unused.");
+        return Right(right => finalize(b));
+    end;
+
+    -- Migration 7 of oidcop as the Go library v0.95.0 has it, and as a provider
+    -- built on it makes it at its first start: the column sign_alg of the
+    -- clients, empty for the provider's algorithm, and the version 7 in
+    -- oidcop's ledger, in one transaction.  None when it is done, else the
+    -- text of the database.
+    constant addSignAlg: Span[Nat8, Static] := "ALTER TABLE op_clients ADD COLUMN sign_alg TEXT NOT NULL DEFAULT ''";
+    constant ledgerSeven: Span[Nat8, Static] := "INSERT INTO oidcop_schema (version) VALUES (7)";
+
+    generic [D: Region]
+    function raisedToSeven(db: &![Database[Writing], D]): Option[String] is
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Some(value => fromSpan(describe(error)));
+            when Right(right as transaction: Transaction) do
+                case execute(&~db, addSignAlg, noValues()) of
+                    when Left(left as error: DbError) do
+                        rollback(&~db, transaction);
+                        return Some(value => fromSpan(describe(error)));
+                    when Right(right as added: Nat64) do
+                        skip;
+                end case;
+                case execute(&~db, ledgerSeven, noValues()) of
+                    when Left(left as error: DbError) do
+                        rollback(&~db, transaction);
+                        return Some(value => fromSpan(describe(error)));
+                    when Right(right as kept: Nat64) do
+                        skip;
+                end case;
+                case commit(&~db, transaction) of
+                    when Left(left as error: DbError) do
+                        return Some(value => fromSpan(describe(error)));
+                    when Right(right as done: Unit) do
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+        end case;
+    end;
+
+    -- The enabled clients the earlier Go provider marked RS256, -1 when they cannot be
+    -- counted.
+    generic [D: Region]
+    function markedRs256(db: &![Database[Writing], D]): Int64 is
+        case rsaClients(&~db) of
+            when Right(right as n: Int64) do
+                return n;
+            when Left(left as error: DbError) do
+                return -1;
+        end case;
+    end;
+
+    generic [D: Region]
+    function counted(db: &![Database[Writing], D], sql: Span[Nat8, Static]): Int64 is
+        case number(&~db, sql) of
+            when Right(right as n: Int64) do
+                return n;
+            when Left(left as message: String) do
+                destroyString(message);
+                return -1;
+        end case;
+    end;
+
+    generic [D: Region]
+    function probedAll(db: &![Database[Writing], D]): Option[String] is
+        case probed(&~db, "accounts", probeAccounts) of
+            when Some(value as message: String) do
+                return Some(value => message);
+            when None do
+                skip;
+        end case;
+        case probed(&~db, "op_clients", probeClients) of
+            when Some(value as message: String) do
+                return Some(value => message);
+            when None do
+                skip;
+        end case;
+        case probed(&~db, "op_sessions", probeSessions) of
+            when Some(value as message: String) do
+                return Some(value => message);
+            when None do
+                skip;
+        end case;
+        case probed(&~db, "op_requests", probeRequests) of
+            when Some(value as message: String) do
+                return Some(value => message);
+            when None do
+                skip;
+        end case;
+        case probed(&~db, "op_codes", probeCodes) of
+            when Some(value as message: String) do
+                return Some(value => message);
+            when None do
+                skip;
+        end case;
+        case probed(&~db, "op_refresh", probeRefresh) of
+            when Some(value as message: String) do
+                return Some(value => message);
+            when None do
+                skip;
+        end case;
+        case probed(&~db, "op_roles", probeRoles) of
+            when Some(value as message: String) do
+                return Some(value => message);
+            when None do
+                skip;
+        end case;
+        return probed(&~db, "pow_spent", probeSpent);
+    end;
+
+    generic [P: Region]
+    function migrate(path: Span[Nat8, P], now: Int64): Either[String, String] is
+        case openContext(path, now) of
+            when Left(left as message: String) do
+                var b: StringBuilder := makeStringBuilder();
+                writeString(&!b, "migrate: the Go provider's installation does not open: ");
+                writeString(&!b, asSpan(&message));
+                destroyString(message);
+                return Left(left => finalize(b));
+            when Right(right as opened: Context) do
+                let { config: Config, db as connection: Database[Writing], settings: OpSettings, ring: Buffer[RingKey],
+                    secrets: Secrets, log: Log } := opened;
+                var db: Database[Writing] := connection;
+                let result: Either[String, String] := checked(&!db, &ring, now);
+                closeContext(Context(config => config, db => db, settings => settings, ring => ring, secrets => secrets,
+                    log => log));
+                return result;
+        end case;
+    end;
+end module body.

@@ -1,0 +1,380 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The pages of rambo as HTML: a record for each page with what it shows, and
+the function that writes it from the templates beside this module.
+
+- Every value is escaped for the place it lands in; only the markup of
+  ipHtml and the data URIs of a picture are written as they are.
+- The texts come from Rambo.Messages in the language of the page, de or
+  en; the title, an error and a note come translated in the frame.
+- Times are shown in UTC to the minute, addresses with a place to break
+  after each colon, nothing as a dash.
+
+    let page: MessagePage := MessagePage(lang => fromSpan("en"), frame => frame);
+    let html: String := renderMessage(&page);
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+
+module Rambo.Pages is
+    """
+    What every page has around its content: the title, an error and a note,
+    translated; the path the language buttons return to; whether the
+    content stands in a card; the open entry of the menu, empty for none;
+    the version for the foot; and the form token of the logout button.
+    """
+    record Frame: Linear is
+        title: String;
+        error: String;
+        info: String;
+        back: String;
+        card: Bool;
+        nav: String;
+        version: String;
+        csrfLogout: String;
+    end;
+
+    """
+    Frees frame.
+    No contract: it only frees.
+    """
+    function destroyFrame(frame: Frame): Unit;
+
+    """
+    A page that only says something.
+    """
+    record MessagePage: Linear is
+        lang: String;
+        frame: Frame;
+    end;
+
+    """
+    Frees page.
+    No contract: it only frees.
+    """
+    function destroyMessagePage(page: MessagePage): Unit;
+
+    generic [P: Region]
+    function renderMessage(page: &[MessagePage, P]): String
+        ensures length(&result) > 0;
+
+    """
+    The question before a logout; the form takes the token of the frame.
+    """
+    generic [P: Region]
+    function renderLogout(page: &[MessagePage, P]): String
+        ensures length(&result) > 0;
+
+    """
+    The sign-in form: the request it belongs to, the client it signs in to,
+    whether it asks again, the address typed so far, the puzzle with its
+    bits, its time limit in milliseconds and its batch, and the challenge of
+    a passkey with its relying party, empty when there is none.
+    """
+    record LoginPage: Linear is
+        lang: String;
+        frame: Frame;
+        req: String;
+        client: String;
+        reauth: Bool;
+        email: String;
+        pow: String;
+        powBits: Int64;
+        powTimeout: Int64;
+        powBatch: Int64;
+        passkey: String;
+        party: String;
+    end;
+
+    """
+    Frees page.
+    No contract: it only frees.
+    """
+    function destroyLoginPage(page: LoginPage): Unit;
+
+    generic [P: Region]
+    function renderLogin(page: &[LoginPage, P]): String
+        ensures length(&result) > 0;
+
+    """
+    A step of a sign-in: the request, the form token of the step, and for
+    the second factor its QR code as a data URI and its secret in blocks.
+    """
+    record StepPage: Linear is
+        lang: String;
+        frame: Frame;
+        req: String;
+        step: String;
+        qr: String;
+        secret: String;
+    end;
+
+    """
+    Frees page.
+    No contract: it only frees.
+    """
+    function destroyStepPage(page: StepPage): Unit;
+
+    """
+    The new password of a step.
+    """
+    generic [P: Region]
+    function renderPassword(page: &[StepPage, P]): String
+        ensures length(&result) > 0;
+
+    """
+    The second factor of a step.
+    """
+    generic [P: Region]
+    function renderTotp(page: &[StepPage, P]): String
+        ensures length(&result) > 0;
+
+    """
+    The renewal of the second factor: its QR code, its secret in blocks and
+    the form token of the confirmation.
+    """
+    record RenewPage: Linear is
+        lang: String;
+        frame: Frame;
+        qr: String;
+        secret: String;
+        csrfConfirm: String;
+    end;
+
+    """
+    Frees page.
+    No contract: it only frees.
+    """
+    function destroyRenewPage(page: RenewPage): Unit;
+
+    generic [P: Region]
+    function renderRenew(page: &[RenewPage, P]): String
+        ensures length(&result) > 0;
+
+    """
+    A passkey as the account page shows it: its credential ID, its name, and
+    when it was added and last used as shown, empty for never.
+    """
+    record PasskeyRow: Linear is
+        credential: String;
+        label: String;
+        created: String;
+        lastUsed: String;
+    end;
+
+    """
+    The own account, its passkeys, and the form tokens of its changes.
+    """
+    record AccountPage: Linear is
+        lang: String;
+        frame: Frame;
+        name: String;
+        email: String;
+        id: String;
+        csrfPassword: String;
+        csrfTotp: String;
+        passkeys: Buffer[PasskeyRow];
+        csrfPasskey: String;
+        csrfPasskeyRename: String;
+        csrfPasskeyRemove: String;
+    end;
+
+    """
+    Frees page.
+    No contract: it only frees.
+    """
+    function destroyAccountPage(page: AccountPage): Unit;
+
+    generic [P: Region]
+    function renderAccount(page: &[AccountPage, P]): String
+        ensures length(&result) > 0;
+
+    """
+    The page that makes a passkey: the challenge and the relying party, the
+    user handle in base64url, the address and the name the authenticator
+    shows, the credentials it has already separated by blanks, and the form
+    token of the registration.
+    """
+    record PasskeyAddPage: Linear is
+        lang: String;
+        frame: Frame;
+        challenge: String;
+        party: String;
+        userId: String;
+        userName: String;
+        display: String;
+        exclude: String;
+        csrfAdd: String;
+    end;
+
+    """
+    Frees page.
+    No contract: it only frees.
+    """
+    function destroyPasskeyAddPage(page: PasskeyAddPage): Unit;
+
+    generic [P: Region]
+    function renderPasskeyAdd(page: &[PasskeyAddPage, P]): String
+        ensures length(&result) > 0;
+
+    """
+    What is about to end: kind is session or device, with its ID, its
+    label, its times as shown, its addresses as ipHtml writes them, whether
+    each address is one of an app's server, where the form goes and its
+    token.
+    """
+    record ConfirmPage: Linear is
+        lang: String;
+        frame: Frame;
+        kind: String;
+        id: String;
+        label: String;
+        created: String;
+        firstIp: String;
+        appFirstIp: Bool;
+        lastSeen: String;
+        lastIp: String;
+        appLastIp: Bool;
+        action: String;
+        csrfConfirm: String;
+    end;
+
+    """
+    Frees page.
+    No contract: it only frees.
+    """
+    function destroyConfirmPage(page: ConfirmPage): Unit;
+
+    generic [P: Region]
+    function renderConfirm(page: &[ConfirmPage, P]): String
+        ensures length(&result) > 0;
+
+    """
+    An app of the portal: its name, the letter shown without a logo, the
+    logo as a data URI or empty, and where it starts.
+    """
+    record Tile: Linear is
+        name: String;
+        initial: String;
+        logo: String;
+        start: String;
+    end;
+
+    """
+    A sign-in held by an app: its client, its label, its times as shown, its
+    addresses as ipHtml writes them and whether there are any, where the app
+    starts, and the family that ends it.
+    """
+    record AppRow: Linear is
+        clientName: String;
+        label: String;
+        created: String;
+        firstIp: String;
+        hasFirstIp: Bool;
+        lastUsed: String;
+        lastIp: String;
+        hasLastIp: Bool;
+        start: String;
+        family: String;
+    end;
+
+    """
+    A browser session: its browser, its times as shown, its addresses as
+    ipHtml writes them, its ID, and whether it is the one looking.
+    """
+    record SessionRow: Linear is
+        userAgent: String;
+        created: String;
+        firstIp: String;
+        lastSeen: String;
+        lastIp: String;
+        id: String;
+        current: Bool;
+    end;
+
+    """
+    The portal: the tiles, the sign-ins of apps, the sessions, and the form
+    tokens that end the last two.
+    """
+    record HomePage: Linear is
+        lang: String;
+        frame: Frame;
+        tiles: Buffer[Tile];
+        apps: Buffer[AppRow];
+        sessions: Buffer[SessionRow];
+        csrfSessionEnd: String;
+        csrfDeviceRevoke: String;
+    end;
+
+    """
+    Frees page.
+    No contract: it only frees.
+    """
+    function destroyHomePage(page: HomePage): Unit;
+
+    generic [P: Region]
+    function renderHome(page: &[HomePage, P]): String
+        ensures length(&result) > 0;
+
+    --- What the pages show
+
+    """
+    seconds since 1970 as UTC to the minute, such as 2026-10-22 14:05, or an
+    en dash for 0 and for a time outside the years 0 to 9999.
+    """
+    function whenText(seconds: Int64): String
+        ensures length(&result) > 0;
+
+    """
+    The address addr escaped for HTML, with a wbr element after each colon so
+    that an IPv6 address may break there; an en dash for an empty address.
+    """
+    generic [A: Region]
+    function ipHtml(addr: Span[Nat8, A]): String
+        ensures length(&result) > 0;
+
+    """
+    The first character of name, trimmed, in capitals when it is a letter of
+    ASCII; a question mark for an empty name or one that is not UTF-8.
+    """
+    generic [N: Region]
+    function initialOf(name: Span[Nat8, N]): String
+        ensures length(&result) > 0;
+
+    """
+    The base32 secret in blocks of four characters, a blank between them,
+    padding left off.
+    No contract: its length follows the secret, with a blank after every four characters.
+    """
+    generic [S: Region]
+    function groupSecret(secret: Span[Nat8, S]): String;
+
+    """
+    p when it is a path on this site, at most 512 bytes: a slash first, not
+    two slashes or a slash and a backslash, no control byte, no scheme;
+    else a slash.  The language buttons must not lead off the site.
+    """
+    generic [P: Region]
+    function localPath(p: Span[Nat8, P]): String
+        ensures length(&result) > 0;
+
+    """
+    The language of the pages for a request: cookie when it is de or en,
+    else the best of the Accept-Language header with a q above 0, region
+    tags counting for their language, 16 tags and 512 bytes of it read at
+    most; en when nothing fits.
+    """
+    generic [C: Region, H: Region]
+    function languageOf(cookie: Span[Nat8, C], header: Span[Nat8, H]): Span[Nat8, Static]
+        ensures spanLength(result) = 2;
+end module.

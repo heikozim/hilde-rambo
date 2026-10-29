@@ -1,0 +1,217 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    openWrite,
+    readAll,
+    writeAll,
+    closeFile,
+    environmentValue
+);
+import Standard.Json (
+    Json,
+    JsonError,
+    readJson,
+    destroyJson,
+    stringAt,
+    integerAt
+);
+
+module body Rambo.Fixture is
+    function fixtureVault(): Span[Nat8, Static] is
+        return "testdata/gorambo/.rambo.env";
+    end;
+
+    function fixturePepper(): Span[Nat8, Static] is
+        return "testdata/gorambo/.rambo_pepper";
+    end;
+
+    function fixtureDatabase(): Span[Nat8, Static] is
+        return "testdata/gorambo/rambo.db";
+    end;
+
+    -- The text of expected.json.
+    function expectedText(): Option[String] is
+        case openRead("testdata/gorambo/expected.json") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let text: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                return text;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- The JSON pointer of the member name.
+    generic [N: Region]
+    function pointerOf(name: Span[Nat8, N]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, '/');
+        writeString(&!out, name);
+        return finalize(out);
+    end;
+
+    generic [N: Region]
+    function expected(name: Span[Nat8, N]): Option[String] is
+        case expectedText() of
+            when Some(value as text: String) do
+                let parsed: Either[JsonError, Json] := readJson(asSpan(&text));
+                destroyString(text);
+                case parsed of
+                    when Right(right as document: Json) do
+                        let pointer: String := pointerOf(name);
+                        let found: Option[String] := stringAt(&document, asSpan(&pointer));
+                        destroyString(pointer);
+                        destroyJson(document);
+                        return found;
+                    when Left(left as error: JsonError) do
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [N: Region]
+    function expectedNumber(name: Span[Nat8, N]): Option[Int64] is
+        case expectedText() of
+            when Some(value as text: String) do
+                let parsed: Either[JsonError, Json] := readJson(asSpan(&text));
+                destroyString(text);
+                case parsed of
+                    when Right(right as document: Json) do
+                        let pointer: String := pointerOf(name);
+                        let found: Option[Int64] := integerAt(&document, asSpan(&pointer));
+                        destroyString(pointer);
+                        destroyJson(document);
+                        return found;
+                    when Left(left as error: JsonError) do
+                        let none: Option[Int64] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Int64] := None();
+                return none;
+        end case;
+    end;
+
+    -- Copies the file at source to the path target; false when either fails.
+    generic [T: Region]
+    function copied(source: Span[Nat8, Static], target: Span[Nat8, T]): Bool is
+        case openRead(source) of
+            when None do
+                return false;
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let text: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case text of
+                    when None do
+                        return false;
+                    when Some(value as content: String) do
+                        let done: Bool := written(target, asSpan(&content));
+                        destroyString(content);
+                        return done;
+                end case;
+        end case;
+    end;
+
+    -- Writes text to the file at path; false when it fails.
+    generic [P: Region, T: Region]
+    function written(path: Span[Nat8, P], text: Span[Nat8, T]): Bool is
+        case openWrite(path) of
+            when None do
+                return false;
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let done: Bool := writeAll(&!file, text);
+                let closed: Bool := closeFile(file);
+                return done and closed;
+        end case;
+    end;
+
+    -- dir, a slash, prefix and name.
+    generic [D: Region]
+    function inDir(dir: Span[Nat8, D], prefix: Span[Nat8, Static], name: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, dir);
+        writeByte(&!out, '/');
+        writeString(&!out, prefix);
+        writeString(&!out, name);
+        return finalize(out);
+    end;
+
+    generic [E: Region]
+    function fixtureCopy(prefix: Span[Nat8, Static], extra: Span[Nat8, E]): Option[String] is
+        case environmentValue("TMPDIR") of
+            when None do
+                let none: Option[String] := None();
+                return none;
+            when Some(value as dir: String) do
+                let vault: String := inDir(asSpan(&dir), prefix, ".rambo.env");
+                let pepper: String := inDir(asSpan(&dir), prefix, ".rambo_pepper");
+                let db: String := inDir(asSpan(&dir), prefix, ".rambo.db");
+                let conf: String := inDir(asSpan(&dir), prefix, ".rambo.conf");
+                destroyString(dir);
+                var good: Bool := copied(fixtureVault(), asSpan(&vault));
+                good := copied(fixturePepper(), asSpan(&pepper)) and good;
+                good := copied(fixtureDatabase(), asSpan(&db)) and good;
+                let issuer: String := orNothing(expected("issuer"));
+                var b: StringBuilder := makeStringBuilder();
+                writeString(&!b, "# a copy of the Go provider's data set\nissuer = ");
+                writeString(&!b, asSpan(&issuer));
+                writeString(&!b, "\nvault = ");
+                writeString(&!b, asSpan(&vault));
+                writeString(&!b, "\npepper = ");
+                writeString(&!b, asSpan(&pepper));
+                writeString(&!b, "\ndb = ");
+                writeString(&!b, asSpan(&db));
+                writeString(&!b, "\n");
+                writeString(&!b, extra);
+                let text: String := finalize(b);
+                good := written(asSpan(&conf), asSpan(&text)) and good;
+                destroyString(text);
+                destroyString(issuer);
+                destroyString(vault);
+                destroyString(pepper);
+                destroyString(db);
+                if not good then
+                    destroyString(conf);
+                    let none: Option[String] := None();
+                    return none;
+                end if;
+                return Some(value => conf);
+        end case;
+    end;
+
+    function orNothing(found: Option[String]): String is
+        case found of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+end module body.

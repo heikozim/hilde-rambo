@@ -1,0 +1,38 @@
+# Part of rambo.
+#
+# SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+# The page texts rambo has beyond those of the earlier Go provider, in English, one line
+# each in the form of its messages_en.go; tools/genmessages.pl reads
+# them with those.
+	"login.passkey":              "Sign in with a passkey",
+	"login.passkey_or":           "or with password and code",
+	"passkey.working":            "Waiting for the passkey ...",
+	"passkey.unsupported":        "This browser offers no passkeys.",
+	"passkey.cancelled":          "The passkey was not used. Please try again.",
+	"err.passkey":                "The passkey was not accepted.",
+	"account.passkeys":           "Passkeys",
+	"account.passkeys_hint":      "A passkey signs you in without password and code: the device checks you by fingerprint, face or PIN. Password and code stay valid as the way back in.",
+	"account.passkey_name":       "Name",
+	"account.passkey_created":    "Added",
+	"account.passkey_last_used":  "Last used",
+	"account.passkey_never":      "never",
+	"account.passkey_none":       "No passkey yet.",
+	"account.passkey_rename":     "Rename",
+	"account.passkey_remove":     "Remove",
+	"account.passkey_label":      "Name of the passkey",
+	"account.passkey_label_hint": "So that you know the device again, for instance laptop or phone.",
+	"account.passkey_add":        "Add a passkey",
+	"account.passkey_add_hint":   "Adding a passkey asks for your current password and a fresh code.",
+	"title.passkey_add":          "Add a passkey",
+	"passkey.create_hint":        "Your browser now asks for the passkey. Confirm with fingerprint, face or PIN.",
+	"passkey.create":             "Create the passkey",
+	"info.passkey_added":         "The passkey was added.",
+	"info.passkey_renamed":       "The passkey was renamed.",
+	"info.passkey_removed":       "The passkey was removed.",
+	"err.passkey_add":            "The passkey could not be added. Please start again.",
+	"err.passkey_many":           "This account has the most passkeys it may have (20).",
+	"err.passkey_known":          "This passkey is registered already.",
+	"err.passkey_gone":           "There is no such passkey.",
+	"err.passkey_label":          "A name of at most 64 characters, please.",

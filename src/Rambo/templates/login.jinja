@@ -1,0 +1,46 @@
+{#
+Part of rambo.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The sign-in form with the puzzle the browser solves before it sends it:
+login.js reads the data attributes, starts the worker and fills pow_nonce.
+Above it, when there is a challenge, the passkey: passkey.js asks the
+authenticator and sends its answer in the hidden fields.
+-#}
+{% extends "templates/layout.jinja" %}
+{% block content %}
+{% if client %}<p class="lead">{{ _("LoginFor") }} <strong class="client">{{ client }}</strong></p>{% endif %}
+{% if reauth %}<p class="lead">{{ _("LoginReauth") }}</p>{% endif %}
+{% if passkey %}<form method="post" action="/login/passkey" id="passkey-login" data-challenge="{{ passkey }}" data-party="{{ party }}"
+ data-msg-working="{{ _("PasskeyWorking") }}" data-msg-unsupported="{{ _("PasskeyUnsupported") }}" data-msg-cancelled="{{ _("PasskeyCancelled") }}">
+<input type="hidden" name="req" value="{{ req }}">
+<input type="hidden" name="credential" value="">
+<input type="hidden" name="clientData" value="">
+<input type="hidden" name="authenticatorData" value="">
+<input type="hidden" name="signature" value="">
+<button type="button" id="passkey-start">{{ _("LoginPasskey") }}</button>
+<p id="passkey-status" role="status" aria-live="polite" hidden></p>
+</form>
+<p class="muted">{{ _("LoginPasskeyOr") }}</p>{% endif %}
+<form method="post" action="/login" id="login"
+ data-pow-token="{{ pow }}" data-pow-bits="{{ powBits }}" data-pow-timeout="{{ powTimeout }}" data-pow-batch="{{ powBatch }}"
+ data-msg-working="{{ _("PowWorking") }}" data-msg-done="{{ _("PowDone") }}"
+ data-msg-timeout="{{ _("PowTimeout") }}" data-msg-unsupported="{{ _("PowUnsupported") }}">
+<input type="hidden" name="req" value="{{ req }}">
+<input type="hidden" name="pow" value="{{ pow }}">
+<input type="hidden" name="pow_nonce" value="" id="pow-nonce">
+<label>{{ _("LoginEmail") }}
+<input type="email" name="email" value="{{ email }}" autocomplete="username" maxlength="254" required autofocus></label>
+<label>{{ _("LoginPassword") }}
+<input type="password" name="password" autocomplete="current-password" maxlength="1024" required></label>
+<label>{{ _("LoginCode") }} <small>{{ _("LoginCodeHint") }}</small>
+<input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" maxlength="7"></label>
+<noscript><p class="error">{{ _("PowNoscript") }}</p></noscript>
+<p id="pow-status" role="status" aria-live="polite" hidden></p>
+<button type="submit" id="login-submit">{{ _("LoginSubmit") }}</button>
+</form>
+<script src="/static/login.js"></script>
+<script src="/static/passkey.js"></script>
+{% endblock %}

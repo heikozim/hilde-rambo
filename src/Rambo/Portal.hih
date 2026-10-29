@@ -1,0 +1,148 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The pages behind the login: the portal with the apps, the sign-ins of
+apps and the browser sessions, and the own account with its two changes.
+
+- Every page asks for a live session of an unlocked account; a GET without
+  one goes to the login and comes back, a POST is refused.
+- Every POST carries the form token of its action, bound to the session.
+- A change of the password or the second factor asks for the password and
+  a fresh code first, slows down wrong guesses per account, and signs out
+  every other session and every app afterwards.
+- Ending a session or an app's sign-in takes two steps: the first names
+  what goes, the second ends it.
+
+    let page: String := home(&request, &!db, &world, &!log, now);
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Database (
+    Database,
+    Writing
+);
+import Standard.FcgiServer (
+    Request
+);
+import Standard.Log (
+    Log
+);
+import Rambo.Web (
+    World
+);
+
+module Rambo.Portal is
+    """
+    GET /: the portal.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function home(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    GET /account: the own account.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function account(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    POST /account/password: a new password, after the old one and a code.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountPassword(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    POST /account/totp: the start of a new second factor, after the
+    password and a code of the old one.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountTotpBegin(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W], log: &![Log, L],
+        now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    POST /account/totp/confirm: the first code of the new second factor of
+    the renewal the session of the request started.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountTotpConfirm(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        log: &![Log, L], now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    POST /account/session/end: another session of the own account, named
+    first and ended with confirm=yes.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountEndSession(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        log: &![Log, L], now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    POST /account/device/revoke: the sign-in of an app of the own account,
+    named first and ended with confirm=yes.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountRevokeDevice(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        log: &![Log, L], now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    POST /account/passkey: the password and a fresh code, then the page
+    that asks the authenticator for a new passkey with a challenge of the
+    account.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountPasskeyBegin(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        log: &![Log, L], now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    POST /account/passkey/add: the answer of the authenticator to that
+    challenge and the name typed; the passkey kept, or the account page
+    with why not.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountPasskeyAdd(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        log: &![Log, L], now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    POST /account/passkey/rename: a new name for a passkey of the own
+    account.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountPasskeyRename(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        log: &![Log, L], now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    POST /account/passkey/remove: a passkey of the own account removed.
+    """
+    generic [Q: Region, D: Region, W: Region, L: Region]
+    function accountPasskeyRemove(request: &[Request, Q], db: &![Database[Writing], D], world: &[World, W],
+        log: &![Log, L], now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+end module.

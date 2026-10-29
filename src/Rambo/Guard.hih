@@ -1,0 +1,82 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+What rambo checks and closes before it works: the directory of its socket,
+and the sandbox of each kind of command.
+
+- serve may read and write its etc and var directories, the directories of
+  its database, vault and pepper, and its socket directory; with the
+  promises of files, locks and Unix sockets, and of the network for the
+  HTTP of development.
+- An admin command may do the same with its data and the system log, and
+  use the terminal.
+- Any other command may only write to its terminal.
+- The socket takes the group of its directory, so serve refuses to start
+  when that directory belongs to another group than socket_group.
+
+    case checkSocketDir(&config) of
+        when Some(value as message: String) do
+            ...
+"""
+import Standard.String (
+    String,
+    length
+);
+import Rambo.Config (
+    Config
+);
+
+module Rambo.Guard is
+    """
+    None when the socket directory of config is a directory of the group
+    socket_group, as /etc/group names it; else the text that says why not.
+    No contract: the file system is read.
+    """
+    generic [C: Region]
+    function checkSocketDir(config: &[Config, C]): Option[String];
+
+    """
+    Confines serve to its profile for config, with the static files below
+    www to read in the HTTP of development; the text that says what
+    confines it.
+    """
+    generic [C: Region, W: Region]
+    function applyServe(config: &[Config, C], www: Span[Nat8, W]): String
+        ensures length(&result) > 0;
+
+    """
+    Confines an admin command to its profile for config; the text that says
+    what confines it.
+    """
+    generic [C: Region]
+    function applyAdmin(config: &[Config, C]): String
+        ensures length(&result) > 0;
+
+    """
+    Confines a command that only prints; the line that names the
+    mechanisms that took effect.
+    """
+    function applyInfo(): String
+        ensures length(&result) > 0;
+
+    """
+    The promises and paths of a command that only prints, the body of its
+    profile in the form of the sandbox output.
+    """
+    function infoProfile(): String
+        ensures length(&result) > 0;
+
+    """
+    The profiles of serve and of the admin commands for config, as the
+    sandbox command prints them: each under a heading with its name, the
+    promises, then the paths sorted and each once with the word for a path
+    on this system and the permissions in parentheses, and their number.
+    """
+    generic [C: Region]
+    function sandboxText(config: &[Config, C]): String
+        ensures length(&result) > 0;
+end module.
