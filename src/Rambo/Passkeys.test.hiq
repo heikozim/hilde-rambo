@@ -1,0 +1,192 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The relying party and the origin of an issuer, the bound of a login,
+-- the names typed for a passkey, and the table of names in an SQLite
+-- database in memory.  The expected bound was computed with Python's
+-- hashlib over the same input.  A passkey registered and used end to end
+-- is the work of scripts/image/passkey-e2e.py.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Buffer (
+    Buffer,
+    length as bufferLength
+);
+import Standard.Text (
+    equal
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Rambo.Passkeys (
+    PasskeyView,
+    destroyPasskeyViews,
+    mostLabel,
+    preparePasskeyTables,
+    partyOf,
+    originOf,
+    loginBound,
+    cleanLabel,
+    keepLabel,
+    renamePasskey,
+    forgetPasskey,
+    forgetPasskeys,
+    passkeysOf,
+    ownerOf
+);
+
+module body Rambo.Passkeys.Test is
+    function sameText(made: String, wanted: Span[Nat8, Static]): Bool is
+        let same: Bool := equal(asSpan(&made), wanted);
+        destroyString(made);
+        return same;
+    end;
+
+    function cleaned(typed: Span[Nat8, Static], wanted: Span[Nat8, Static]): Bool is
+        case cleanLabel(typed) of
+            when Some(value as label: String) do
+                return sameText(label, wanted);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function refused(typed: Span[Nat8, Static]): Bool is
+        case cleanLabel(typed) of
+            when Some(value as label: String) do
+                destroyString(label);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function testOriginAndParty(): Unit is
+        assertTrue(sameText(originOf("https://auth.example.net"), "https://auth.example.net"), "an issuer is its origin");
+        assertTrue(sameText(originOf("https://auth.example.org/realm/x"), "https://auth.example.org"), "the path is dropped");
+        assertTrue(sameText(originOf("http://127.0.0.1:8480"), "http://127.0.0.1:8480"), "the port is kept");
+        assertTrue(sameText(partyOf("https://auth.example.net"), "auth.example.net"), "the party is the host");
+        assertTrue(sameText(partyOf("https://auth.example.org:8443/x"), "auth.example.org"), "without port and path");
+        return nil;
+    end;
+
+    function testBound(): Unit is
+        assertTrue(sameText(loginBound("request-1"), "19f1064b619d49d35392eac7261cd7266c720671fc594f4b226f32bf0bee74ba"),
+            "the SHA-256 of the request in hexadecimal");
+        let other: String := loginBound("request-2");
+        assertTrue(length(&other) = 64, "64 digits");
+        assertFalse(equal(asSpan(&other), "19f1064b619d49d35392eac7261cd7266c720671fc594f4b226f32bf0bee74ba"),
+            "another request, another bound");
+        destroyString(other);
+        return nil;
+    end;
+
+    function testLabels(): Unit is
+        assertTrue(cleaned("  Laptop  ", "Laptop"), "a name is trimmed");
+        assertTrue(cleaned("", "Passkey"), "nothing is Passkey");
+        assertTrue(cleaned("   ", "Passkey"), "blanks are nothing");
+        assertTrue(cleaned("Telefon \u{fc}berall", "Telefon \u{fc}berall"), "UTF-8 is kept");
+        assertTrue(cleaned("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "64 bytes pass");
+        assertTrue(refused("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "65 bytes do not");
+        assertTrue(refused("a\tb"), "a tab is a control character");
+        assertTrue(refused("a\u{7f}b"), "and delete");
+        assertTrue(mostLabel() = 64, "the bound is 64");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function views(db: &![Database[Writing], R], account: Span[Nat8, Static]): Int64 is
+        case passkeysOf(&~db, account) of
+            when Right(right as found: Buffer[PasskeyView]) do
+                let n: Index := bufferLength(&found);
+                destroyPasskeyViews(found);
+                case toInt64(n) of
+                    when Some(value as count: Int64) do
+                        return count;
+                    when None do
+                        return -1;
+                end case;
+            when Left(left as error: DbError) do
+                return -1;
+        end case;
+    end;
+
+    function testTableWithoutKeys(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                case preparePasskeyTables(&!db) of
+                    when Some(value as error: DbError) do
+                        assertTrue(false, "the tables are made");
+                    when None do
+                        skip;
+                end case;
+                case preparePasskeyTables(&!db) of
+                    when Some(value as error: DbError) do
+                        assertTrue(false, "and made again without harm");
+                    when None do
+                        skip;
+                end case;
+                assertTrue(views(&!db, "ann") = 0, "ann has no passkey");
+                case keepLabel(&!db, "AAAA", "ann", "Laptop") of
+                    when Some(value as error: DbError) do
+                        assertTrue(false, "a name is kept");
+                    when None do
+                        skip;
+                end case;
+                assertTrue(views(&!db, "ann") = 0, "a name alone is no passkey");
+                case renamePasskey(&!db, "ann", "AAAA", "Phone") of
+                    when Right(right as done: Bool) do
+                        assertFalse(done, "a name without a key is not renamed");
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "a name without a key is not renamed");
+                end case;
+                case forgetPasskey(&!db, "ann", "AAAA") of
+                    when Right(right as done: Bool) do
+                        assertFalse(done, "nor removed as a passkey");
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "nor removed as a passkey");
+                end case;
+                case forgetPasskeys(&!db, "ann") of
+                    when Right(right as n: Int64) do
+                        assertTrue(n = 0, "ann had none");
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "ann had none");
+                end case;
+                case ownerOf(&!db, "AAAA") of
+                    when Right(right as found: Option[String]) do
+                        case found of
+                            when Some(value as owner: String) do
+                                destroyString(owner);
+                                assertTrue(false, "an unknown credential has no owner");
+                            when None do
+                                assertTrue(true, "an unknown credential has no owner");
+                        end case;
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "an unknown credential has no owner");
+                end case;
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

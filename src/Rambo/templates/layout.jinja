@@ -1,0 +1,49 @@
+{#
+Part of rambo.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The frame of every page: the head with the language buttons, the menu for
+a person who is signed in, the title, an error or a note, and the foot.
+frame holds title, error and info translated by the code, and card, which
+puts the content of the sign-in pages into a card.
+-#}
+{% catalog messages %}<!doctype html>
+<html lang="{{ lang }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{{ frame.title }} &middot; RAMBO</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon-180.png">
+<link rel="stylesheet" href="/static/rambo.css">
+</head>
+<body>
+<div class="topbar"><header>
+<picture><source srcset="/static/mark-dark.svg" media="(prefers-color-scheme: dark)"><img src="/static/mark-light.svg" alt="" width="44" height="44"></picture>
+<span class="name">RAMBO</span>
+<form method="post" action="/lang" class="lang" aria-label="{{ _("LangLabel") }}">
+<input type="hidden" name="back" value="{{ frame.back }}">
+<button type="submit" name="lang" value="de" title="{{ _("LangDe") }}"{% if lang == "de" %} aria-pressed="true" disabled=""{% endif %}>&#x1F1E9;&#x1F1EA; {{ _("LangDeShort") }}</button>
+<button type="submit" name="lang" value="en" title="{{ _("LangEn") }}"{% if lang == "en" %} aria-pressed="true" disabled=""{% endif %}>&#x1F1EC;&#x1F1E7; {{ _("LangEnShort") }}</button>
+</form>
+</header></div>
+{% if frame.card %}<main class="signin">{% else %}<main>{% endif %}
+{% if frame.nav %}<nav class="menu" aria-label="{{ _("NavLabel") }}">
+<a href="/"{% if frame.nav == "home" %} aria-current="page"{% endif %}>{{ _("NavHome") }}</a>
+<a href="/account"{% if frame.nav == "account" %} aria-current="page"{% endif %}>{{ _("NavAccount") }}</a>
+<form method="post" action="/logout"><input type="hidden" name="csrf" value="{{ frame.csrfLogout }}"><button type="submit" class="link">{{ _("LogoutSubmit") }}</button></form>
+</nav>{% endif %}
+{% if frame.card %}<div class="card">{% endif %}
+<h1>{{ frame.title }}</h1>
+{% if frame.error %}<p class="error" role="alert">{{ frame.error }}</p>{% endif %}
+{% if frame.info %}<p class="info" role="status">{{ frame.info }}</p>{% endif %}
+{% block content %}{% endblock %}
+{% if frame.card %}</div>{% endif %}
+<footer class="site-foot">RAMBO {{ frame.version }} - {{ _("FooterAcronym") }} - {{ _("FooterCopyright") }} <a href="https://www.heiko-zimmermann.com/" target="_blank" rel="noopener noreferrer">{{ _("FooterAuthor") }}</a></footer>
+</main>
+</body>
+</html>

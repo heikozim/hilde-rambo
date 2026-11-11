@@ -1,0 +1,83 @@
+{#
+Part of rambo.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The own account: its name, address and ID, the two changes that ask for
+the password and a fresh code, and the passkeys, each form with the token
+of its action.  A new passkey asks for the password and a code as well.
+-#}
+{% extends "templates/layout.jinja" %}
+{% block content %}
+<dl class="facts">
+<dt>{{ _("AccountName") }}</dt><dd>{% if name %}{{ name }}{% else %}&ndash;{% endif %}</dd>
+<dt>{{ _("AccountEmail") }}</dt><dd>{{ email }}</dd>
+<dt>{{ _("AccountId") }}</dt><dd><code>{{ id }}</code></dd>
+</dl>
+
+<p class="lead">{{ _("AccountReauthHint") }}</p>
+
+<section>
+<h2>{{ _("AccountPassword") }}</h2>
+<form method="post" action="/account/password">
+<input type="hidden" name="csrf" value="{{ csrfPassword }}">
+<label>{{ _("AccountOldPassword") }}
+<input type="password" name="old" autocomplete="current-password" maxlength="1024" required></label>
+<label>{{ _("AccountCode") }}
+<input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" maxlength="7" required></label>
+<label>{{ _("PasswordNew") }} <small>{{ _("PasswordRule") }}</small>
+<input type="password" name="new" autocomplete="new-password" minlength="12" maxlength="1024" required></label>
+<label>{{ _("PasswordAgain") }}
+<input type="password" name="new2" autocomplete="new-password" minlength="12" maxlength="1024" required></label>
+<p><small>{{ _("AccountPasswordHint") }}</small></p>
+<button type="submit">{{ _("AccountPasswordSubmit") }}</button>
+</form>
+</section>
+
+<section>
+<h2>{{ _("AccountTotp") }}</h2>
+<p>{{ _("AccountTotpHint") }}</p>
+<form method="post" action="/account/totp">
+<input type="hidden" name="csrf" value="{{ csrfTotp }}">
+<label>{{ _("AccountOldPassword") }}
+<input type="password" name="old" autocomplete="current-password" maxlength="1024" required></label>
+<label>{{ _("AccountCode") }}
+<input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" maxlength="7" required></label>
+<button type="submit">{{ _("AccountTotpSubmit") }}</button>
+</form>
+</section>
+
+<section>
+<h2>{{ _("AccountPasskeys") }}</h2>
+<p>{{ _("AccountPasskeysHint") }}</p>
+{% if passkeys %}<div class="table-wrap">
+<table>
+<thead><tr><th>{{ _("AccountPasskeyName") }}</th><th>{{ _("AccountPasskeyCreated") }}</th><th>{{ _("AccountPasskeyLastUsed") }}</th><th></th></tr></thead>
+<tbody>
+{% for entry in passkeys %}<tr>
+<td data-label="{{ _("AccountPasskeyName") }}"><form method="post" action="/account/passkey/rename" class="inline">
+<input type="hidden" name="csrf" value="{{ csrfPasskeyRename }}"><input type="hidden" name="credential" value="{{ entry.credential }}">
+<input type="text" name="label" value="{{ entry.label }}" maxlength="64" aria-label="{{ _("AccountPasskeyLabel") }}" required>
+<button type="submit" class="small secondary">{{ _("AccountPasskeyRename") }}</button></form></td>
+<td data-label="{{ _("AccountPasskeyCreated") }}"><span class="when">{{ entry.created }}</span></td>
+<td data-label="{{ _("AccountPasskeyLastUsed") }}">{% if entry.lastUsed %}<span class="when">{{ entry.lastUsed }}</span>{% else %}{{ _("AccountPasskeyNever") }}{% endif %}</td>
+<td><form method="post" action="/account/passkey/remove">
+<input type="hidden" name="csrf" value="{{ csrfPasskeyRemove }}"><input type="hidden" name="credential" value="{{ entry.credential }}">
+<button type="submit" class="small">{{ _("AccountPasskeyRemove") }}</button></form></td>
+</tr>{% endfor %}
+</tbody>
+</table>
+</div>{% else %}<p>{{ _("AccountPasskeyNone") }}</p>{% endif %}
+<h3>{{ _("AccountPasskeyAdd") }}</h3>
+<p><small>{{ _("AccountPasskeyAddHint") }}</small></p>
+<form method="post" action="/account/passkey">
+<input type="hidden" name="csrf" value="{{ csrfPasskey }}">
+<label>{{ _("AccountOldPassword") }}
+<input type="password" name="old" autocomplete="current-password" maxlength="1024" required></label>
+<label>{{ _("AccountCode") }}
+<input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" maxlength="7" required></label>
+<button type="submit">{{ _("AccountPasskeyAdd") }}</button>
+</form>
+</section>
+{% endblock %}

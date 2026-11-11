@@ -1,0 +1,131 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    destroyEmpty,
+    nthRef,
+    length as bufferLength
+);
+import Standard.Text (
+    substring
+);
+
+module body Rambo.Table is
+    generic [T: Region, L: Region]
+    function addRow(table: &![Buffer[Buffer[String]], T], line: Span[Nat8, L]): Unit is
+        var row: Buffer[String] := allocateEmpty();
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= spanLength(line) do
+            var cut: Bool := i = spanLength(line);
+            if not cut then
+                cut := line[i] = 9;
+            end if;
+            if cut then
+                insertBack(&!row, fromSpan(substring(line, start, i)));
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        insertBack(table, row);
+        return nil;
+    end;
+
+    -- The characters of UTF-8 in text: the bytes that start one.
+    generic [T: Region]
+    function width(text: Span[Nat8, T]): Index is
+        var n: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if (text[i] < 128) or (text[i] >= 192) then
+                n := n + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return n;
+    end;
+
+    generic [R: Region]
+    function cellWidth(row: &[Buffer[String], R], column: Index): Index is
+        if column < bufferLength(row) then
+            return width(asSpan(nthRef(row, column)));
+        end if;
+        return 0;
+    end;
+
+    -- The widest cell of column among the rows that have a cell after it.
+    generic [T: Region]
+    function columnWidth(table: &[Buffer[Buffer[String]], T], column: Index): Index is
+        var most: Index := 0;
+        var r: Index := 0;
+        while r < bufferLength(table) do
+            let row: &[Buffer[String], T] := nthRef(table, r);
+            if (column + 1) < bufferLength(row) then
+                let w: Index := cellWidth(row, column);
+                if w > most then
+                    most := w;
+                end if;
+            end if;
+            r := r + 1;
+        end while;
+        return most;
+    end;
+
+    generic [T: Region]
+    function tableText(table: &[Buffer[Buffer[String]], T]): String is
+        var b: StringBuilder := makeStringBuilder();
+        var r: Index := 0;
+        while r < bufferLength(table) do
+            let row: &[Buffer[String], T] := nthRef(table, r);
+            var c: Index := 0;
+            while c < bufferLength(row) do
+                let cell: Span[Nat8, T] := asSpan(nthRef(row, c));
+                writeString(&!b, cell);
+                if (c + 1) < bufferLength(row) then
+                    var pad: Index := (columnWidth(table, c) + 2) - width(cell);
+                    while pad > 0 do
+                        writeByte(&!b, ' ');
+                        pad := pad - 1;
+                    end while;
+                end if;
+                c := c + 1;
+            end while;
+            writeByte(&!b, 10);
+            r := r + 1;
+        end while;
+        return finalize(b);
+    end;
+
+    function destroyTable(table: Buffer[Buffer[String]]): Unit is
+        var rows: Buffer[Buffer[String]] := table;
+        while bufferLength(&rows) > 0 do
+            var row: Buffer[String] := removeLast(&!rows);
+            while bufferLength(&row) > 0 do
+                destroyString(removeLast(&!row));
+            end while;
+            destroyEmpty(row);
+        end while;
+        destroyEmpty(rows);
+        return nil;
+    end;
+end module body.

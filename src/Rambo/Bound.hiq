@@ -1,0 +1,101 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.FcgiServer (
+    Request
+);
+import Standard.Log (
+    Log
+);
+import Wolly.Response (
+    withHeader
+);
+import Wolly.OpBase (
+    OpSettings
+);
+import Wolly.Op (
+    Handover
+);
+import Wolly.OpDbsc (
+    offer,
+    offerAfter,
+    register,
+    refresh
+);
+import Rambo.Web (
+    remoteAddr
+);
+
+module body Rambo.Bound is
+    constant register_path: Span[Nat8, Static] := "/dbsc/register";
+    constant refresh_path: Span[Nat8, Static] := "/dbsc/refresh";
+    constant offer_header: Span[Nat8, Static] := "Secure-Session-Registration";
+
+    function registerPath(): Span[Nat8, Static] is
+        return register_path;
+    end;
+
+    function refreshPath(): Span[Nat8, Static] is
+        return refresh_path;
+    end;
+
+    -- output with the offer made, as it was without one.
+    function withMade(output: String, made: Either[DbError, Option[String]]): String is
+        case made of
+            when Right(right as maybe: Option[String]) do
+                case maybe of
+                    when Some(value as header: String) do
+                        let offered: String := withHeader(output, offer_header, asSpan(&header));
+                        destroyString(header);
+                        return offered;
+                    when None do
+                        return output;
+                end case;
+            when Left(left as error: DbError) do
+                return output;
+        end case;
+    end;
+
+    generic [R: Region, S: Region, H: Region]
+    function withOfferAfter(db: &![Database[Writing], R], settings: &[OpSettings, S], step: &[Handover, H], output: String,
+        now: Int64): String is
+        return withMade(output, offerAfter(&~db, settings, step, register_path, now));
+    end;
+
+    generic [Q: Region, R: Region, S: Region]
+    function withOfferFor(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], output: String,
+        now: Int64): String is
+        return withMade(output, offer(request, &~db, settings, register_path, now));
+    end;
+
+    generic [Q: Region, R: Region, S: Region, L: Region]
+    function registerAnswer(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L],
+        now: Int64): String is
+        let ip: String := remoteAddr(request);
+        let out: String := register(request, &~db, settings, &~log, refresh_path, asSpan(&ip), now);
+        destroyString(ip);
+        return out;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, L: Region]
+    function refreshAnswer(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L],
+        now: Int64): String is
+        let ip: String := remoteAddr(request);
+        let out: String := refresh(request, &~db, settings, &~log, refresh_path, asSpan(&ip), now);
+        destroyString(ip);
+        return out;
+    end;
+end module body.

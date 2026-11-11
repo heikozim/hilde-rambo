@@ -1,0 +1,82 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    contains,
+    indexOf,
+    substring
+);
+import Rambo.Config (
+    Config,
+    destroyConfig,
+    readConfig
+);
+import Rambo.Guard (
+    sandboxText
+);
+
+module body Rambo.Guard.Test is
+    -- The data apart: the vault in a directory of its own below etc, the database in one below var.
+    constant apart: Span[Nat8, Static] := "issuer = https://auth.example.org\netc_dir = /etc/rambo\nvar_dir = /var/rambo\ndb = /var/rambo/db/rambo.db\nvault = /etc/rambo/vault/.rambo.env\npepper = /var/rambo/.rambo_pepper\n";
+
+    -- The profile of serve in text, the part before the profile of the admin commands.
+    generic [T: Region]
+    function serveProfile(text: Span[Nat8, T]): String is
+        case indexOf(text, "rambo-admin") of
+            when Some(value as at: Index) do
+                return fromSpan(substring(text, 0, at));
+            when None do
+                return fromSpan(text);
+        end case;
+    end;
+
+    generic [T: Region]
+    function adminProfile(text: Span[Nat8, T]): String is
+        case indexOf(text, "rambo-admin") of
+            when Some(value as at: Index) do
+                return fromSpan(substring(text, at, spanLength(text)));
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- serve writes only where the database and the vault are written; it reads its etc and var
+    -- directories and its pepper.
+    function testServeWritesOnlyItsData(): Unit is
+        case readConfig(apart, "/etc/rambo/rambo.conf", "openbsd") of
+            when Right(right as config: Config) do
+                let text: String := sandboxText(&config);
+                let serve: String := serveProfile(asSpan(&text));
+                assertTrue(contains(asSpan(&serve), "/var/rambo/db (rwc)"), "control: the directory of the database to write");
+                assertTrue(contains(asSpan(&serve), "/etc/rambo/vault (rwc)"), "control: the directory of the vault to write");
+                assertTrue(contains(asSpan(&serve), "/etc/rambo (r)"), "the etc directory only to read");
+                assertFalse(contains(asSpan(&serve), "/etc/rambo (rwc)"), "not to write");
+                assertTrue(contains(asSpan(&serve), "/var/rambo (r)"), "the var directory only to read");
+                assertFalse(contains(asSpan(&serve), "/var/rambo (rwc)"), "not to write");
+                assertTrue(contains(asSpan(&serve), "/var/rambo/.rambo_pepper (r)"), "the pepper only to read");
+                let admin: String := adminProfile(asSpan(&text));
+                assertTrue(contains(asSpan(&admin), "/etc/rambo (rwc)"), "control: an admin command still writes its etc directory");
+                destroyString(admin);
+                destroyString(serve);
+                destroyString(text);
+                destroyConfig(config);
+            when Left(left as message: String) do
+                destroyString(message);
+                assertTrue(false, "the configuration holds");
+        end case;
+        return nil;
+    end;
+end module body.

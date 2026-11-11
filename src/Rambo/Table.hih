@@ -1,0 +1,47 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A table as the lists of the command line print it, the way Go's
+text/tabwriter prints them with a padding of 2 and blanks.
+
+- Every cell but the last of a line is padded with blanks to the widest
+  cell of its column plus 2; the last cell of a line stands as it is.
+- The width of a cell is its number of characters of UTF-8.
+- Each line ends with a line feed.
+
+    var table: Buffer[Buffer[String]] := allocateEmpty();
+    addRow(&!table, "ID\tE-MAIL\tNAME\tSTATE");
+    let text: String := tableText(&table);
+"""
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer
+);
+
+module Rambo.Table is
+    """
+    Adds the row of line to table, its cells cut at tabs.
+    No contract: it changes the table in place, cut at the tabs of line.
+    """
+    generic [T: Region, L: Region]
+    function addRow(table: &![Buffer[Buffer[String]], T], line: Span[Nat8, L]): Unit;
+
+    """
+    The text of table.
+    No contract: its length follows the cells, a walk over the whole table.
+    """
+    generic [T: Region]
+    function tableText(table: &[Buffer[Buffer[String]], T]): String;
+
+    """
+    Gives table back.
+    No contract: it only frees.
+    """
+    function destroyTable(table: Buffer[Buffer[String]]): Unit;
+end module.

@@ -1,0 +1,115 @@
+#!/bin/ksh
+#
+# Part of rambo.
+#
+# SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+# RAMBO, the rc.d script of OpenBSD.
+# Install: /etc/rc.d/rambo (0555 root:wheel), then `rcctl enable rambo`.
+#
+# Browser -> Hiawatha -> unix socket -> rambo serve (FastCGI).
+#
+# The same four mechanisms as the script of the earlier Go provider, measured on OpenBSD 7.9:
+#
+#   1. The socket directory is made in rc_pre: unveil(2) grants nothing for
+#      a path that does not exist yet, so the daemon cannot make it.
+#   2. Ready means the web user can connect, tested with nc -U -z as that
+#      user: the socket file exists before its mode and group are set.
+#   3. rc.subr runs the daemon under su -l, which builds a fresh
+#      environment; the configuration path travels as --config in
+#      daemon_flags, not in the environment.
+#   4. rc.subr cannot fail a start on readiness (rc_bg=YES maps the start
+#      alarm to ok); the EXIT trap at the bottom takes that verdict.
+#
+# Unlike the earlier Go provider, rambo writes its audit lines to syslog itself (auth.info,
+# tag rambo), the daemon and the admin commands alike; nothing is piped from
+# stderr, so there is no daemon_logger.  Every request reads rambo.conf, the
+# vault and the signing keys anew: a key of `rambo keys rotate` is served at
+# the next request without a reload.  Only listen, socket_dir and
+# socket_group need `rcctl restart rambo`.
+
+# One path for the daemon and for this script, which reads socket_dir out of
+# it.  `rcctl set rambo flags` replaces daemon_flags as a whole: whoever
+# points it at another file changes this line too.
+rambo_conf=/etc/rambo/rambo.conf
+
+daemon="/usr/local/sbin/rambo"
+daemon_flags="serve --config ${rambo_conf}"
+daemon_user="_rambo"
+
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=NO
+
+# _rambo_conf_value prints the value of key $1 in rambo.conf, or nothing.
+_rambo_conf_value() {
+	sed -n \
+		"s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\([^[:space:]]*\).*/\1/p" \
+		"${rambo_conf}" 2>/dev/null | tail -1
+}
+
+# _rambo_socket_dir prints socket_dir from rambo.conf, or the default of
+# rambo on OpenBSD when the key is absent.
+_rambo_socket_dir() {
+	local _dir
+	_dir=$(_rambo_conf_value socket_dir)
+	echo "${_dir:-/var/run/rambo}"
+}
+
+# The group that must reach the socket: socket_group of rambo.conf, the same
+# value serve checks the directory against, www when the key is absent.  It
+# must be the user Hiawatha drops to (ServerId).
+_rambo_group=$(_rambo_conf_value socket_group)
+: ${rambo_socket_group:=${_rambo_group:-www}}
+
+# _rambo_socket_ready succeeds only when the web user can open the socket.
+_rambo_socket_ready() {
+	local _sock
+	_sock="$(_rambo_socket_dir)/rambo.sock"
+	[ -S "${_sock}" ] || return 1
+	su -s /bin/sh "${rambo_socket_group}" -c "nc -U -z ${_sock}" >/dev/null 2>&1
+}
+
+# rc_pre makes the socket directory in the web server's group, which the
+# socket takes on OpenBSD; serve checks that group before it starts.
+rc_pre() {
+	install -d -o "${daemon_user}" -g "${rambo_socket_group}" -m 0750 \
+		"$(_rambo_socket_dir)"
+}
+
+# rc_check asks for the socket only on start; stop, check and restart ask
+# whether the process runs (a check that demanded the socket turned a stop
+# into a silent exit 0 in a test guest of the earlier Go provider).
+rc_check() {
+	pgrep -T "${daemon_rtable}" -q -xf "${pexp}" || return 1
+	[ "${_rambo_action}" = start ] || return 0
+	_rambo_socket_ready
+}
+
+# rc_post removes a stale socket after a stop or a failed start.
+rc_post() {
+	rm -f "$(_rambo_socket_dir)/rambo.sock"
+}
+
+# The verdict of a start, in an EXIT trap of this shell: rc.subr signals the
+# daemon with pkill -P $$, which a subshell around rc_cmd would not get.
+_rambo_start_verdict() {
+	local _status=$?
+	trap - EXIT
+	[ ${_status} -eq 0 ] || exit ${_status}
+	if ! _rambo_socket_ready; then
+		echo "rambo: $(_rambo_socket_dir)/rambo.sock not reachable by" \
+			"${rambo_socket_group} within ${daemon_timeout}s -- stopped" >&2
+		pkill -T "${daemon_rtable}" -xf "${pexp}"
+		rc_post
+		exit 1
+	fi
+	exit 0
+}
+
+_rambo_action=$1
+[ "$1" = start ] && trap _rambo_start_verdict EXIT
+
+rc_cmd $1

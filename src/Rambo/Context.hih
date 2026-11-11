@@ -1,0 +1,141 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+What rambo works with, opened together and closed together: the
+configuration, the database with its tables, the secrets of the vault,
+the signing keys, the settings of the provider and the audit log.  A
+worker of the server keeps one open between its requests (Rambo.Site);
+the development server and the commands open one for each use.
+
+- The configuration is the file of --config, else of RAMBO_CONFIG, else
+  rambo.conf in the etc directory of the system.
+- The vault yields the pepper of the passwords, 32 bytes in Base64, the key
+  of the second factors and the key of the puzzles, 32 bytes or more in
+  Base64; a missing or wrong one stops the request.
+- Once an hour maintain rotates the signing keys that are due and removes
+  what can no longer be used.  The database decides which caller does it,
+  so two never do at once.
+
+    case openContext(path, now) of
+        when Right(right as context: Context) do
+            ...
+            closeContext(context);
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing
+);
+import Standard.Log (
+    Log
+);
+import Wolly.OpKey (
+    RingKey
+);
+import Wolly.OpBase (
+    OpSettings
+);
+import Rambo.Config (
+    Config
+);
+
+module Rambo.Context is
+    """
+    The secrets of the vault: the pepper of the passwords and the key of the
+    puzzles as bytes, the key of the second factors as its text.
+    """
+    record Secrets: Linear is
+        pepper: String;
+        totpKey: String;
+        powKey: String;
+    end;
+
+    """
+    Frees secrets.
+    No contract: it only frees.
+    """
+    function destroySecrets(secrets: Secrets): Unit;
+
+    """
+    The world of rambo.
+    """
+    record Context: Linear is
+        config: Config;
+        db: Database[Writing];
+        settings: OpSettings;
+        ring: Buffer[RingKey];
+        secrets: Secrets;
+        log: Log;
+    end;
+
+    """
+    Closes the database and the log and drops the rest.
+    No contract: it closes the database and the log, whose result is I/O.
+    """
+    function closeContext(context: Context): Unit;
+
+    """
+    The name of the key of the vault: RAMBO_FERNET_KEY.
+    """
+    function vaultKeyName(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The prefix of the signing keys in the vault: RAMBO_SIGNING_KEY_.
+    """
+    function signingPrefix(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The configuration file: the value of --config on the command line of
+    this programme, else Rambo.Config.defaultConfigPath.
+    """
+    function configPath(): String
+        ensures length(&result) > 0;
+
+    """
+    Opens the world of rambo at now with the configuration at path.
+    Left the text that says what failed, without a secret in it.
+    No ensures: files, the vault and the database are read.
+    """
+    generic [P: Region]
+    function openContext(path: Span[Nat8, P], now: Int64): Either[String, Context]
+        requires now > 0;
+
+    """
+    The seconds between two rounds of maintenance: 3600.
+    """
+    function maintainEvery(): Int64
+        ensures result = 3600;
+
+    """
+    The context after maintain, and its outcome: Right true when it
+    maintained, Right false when it was not its turn, Left the text that
+    says what failed.
+    """
+    record Maintained: Linear is
+        context: Context;
+        outcome: Either[String, Bool];
+    end;
+
+    """
+    Maintains when the last round lies maintainEvery or more before now and
+    no other request has taken this round: rotates the signing keys that
+    are due (ML-DSA-44, the one family), saves the
+    ring, removes keys retired longer than tokens live, and the requests,
+    codes, puzzles, delays and strikes that ran out.
+    No ensures: the vault and the database are written.
+    """
+    function maintain(context: Context, now: Int64): Maintained
+        requires now > 0;
+end module.

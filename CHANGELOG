@@ -1,0 +1,62 @@
+rambo (0.4.1) stable; urgency=low
+
+  * Small bugfixes and improvements.
+
+ -- Heiko Zimmermann <code@heiko-zimmermann.com>  Wed, 11 Nov 2026 01:00:00 +0100
+
+rambo (0.4.0) stable; urgency=medium
+
+  * Sessions bound to the device (Device Bound Session Credentials of the
+    W3C): after a login, and on the portal and the account page of a
+    session that is not bound, rambo offers the browser a binding. A
+    browser that takes it keeps a key of its own for the session; the
+    session cookie then lives ten minutes and gets a new value each time
+    the browser signs a fresh challenge at /dbsc/refresh, so a copy of the
+    cookie taken off the device is dead at the next refresh. A session that
+    ended or an account that is locked ends the binding. A browser that does
+    not know the protocol keeps its session as before. Nothing changes for
+    a client.
+
+  * A form shown before a refresh of a bound session is refused once after
+    it, since its token hangs on the value of the session cookie.
+
+  * The findings of a security audit: failures of one
+    account are throttled across addresses; a new password or a renewed
+    second factor also removes the passkeys of the account; a locked account
+    is answered as a wrong proof; serve may write only in the directories of
+    its database, its vault and its socket; the page that asks before a
+    logout carries the request of the client back; a session bound to the
+    device once never counts as unbound again, and an open challenge is not
+    given out twice.
+
+  * 0.3.0 was never released; its device-bound sessions ship with 0.4.0.
+
+ -- Heiko Zimmermann <code@heiko-zimmermann.com>  Tue, 10 Nov 2026 00:00:00 +0100
+
+rambo (0.2.0) stable; urgency=low
+
+  * First public release. RAMBO, a sign-in service, written in Hilde on
+    Wolly: an OpenID provider for a fixed set of first-party clients that
+    replaces a provider written in Go without a change for its clients.
+
+  * OpenID Connect: discovery, the key set, /authorize with PKCE (S256) and
+    a nonce, /token with authorization codes, refresh tokens rotated in
+    families (a family revoked when a token comes twice) and client
+    credentials, /logout over GET and POST with an id_token_hint; max_age,
+    auth_time and the claim roles. ID tokens are signed with ML-DSA-44 or
+    the composite ML-DSA-44-Ed25519; rambo keys rotate makes a new key.
+
+  * The pages: the portal, the language, the login with e-mail address, a
+    proof of work, the password and a code of an authenticator app, the
+    first login, and the account page with password, second factor,
+    sessions and devices. Passkeys: a login that names nobody, one passkey
+    registered at a time.
+
+  * Secrets, sessions, codes and refresh tokens are kept only as SHA-256;
+    the keys and the pepper in a vault. The command rambo manages the
+    vault, the accounts and the clients, takes over a database of the
+    earlier Go provider (migrate) and prints its version line, the full
+    version, info and the sandbox: pledge and unveil on OpenBSD, Landlock
+    and seccomp on Linux.
+
+ -- Heiko Zimmermann <code@heiko-zimmermann.com>  Thu, 29 Oct 2026 00:00:00 +0100

@@ -1,0 +1,19 @@
+{#
+Part of rambo.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The step that sets up the second factor during a sign-in.
+-#}
+{% extends "templates/layout.jinja" %}
+{% block content %}
+<p class="lead">{{ _("TotpLead") }}</p>
+{% include "templates/enroll.jinja" %}
+<form method="post" action="/login/totp">
+<input type="hidden" name="req" value="{{ req }}">
+<input type="hidden" name="step" value="{{ step }}">
+{% include "templates/codefield.jinja" %}
+<button type="submit">{{ _("TotpSubmit") }}</button>
+</form>
+{% endblock %}

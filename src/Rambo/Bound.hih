@@ -1,0 +1,94 @@
+--
+-- Part of rambo.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The sign-in session bound to a key of the device (Device Bound Session Credentials of the W3C).
+
+- After a login, and on the start page and the account page of a session
+  that is not bound yet, the answer offers the browser a binding.
+- POST /dbsc/register takes the browser's proof and gives the session
+  cookie a new value that lives ten minutes.
+- POST /dbsc/refresh gives a new value each time the browser signs a fresh
+  challenge with its key; a copy of the cookie taken off the device is dead
+  at the next refresh.
+- A browser that does not know the protocol keeps the session as before.
+
+    let out: String := withOfferAfter(&!db, &settings, &step, handoverAnswer(&step), now);
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Database (
+    Database,
+    Writing
+);
+import Standard.FcgiServer (
+    Request
+);
+import Standard.Log (
+    Log
+);
+import Wolly.OpBase (
+    OpSettings
+);
+import Wolly.Op (
+    Handover
+);
+
+module Rambo.Bound is
+    """
+    The path the browser posts its registration to.
+    """
+    function registerPath(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The path the browser posts its refresh to.
+    """
+    function refreshPath(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    output, the answer of a login that hands over step, with the offer
+    of a binding for the session its cookie sets; output as it was when no
+    offer can be made.
+    """
+    generic [R: Region, S: Region, H: Region]
+    function withOfferAfter(db: &![Database[Writing], R], settings: &[OpSettings, S], step: &[Handover, H], output: String,
+        now: Int64): String
+        requires (now > 0) and (length(&output) > 0)
+        ensures length(&result) > 0;
+
+    """
+    output, a page for the browser of request, with the offer of a binding
+    when the browser holds a live session that is not bound; output as it
+    was otherwise.
+    """
+    generic [Q: Region, R: Region, S: Region]
+    function withOfferFor(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], output: String,
+        now: Int64): String
+        requires (now > 0) and (length(&output) > 0)
+        ensures length(&result) > 0;
+
+    """
+    The answer of POST to registerPath.
+    """
+    generic [Q: Region, R: Region, S: Region, L: Region]
+    function registerAnswer(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L],
+        now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    The answer of POST to refreshPath.
+    """
+    generic [Q: Region, R: Region, S: Region, L: Region]
+    function refreshAnswer(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L],
+        now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+end module.

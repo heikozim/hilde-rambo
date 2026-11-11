@@ -1,0 +1,20 @@
+{#
+Part of rambo.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The renewal of the second factor from the account page: the old factor
+holds until a code of the new one is sent.
+-#}
+{% extends "templates/layout.jinja" %}
+{% block content %}
+<p class="lead">{{ _("RenewLead") }}</p>
+{% include "templates/enroll.jinja" %}
+<form method="post" action="/account/totp/confirm">
+<input type="hidden" name="csrf" value="{{ csrfConfirm }}">
+{% include "templates/codefield.jinja" %}
+<button type="submit">{{ _("TotpSubmit") }}</button>
+</form>
+<p><a href="/account">{{ _("CommonCancel") }}</a></p>
+{% endblock %}

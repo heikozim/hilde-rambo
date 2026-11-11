@@ -1,0 +1,26 @@
+{#
+Part of rambo.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The page before a session or the sign-in of an app is ended: it names what
+goes.  kind is session or device; the addresses come as markup from the
+code, escaped there, with a place to break after each colon.
+-#}
+{% extends "templates/layout.jinja" %}
+{% block content %}
+<p class="lead">{% if kind == "session" %}{{ _("ConfirmSession") }}{% else %}{{ _("ConfirmDevice") }}{% endif %}</p>
+<dl class="facts">
+<dt>{% if kind == "session" %}{{ _("AccountBrowser") }}{% else %}{{ _("AccountApp") }}{% endif %}</dt><dd>{% if label %}{{ label }}{% else %}&ndash;{% endif %}</dd>
+<dt>{{ _("AccountSince") }}</dt><dd><span class="when">{{ created }}</span> <code class="ip">{{ firstIp|safe }}</code>{% if appFirstIp %} <span class="muted tag">{{ _("AccountAppServer") }}</span>{% endif %}</dd>
+<dt>{{ _("AccountLastSeen") }}</dt><dd><span class="when">{{ lastSeen }}</span> <code class="ip">{{ lastIp|safe }}</code>{% if appLastIp %} <span class="muted tag">{{ _("AccountAppServer") }}</span>{% endif %}</dd>
+</dl>
+<form method="post" action="{{ action }}">
+<input type="hidden" name="csrf" value="{{ csrfConfirm }}">
+<input type="hidden" name="id" value="{{ id }}">
+<input type="hidden" name="confirm" value="yes">
+<button type="submit" class="danger">{% if kind == "session" %}{{ _("ConfirmEndSession") }}{% else %}{{ _("ConfirmRevokeDevice") }}{% endif %}</button>
+</form>
+<p><a href="/">{{ _("CommonCancel") }}</a></p>
+{% endblock %}

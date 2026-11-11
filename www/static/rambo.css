@@ -1,0 +1,128 @@
+/* RAMBO -- one stylesheet, no inline styles (the CSP allows none). */
+:root {
+  --bg: #F6F1E7; --fg: #1F3A2E; --muted: #5b6b62; --accent: #A34C26;
+  --line: #d9d0bf; --field: #fffdf8; --err-bg: #f7dfd3; --info-bg: #dde9df;
+  --gap: 1rem; --gap-lg: 2rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14261e; --fg: #F6F1E7; --muted: #b6c2ba; --accent: #E08A5C;
+    --line: #34503f; --field: #1c3328; --err-bg: #4a2718; --info-bg: #25402f;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 44rem; margin: 0 auto; padding: 2rem 1rem 4rem; }
+/* A page with a table has four columns to show: more room. A table that
+ * still does not fit scrolls inside its own container, never the page. */
+main:has(table) { max-width: 72rem; }
+/* The head bar: as wide as the window, set off in the colour of the info
+ * box; its content keeps the width and the middle of main. */
+.topbar { background: var(--info-bg); border-bottom: 1px solid var(--line); }
+.topbar header { display: flex; align-items: center; gap: .75rem; max-width: 44rem; margin: 0 auto; padding: .6rem 1rem; }
+body:has(table) .topbar header { max-width: 72rem; }
+header img { display: block; }
+header .name { font-weight: 700; letter-spacing: .12em; }
+h1 { font-size: 1.6rem; margin: 0 0 var(--gap); }
+h2 { font-size: 1.15rem; margin: 0 0 .75rem; }
+/* One vertical rhythm for every page: blocks are --gap apart, sections --gap-lg.
+ * The space between sections belongs to the SECTION, not to its heading, so a
+ * section needs no h2 to stand apart from the one before it. */
+section { margin: var(--gap-lg) 0 0; }
+p, dl, table, form { margin: 0 0 var(--gap); }
+.lead { font-size: 1.05rem; }
+label { display: block; margin: 0 0 var(--gap); font-weight: 600; }
+label small { font-weight: 400; color: var(--muted); }
+input[type=email], input[type=password], input[type=text] {
+  display: block; width: 100%; max-width: 24rem; margin-top: .3rem; padding: .55rem .6rem;
+  font: inherit; color: var(--fg); background: var(--field);
+  border: 1px solid var(--line); border-radius: 6px; }
+input:focus-visible, button:focus-visible, a:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+button { font: inherit; font-weight: 600; padding: .55rem 1.2rem; border: 0; border-radius: 6px;
+  background: var(--fg); color: var(--bg); cursor: pointer; }
+button.small { padding: .25rem .7rem; font-size: .9rem; }
+button.secondary { background: transparent; color: var(--fg); border: 1px solid var(--fg); }
+button.danger { background: var(--accent); color: #fff; }
+a { color: var(--accent); }
+.error, .info { padding: .7rem .9rem; border-radius: 6px; }
+.error { background: var(--err-bg); }
+.info { background: var(--info-bg); }
+/* The browser check is a remark under the fields, not a message: no box. */
+#pow-status.info { padding: 0; background: none; color: var(--muted); font-size: .9rem; }
+#pow-status.info::before { content: "\2713  "; color: var(--fg); }
+/* An error inside a form is no wider than its fields. */
+form .error { max-width: 24rem; }
+/* The sign-in pages (login, new password, second factor) stand in one card in
+ * the middle of the page, as the sign-in of the apps does: everything in it is
+ * centered, the fields are as wide as the card. The footer is centered under
+ * it. The head bar keeps the page width. */
+.card { max-width: 26rem; margin: 1.5rem auto 0; padding: 1.5rem 1.5rem .5rem; text-align: center;
+  background: var(--info-bg); border: 1px solid var(--line); border-radius: 10px; }
+.card label { text-align: center; }
+.card input[type=email], .card input[type=password], .card input[type=text] { max-width: none; margin-left: 0; margin-right: 0; text-align: left; }
+.card form .error { max-width: none; }
+main.signin .site-foot { max-width: 26rem; margin-left: auto; margin-right: auto; border-top: 0; }
+/* The name of the app the login is for: in the colour of the focus ring. */
+.client { color: var(--accent); }
+.qr img { display: block; background: #fff; padding: .5rem; border-radius: 6px; image-rendering: pixelated; }
+.secret code { font-size: 1.1rem; letter-spacing: .08em; word-break: break-all; }
+dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: .3rem 1rem; }
+dl.facts dt { color: var(--muted); }
+dl.facts dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 40rem) {
+  /* A label and its value one above the other: side by side they are wider than a phone. */
+  dl.facts { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  dl.facts dd { margin: 0 0 .6rem; }
+}
+table { width: 100%; border-collapse: collapse; font-size: .95rem; table-layout: fixed; }
+th:nth-child(2), th:nth-child(3) { width: 13rem; }
+th:nth-child(4) { width: 7.5rem; }
+th, td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+td { overflow-wrap: anywhere; }
+td em, td form { white-space: nowrap; }
+td form { margin: 0; }
+/* A phone is too narrow for four columns: each row becomes a block, the
+ * header row goes and every cell names itself from its data-label. */
+@media (max-width: 52rem) {
+  thead { display: none; }
+  table, tbody, tr, td { display: block; }
+  table { table-layout: auto; }
+  tr { padding: .6rem 0; border-bottom: 1px solid var(--line); }
+  td { border: 0; padding: .15rem 0; }
+  td[data-label]::before { content: attr(data-label) ": "; color: var(--muted); }
+  td em, td form { white-space: normal; }
+}
+button:disabled { opacity: .5; cursor: not-allowed; }
+.muted { color: var(--muted); font-size: .9rem; }
+.when, .tag { white-space: nowrap; }
+.table-wrap { overflow-x: auto; margin: 0 0 var(--gap); }
+.table-wrap table { margin: 0; }
+.ip { font-size: .9rem; overflow-wrap: normal; }
+/* The footer: small, muted and in the middle. It sits at the end of main,
+ * so it has the page's width and edges. */
+.site-foot { margin-top: 2.5rem; padding: .75rem 0 1.5rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .75rem; text-align: center; }
+.site-foot a { color: inherit; }
+/* The language buttons in the head: the picked one is filled, not faded. */
+.lang { display: flex; gap: .25rem; margin: 0 0 0 auto; }
+.lang button { padding: .25rem .6rem; font-size: .9rem; background: transparent; color: var(--fg); border: 1px solid var(--line); }
+.lang button[aria-pressed=true] { background: var(--fg); color: var(--bg); border-color: var(--fg); opacity: 1; cursor: default; }
+/* The menu of the pages behind the login: two links and the sign-out button. */
+.menu { display: flex; flex-wrap: wrap; align-items: center; gap: .25rem 1.25rem; margin: 0 0 1.5rem; padding: 0 0 .75rem; border-bottom: 1px solid var(--line); }
+.menu a { color: var(--fg); text-decoration: none; font-weight: 600; padding: .2rem 0; }
+.menu a[aria-current=page] { border-bottom: 3px solid var(--accent); }
+.menu form { margin: 0 0 0 auto; }
+button.link { background: transparent; color: var(--accent); padding: .2rem 0; text-decoration: underline; }
+/* The portal: one tile per app. */
+.tiles { list-style: none; margin: 0 0 var(--gap); padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr)); gap: var(--gap); }
+.tile { display: flex; flex-direction: column; align-items: center; gap: .6rem; padding: 1.1rem .75rem; border: 1px solid var(--line); border-radius: 10px; background: var(--field); color: var(--fg); text-decoration: none; text-align: center; height: 100%; }
+.tile:hover { border-color: var(--accent); }
+.tile img { display: block; width: 64px; height: 64px; object-fit: contain; }
+.tile .initial { display: flex; align-items: center; justify-content: center; width: 64px; height: 64px; border-radius: 50%; background: var(--fg); color: var(--bg); font-size: 1.8rem; font-weight: 700; }
+.tile .label { font-weight: 600; overflow-wrap: anywhere; }
+/* A link that looks like a small button, next to a form button in a table cell. */
+a.button { display: inline-block; font-weight: 600; padding: .55rem 1.2rem; border-radius: 6px; background: var(--fg); color: var(--bg); text-decoration: none; }
+a.button.small { padding: .25rem .7rem; font-size: .9rem; }
+td.actions { display: flex; flex-wrap: wrap; gap: .4rem; align-items: flex-start; }
+td.actions form { display: inline; }

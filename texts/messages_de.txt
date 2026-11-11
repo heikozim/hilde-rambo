@@ -1,0 +1,38 @@
+# Part of rambo.
+#
+# SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+# The page texts rambo has beyond those of the earlier Go provider, in German, one line
+# each in the form of its messages_de.go, letters outside ASCII as
+# \u escapes; tools/genmessages.pl reads them with those.
+	"login.passkey":              "Mit Passkey anmelden",
+	"login.passkey_or":           "oder mit Passwort und Code",
+	"passkey.working":            "Warte auf den Passkey ...",
+	"passkey.unsupported":        "Dieser Browser bietet keine Passkeys an.",
+	"passkey.cancelled":          "Der Passkey wurde nicht verwendet. Bitte noch einmal versuchen.",
+	"err.passkey":                "Der Passkey wurde nicht angenommen.",
+	"account.passkeys":           "Passkeys",
+	"account.passkeys_hint":      "Ein Passkey meldet Sie ohne Passwort und Code an: das Ger\u00e4t pr\u00fcft Sie per Fingerabdruck, Gesicht oder PIN. Passwort und Code bleiben als Weg zur\u00fcck g\u00fcltig.",
+	"account.passkey_name":       "Name",
+	"account.passkey_created":    "Hinzugef\u00fcgt",
+	"account.passkey_last_used":  "Zuletzt verwendet",
+	"account.passkey_never":      "nie",
+	"account.passkey_none":       "Noch kein Passkey.",
+	"account.passkey_rename":     "Umbenennen",
+	"account.passkey_remove":     "Entfernen",
+	"account.passkey_label":      "Name des Passkeys",
+	"account.passkey_label_hint": "Damit Sie das Ger\u00e4t wiedererkennen, etwa Laptop oder Telefon.",
+	"account.passkey_add":        "Passkey hinzuf\u00fcgen",
+	"account.passkey_add_hint":   "Ein neuer Passkey verlangt Ihr aktuelles Passwort und einen frischen Code.",
+	"title.passkey_add":          "Passkey hinzuf\u00fcgen",
+	"passkey.create_hint":        "Ihr Browser fragt jetzt nach dem Passkey. Best\u00e4tigen Sie per Fingerabdruck, Gesicht oder PIN.",
+	"passkey.create":             "Passkey erstellen",
+	"info.passkey_added":         "Der Passkey wurde hinzugef\u00fcgt.",
+	"info.passkey_renamed":       "Der Passkey wurde umbenannt.",
+	"info.passkey_removed":       "Der Passkey wurde entfernt.",
+	"err.passkey_add":            "Der Passkey konnte nicht hinzugef\u00fcgt werden. Bitte neu beginnen.",
+	"err.passkey_many":           "Dieses Konto hat schon die meisten Passkeys, die es haben darf (20).",
+	"err.passkey_known":          "Dieser Passkey ist schon registriert.",
+	"err.passkey_gone":           "Diesen Passkey gibt es nicht.",
+	"err.passkey_label":          "Bitte einen Namen mit h\u00f6chstens 64 Zeichen.",
