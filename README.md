@@ -3,7 +3,7 @@
   <img src="docs/logo/rambo-wordmark-light.svg" alt="RAMBO" width="310" height="100">
 </picture>
 
-RAMBO, an OpenID provider with passkeys, written in Hilde on Wolly
+RAMBO: Rights, Accounts, Multi-factor, Bearer tokens & OAuth. An OpenID provider with passkeys, written in Hilde on Wolly
 
 Website: https://hilde-lang.org/rambo/
 
