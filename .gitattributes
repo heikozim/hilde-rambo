@@ -1,0 +1,17 @@
+# GitHub Linguist does not know Hilde (.hiq, .hih).  The helper scripts,
+# templates and assets around it are not counted as the language of this
+# repository.
+*.sh linguist-detectable=false
+*.ksh linguist-detectable=false
+*.py linguist-detectable=false
+*.pl linguist-detectable=false
+*.pm linguist-detectable=false
+*.go linguist-detectable=false
+Makefile linguist-detectable=false
+*.mk linguist-detectable=false
+*.jinja linguist-detectable=false
+*.css linguist-detectable=false
+*.js linguist-detectable=false
+*.c linguist-detectable=false
+*.h linguist-detectable=false
+deploy/openbsd/rambo linguist-detectable=false
