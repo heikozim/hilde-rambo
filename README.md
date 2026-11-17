@@ -7,7 +7,7 @@ RAMBO, an OpenID provider with passkeys, written in Hilde on Wolly
 
 Website: https://hilde-lang.org/rambo/
 
-# rambo
+# RAMBO
 
 RAMBO, a sign-in service: an OpenID provider for a fixed set of first-party
 clients, written in Hilde on the web framework Wolly.  It replaces an
@@ -36,7 +36,7 @@ Hiawatha.
   keys and the pepper in a vault.
 - The command `rambo`: `serve` (FastCGI behind Hiawatha, or HTTP on the
   loopback for development), `setup` (the vault), `account`, `client`,
-  `migrate` (a database of the earlier provider taken over), `version`, `info`
+  `keys`, `migrate` (a database of the earlier provider taken over), `version`, `info`
   and `sandbox`.  On OpenBSD it runs under pledge and unveil, on Linux under
   Landlock and seccomp.
 
@@ -77,15 +77,14 @@ exits with 1.
 
 Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
 
-rambo is licensed under the Apache License 2.0 with LLVM exception; see LICENSE.
+RAMBO is licensed under the Apache License 2.0 with LLVM Exceptions; see LICENSE.
 
 ## Checking a release
 
 A release is an archive `rambo-X.Y.Z.tar.gz` of the tree at the tag vX.Y.Z,
 its signature made with signify and a file SHA256 with the checksums of
 both, on the release page of this repository.  The public key is
-`rambo-0.pub` in the root of the repository; `VERIFY.md` of a release says
-how to check it:
+`rambo-0.pub` in the root of the repository:
 
 ```
 signify -V -p rambo-0.pub -x rambo-X.Y.Z.tar.gz.sig -m rambo-X.Y.Z.tar.gz
